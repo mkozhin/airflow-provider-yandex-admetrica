@@ -5,10 +5,9 @@ from __future__ import annotations
 import json
 import logging
 import re
-import sys
 import time
-from dataclasses import dataclass
-from datetime import datetime, timezone
+from datetime import datetime
+from datetime import timezone as _timezone
 from email.utils import parsedate_to_datetime
 from typing import TYPE_CHECKING
 
@@ -24,6 +23,21 @@ if TYPE_CHECKING:
     from airflow_provider_yandex_admetrica.hooks.loki import LokiClient
 
 log = logging.getLogger(__name__)
+
+
+class _MaskedError(AirflowException):
+    """A failure this module worded, out of text the masking gate has seen.
+
+    Every failure raised here is one of these, and the request path recognises
+    its own failures by this class alone.  ``AirflowException`` is the whole
+    scheduler's currency — a wrapper around ``requests``, a response adapter or
+    a piece of middleware may raise one too — and its text is then the
+    environment's own writing, which can name the proxy it dialled credentials
+    and all.  A class only this module raises tells the two apart exactly, so
+    text that has never passed the gate is re-worded on its way out instead of
+    travelling as it is.
+    """
+
 
 #: Version of the diagnostic event's field set.  A reader of a stored event
 #: knows by this number which fields it may expect.
@@ -46,16 +60,22 @@ _ENDPOINT_URLS = {
 #: a body is read for rows through the endpoint label the event already carries.
 _ROWS_KEYS = {"campaigns": "campaigns", "stat": "data"}
 
+#: How a day is written wherever one is named.  ``date1`` and ``date2`` carry a
+#: day in this spelling and the endpoint reads no other; the same string names
+#: the file an export writes and the partition it lands in, so one format holds
+#: for the request and for everything downstream of it alike.
+DATE_FORMAT = "%Y-%m-%d"
+
 #: Seconds of quiet between two requests.  AdMetrica publishes neither a quota
 #: nor a rate, so the pace is a conservative guess a task may raise or lower
 #: through the operator once a real advertiser has been measured.
-_DEFAULT_REQUEST_DELAY = 0.2
+DEFAULT_REQUEST_DELAY = 0.2
 
 #: Rows one statistics page asks for.  The endpoint allows up to 100 000 and
 #: falls back to 100 when asked for nothing; a tenth of the ceiling keeps a day
 #: of a large advertiser inside a few pages while leaving a single answer small
 #: enough to hold in memory and to retry cheaply.
-_DEFAULT_LIMIT = 10000
+DEFAULT_LIMIT = 10000
 
 #: Rows one page of the campaign list asks for.  The endpoint names neither a
 #: default nor a ceiling, so both ``limit`` and ``offset`` go out spelled; a
@@ -75,6 +95,23 @@ _STAT_OFFSET_BASE = 1
 #: a message naming the list that is too long and by how much.
 _MAX_METRICS = 20
 _MAX_DIMENSIONS = 10
+_MAX_LIMIT = 100000
+
+#: How much one walk may collect before it is called a walk that does not end.
+#: Both endpoints are paginated by an ``offset`` the answer is free to ignore,
+#: and an endpoint that answers every offset with a full page of rows would be
+#: read forever: the export would hold a task slot, fill a disk and never
+#: finish.  Ten million rows of one campaign on one day, and a million campaigns
+#: in one advertiser's list, are far past any real advertiser, so reaching
+#: either says the walk is not converging rather than that the data is large.
+_MAX_ROWS = 10_000_000
+_MAX_CAMPAIGNS = 1_000_000
+
+#: Requests one walk may spend reaching the ceiling above.  The ceiling is
+#: counted in rows, so on its own it says nothing about how long a walk may
+#: take: a page of ten rows would be asked for a million times before it was
+#: reached.  This is what ends such a walk instead.
+_MAX_PAGES = 100_000
 
 #: Request parameters the hook owns, which ``extra_params`` may therefore not
 #: carry.  Each of them is either the question being asked or an answer to how
@@ -83,8 +120,13 @@ _MAX_DIMENSIONS = 10
 #: operator's date, and ``accuracy`` or ``include_undefined`` would drop the
 #: defaults that stand against drifting and truncated numbers — with the
 #: completeness check still passing, because ``total_rows`` agrees with the
-#: truncated selection.  The last five have parameters of their own on the
-#: operator, so nothing needs this route to reach them.
+#: truncated selection.  ``preset`` is refused for the same reason one step
+#: further out: it lets the API define the report's own metrics and dimensions,
+#: while the records pair returned values by position against the names the
+#: caller asked for, so the numbers would be written under the wrong keys.
+#: ``filters``, ``timezone``, ``lang``, ``accuracy`` and ``include_undefined``
+#: have parameters of their own on the operator, so nothing needs this route to
+#: reach them.
 _RESERVED_PARAMS = frozenset(
     {
         "ids",
@@ -92,6 +134,7 @@ _RESERVED_PARAMS = frozenset(
         "date2",
         "metrics",
         "dimensions",
+        "preset",
         "limit",
         "offset",
         "sort",
@@ -197,23 +240,27 @@ _OUTCOME_UNKNOWN = "unknown"
 #: failure.
 _RETRIED_OUTCOMES = frozenset({"retryable_error", "network_error"})
 
-#: Character budget shared by every name and value of ``request_params``.
-#: Loki's line limit counts bytes and the response body already spends most of
-#: them, so what is left is shared out: 8 KiB of characters costs at most 32 KB
-#: of line even when every one of them is an emoji, the widest a character gets
-#: once JSON has escaped it.  A request whose parameters go on past that budget
-#: is described up to it, and a marker says how many were left out.
-_PARAMS_LIMIT = 8192
+#: What ``request_params`` may cost the line: how many parameters are described
+#: at all, and how long a name and a text value of one may be.  Loki's line
+#: limit counts bytes and the response body already spends most of them, so the
+#: three together are chosen so that their product — every described parameter
+#: at the full length of both of its bounds — is at most 32 KB of line even when
+#: every character is an emoji, the widest one gets once JSON has escaped it.
+#: Each bound is its own: a name and a value are cut where they run past theirs,
+#: with the ellipsis of :func:`_truncate` marking the cut, and no budget is
+#: shared between them.
+_PARAMS_MAX = 24
+_PARAM_NAME_LIMIT = 40
+_PARAM_VALUE_LIMIT = 300
+
+#: Stands in for a name the gate left nothing of — a name that was only
+#: whitespace, or only the token.  The parameter is still described, because
+#: what it carried is as much a part of the request as any other.
+_PARAM_NAME_EMPTY = "<param name withheld>"
 
 #: Key under which :func:`_redact_params` reports the parameters left out; its
 #: value is how many there were.
 _PARAMS_TRUNCATED = "<params truncated>"
-
-#: Characters charged against the shared parameter budget for a value that is
-#: not text: a number, a flag, an absent value, or the type name standing in
-#: for a value of another kind.
-_SCALAR_PARAM_COST = 16
-_OTHER_PARAM_COST = 32
 
 #: Response headers read for the rate-limit fields of an event.  AdMetrica
 #: documents no headers of the kind, so these are the conventional spellings,
@@ -632,10 +679,19 @@ def _redact_params(params: object, token: object) -> dict | None:
     an object of unknown provenance never reaches the push to be serialized
     there.
 
-    Every name and value shares the one budget of :data:`_PARAMS_LIMIT`
-    characters, spent in the order the parameters come in.  Once it is gone the
-    rest are left out and :data:`_PARAMS_TRUNCATED` says how many, so a
-    parameter of any size costs the line a bounded amount.
+    A name passes the same gate as a value, and for the same reason: a
+    credential pasted into the left-hand side of an ``extra_params`` entry is as
+    much of a leak as one pasted into the right.  Two names the bound above
+    reduces to the same text are told apart by the position of the parameter,
+    which is written into the name inside its own bound, so one value never
+    takes the other's place in the event.
+
+    What the field costs the line is bounded three ways: at most
+    :data:`_PARAMS_MAX` parameters are described, a name at
+    :data:`_PARAM_NAME_LIMIT` characters and a text value at
+    :data:`_PARAM_VALUE_LIMIT`.  Parameters past the count are left out and
+    :data:`_PARAMS_TRUNCATED` says how many, so a request of any size costs a
+    bounded amount whatever any one parameter holds.
 
     ``None`` says there were no parameters to describe.  Never raises: it runs
     while an event is assembled, often with an exception already in flight.
@@ -647,24 +703,23 @@ def _redact_params(params: object, token: object) -> dict | None:
     except Exception:
         return None
     redacted: dict = {}
-    budget = _PARAMS_LIMIT
-    for position, (key, value) in enumerate(items):
-        if type(key) is not str:
-            key = f"<non-str param name: {type(key).__name__}>"
-        budget -= len(key)
-        if budget <= 0:
-            redacted[_PARAMS_TRUNCATED] = len(items) - position
-            break
-        if type(value) is str:
-            text = _safe_text(value, token, limit=budget)
-            redacted[key] = text
-            budget -= len(text) if text else 0
-        elif value is None or type(value) in (int, float, bool):
-            redacted[key] = value
-            budget -= _SCALAR_PARAM_COST
+    for position, (key, value) in enumerate(items[:_PARAMS_MAX], start=1):
+        if type(key) is str:
+            name = _safe_text(key, token, limit=_PARAM_NAME_LIMIT) or _PARAM_NAME_EMPTY
         else:
-            redacted[key] = f"<non-scalar param: {type(value).__name__}>"
-            budget -= _OTHER_PARAM_COST
+            name = f"<non-str param name: {type(key).__name__}>"
+        suffix = f"#{position}"
+        while name in redacted:
+            name = _truncate(name, _PARAM_NAME_LIMIT - len(suffix)) + suffix
+            suffix += "#"
+        if type(value) is str:
+            redacted[name] = _safe_text(value, token, limit=_PARAM_VALUE_LIMIT)
+        elif value is None or type(value) in (int, float, bool):
+            redacted[name] = value
+        else:
+            redacted[name] = f"<non-scalar param: {type(value).__name__}>"
+    if len(items) > _PARAMS_MAX:
+        redacted[_PARAMS_TRUNCATED] = len(items) - _PARAMS_MAX
     return redacted
 
 
@@ -701,7 +756,7 @@ def _new_event(
         "schema_version": _SCHEMA_VERSION,
         "outcome": _OUTCOME_UNKNOWN,
         "level": None,
-        "sent_at": datetime.now(timezone.utc).isoformat(),
+        "sent_at": datetime.now(_timezone.utc).isoformat(),
         "endpoint": endpoint,
         "advertiser_id": advertiser_id,
         "campaign_id": campaign_id,
@@ -892,28 +947,18 @@ def _summarize_error(error: object, token: object) -> tuple[int | None, str | No
     return code, _safe_text(message, token)
 
 
-def _describe_error_code(code: int) -> str:
-    """Spell a code out for the task log: the number, bare.
-
-    The API documents no codes, so a reading invented here would say more than
-    is known, and nothing in this provider branches on the value: the policy for
-    a refusal is decided by the HTTP status alone.  The argument is a code and
-    only a code — :func:`_summarize_error` hands over ``int | None``, and the
-    caller assembles the line without this part when there is no code.
-    """
-    return str(code)
-
-
 def _describe_error(code: int | None, message: str | None) -> str:
     """Read a refusal out of its two parsed parts, for a human.
 
     The composition is the same wherever the refusal is told — the line an
     attempt logs and the text of the exception that ends the request: the code
     first, the server's own message after it.  Either part may be missing, and
-    the phrase then holds what there is.  ``message`` arrives already bounded and
-    masked by :func:`_summarize_error`.
+    the phrase then holds what there is.  The code is spelled bare, because the
+    API documents no codes and nothing here branches on the value: the policy
+    for a refusal is decided by the HTTP status alone.  ``message`` arrives
+    already bounded and masked by :func:`_summarize_error`.
     """
-    head = f"code {_describe_error_code(code)}" if code is not None else None
+    head = f"code {code}" if code is not None else None
     if head is not None and message:
         return f"{head}: {message}"
     return head or message or "no code and no message"
@@ -1141,8 +1186,8 @@ def _seconds_until(http_date: str) -> float | None:
         if moment.tzinfo is None:
             # An HTTP-date without a zone is GMT by the specification, and
             # reading it as local time would move the wait by whole hours.
-            moment = moment.replace(tzinfo=timezone.utc)
-        return (moment - datetime.now(timezone.utc)).total_seconds()
+            moment = moment.replace(tzinfo=_timezone.utc)
+        return (moment - datetime.now(_timezone.utc)).total_seconds()
     except Exception:
         return None
 
@@ -1178,18 +1223,6 @@ def _retry_after(resp: object) -> float | None:
     if seconds is None or not seconds > 0:
         return None
     return min(seconds, _RETRY_AFTER_MAX)
-
-
-def _retry_delay(resp: object, fallback: float) -> float:
-    """How long to wait before the next attempt: the server's answer, or the rung.
-
-    The server's own ``Retry-After`` wins whenever it named one, in both
-    directions: a wait longer than the rung is a window that has not passed yet,
-    and a shorter one is an invitation to come back sooner than the ladder would
-    have.
-    """
-    asked = _retry_after(resp)
-    return fallback if asked is None else asked
 
 
 def _record_exception(event: dict, exc: BaseException) -> None:
@@ -1265,28 +1298,16 @@ def _emit_event(loki: object, event: dict, resp: object, token: object) -> None:
     loki.push(event)
 
 
-@dataclass
-class AdvertiserConfig:
-    """The advertiser one connection stands for.
+def _as_positive_id(value: object) -> int | None:
+    """Return the identifier *value* names, or ``None``.
 
-    A connection carries a single advertiser, so its whole configuration is this
-    one number: the ``advertiser_id`` every request names and every written
-    record repeats.
-    """
-
-    advertiser_id: int
-
-
-def _as_advertiser_id(value: object) -> int | None:
-    """Return the advertiser id *value* names, or ``None``.
-
-    An id written as text is an ordinary way to write it: ``extra`` is JSON
+    An id written as text is an ordinary way to write one: ``extra`` is JSON
     typed by hand in the Airflow UI, where quoting a number is as natural as
-    leaving it bare, so both forms name the same advertiser.
+    leaving it bare, and an answer is free to word an identifier either way too.
 
     A flag is not a number here even though Python counts one as an ``int``, a
-    fractional value names no advertiser, and neither does a number at or below
-    zero: ids the API issues start above it.
+    fractional value names nothing, and neither does a number at or below zero:
+    the ids the API issues start above it.
     """
     if type(value) is bool:
         return None
@@ -1301,8 +1322,8 @@ def _as_advertiser_id(value: object) -> int | None:
     return None
 
 
-def parse_connection(extra: dict) -> AdvertiserConfig | None:
-    """Read ``connection.extra`` into an :class:`AdvertiserConfig`, or ``None``.
+def parse_connection(extra: dict) -> int | None:
+    """Read the ``advertiser_id`` out of ``connection.extra``, or return ``None``.
 
     The single point of knowledge about the shape of ``extra``, which is
     ``{"advertiser_id": 17004}``.  Everything else the connection holds is the
@@ -1331,14 +1352,13 @@ def parse_connection(extra: dict) -> AdvertiserConfig | None:
     if raw is None:
         log.warning("Connection extra holds no 'advertiser_id'.")
         return None
-    advertiser_id = _as_advertiser_id(raw)
+    advertiser_id = _as_positive_id(raw)
     if advertiser_id is None:
         log.warning(
             "Connection extra field 'advertiser_id' is not a positive whole number (got %s).",
             type(raw).__name__,
         )
-        return None
-    return AdvertiserConfig(advertiser_id=advertiser_id)
+    return advertiser_id
 
 
 def _token_from_password(password: object) -> str | None:
@@ -1361,31 +1381,104 @@ def _token_from_password(password: object) -> str | None:
     return token or None
 
 
+#: Stands for a field an answer did not carry at all.  A field holding ``null``
+#: and a field that is absent both read as ``None`` through :meth:`dict.get`,
+#: and the two say opposite things about completeness: one is a flag nothing can
+#: read, the other is the answer declining to call its total an approximation.
+_ABSENT = object()
+
+
 def _declared_total(value: object) -> int | None:
     """Return the row count an answer declares, or ``None`` when none is readable.
 
     The count is what the pagination is checked against, so only a whole number
     counts as one: a flag, a string or a missing field say that the answer named
-    no total, and the caller reports an unverified list rather than comparing
-    against a value it invented.
+    no total, and the caller fails the walk rather than checking it against a
+    value invented here.
     """
     if isinstance(value, bool) or not isinstance(value, int):
         return None
     return value
 
 
+def _declared_rounded(value: object) -> bool | None:
+    """Return whether an answer calls its total an approximation, or ``None``.
+
+    The field is a boolean, and an answer carrying no such field at all — which
+    is what :data:`_ABSENT` says — is one whose total is exact, the reading the
+    completeness check is strictest under.  Anything else, ``null`` included, is
+    unreadable and comes back as ``None`` for the caller to fail on: read as a
+    truthy value, a string such as ``"false"`` would disown the exact check and
+    let a short export finish green, and read as a falsy one it would fail a day
+    that is whole.  A flag that cannot be read leaves no way to know which, and
+    completeness is not something to guess at.
+    """
+    if value is _ABSENT:
+        return False
+    if isinstance(value, bool):
+        return value
+    return None
+
+
+def _page_budget(limit: int, ceiling: int) -> int:
+    """Return how many pages of *limit* rows a walk may ask for.
+
+    The budget is worked out from *ceiling*, the amount of data a walk is
+    allowed, rather than fixed at a number of pages: a campaign-day of a million
+    rows is the same day whether it arrives in a hundred pages or in ten
+    thousand, and a page size chosen to ask the API for less at a time must not
+    turn a large day into a failure that reads as a walk going nowhere.
+
+    :data:`_MAX_PAGES` bounds the count from above, because the ceiling is
+    counted in rows and a small page would spend the whole of a task reaching
+    it.  A walk reading such pages is the one case where the budget runs out
+    before the ceiling does.
+    """
+    return min(-(-ceiling // max(limit, 1)), _MAX_PAGES)
+
+
 def _campaign_record(row: dict) -> dict:
     """Return one dictionary record: the named fields, in a fixed order.
 
-    Values are handed on as the API worded them — an identifier stays a number,
-    a date stays the string it arrived as — because the dictionary describes the
-    campaign the API knows and any rewording here would be a second source of
-    truth about it.
+    Values are handed on as the API worded them — a date stays the string it
+    arrived as — because the dictionary describes the campaign the API knows and
+    any rewording here would be a second source of truth about it.
+
+    ``campaign_id`` is the exception, and it is read as a positive whole number
+    or as nothing at all.  The value names a campaign in a request, in a record
+    key, in an ``INTEGER`` column and — through the diagnostic event and the
+    task log — in text that leaves the process, so what an answer put there is
+    admitted at one type only: a value of any other kind would travel unbounded
+    into all four.  Nothing at all is what :meth:`AdmetricaHook.get_campaigns`
+    fails the export over, so no record written anywhere carries it.
 
     A field the answer left out is present and empty, so every record of a file
     carries the same keys and a table schema written once holds them all.
     """
-    return {field: row.get(field) for field in _CAMPAIGN_FIELDS}
+    record = {field: row.get(field) for field in _CAMPAIGN_FIELDS}
+    record["campaign_id"] = _as_positive_id(record["campaign_id"])
+    return record
+
+
+def _describe_campaign(row: dict, token: object) -> str:
+    """Return the words that name a campaign whose id could not be read.
+
+    The type of what the answer put in ``campaign_id``, the value itself when it
+    is one a diagnostic may carry, and the campaign's name when the answer gave
+    one.  The name and a textual id are the server's own words, so they leave
+    through the gate every text leaves by; a number, which is short and holds no
+    text, is spelled out as it arrived.
+    """
+    raw = row.get("campaign_id")
+    if type(raw) in (int, float, bool):
+        described = f"a {type(raw).__name__} of {raw}"
+    elif type(raw) is str:
+        text = _safe_text(raw, token, limit=_PARAM_VALUE_LIMIT)
+        described = f"a str of {text!r}" if text else "a str of unusable text"
+    else:
+        described = f"a {type(raw).__name__}"
+    name = _safe_text(row.get("name"), token)
+    return f"{described}; the campaign is named {name!r}" if name else described
 
 
 def _resolve_placeholders(text: str, extra_params: dict | None) -> str:
@@ -1411,9 +1504,12 @@ def _resolve_placeholders(text: str, extra_params: dict | None) -> str:
         if parameter in params:
             return str(params[parameter])
         log.warning(
-            "Name %r names the parameter %r, which the request does not carry; "
-            "the record key keeps the parameter's name in place of its value.",
-            text,
+            "A name of %d character(s) in this request names the parameter %r, "
+            "which the request does not carry; the record key keeps the "
+            "parameter's name in place of its value. The name is given by its "
+            "length rather than quoted: it is the caller's own text and this "
+            "line is read from a task log.",
+            len(text),
             parameter,
         )
         return parameter
@@ -1433,8 +1529,8 @@ def _normalize_name(name: object, extra_params: dict | None = None) -> str:
     in it, is ``interest2d1``.
 
     This key is a public contract: it is what an analyst writes in
-    ``JSON_VALUE(dimensions.device_type)`` and what the documentation lists
-    beside every name.  Changing the rule renames columns of every file written
+    ``JSON_VALUE(dimensions, '$.device_type')`` and what the documentation
+    lists beside every name.  Changing the rule renames columns of every file written
     after the change while leaving the ones before it under the old names, and
     a query that names the old key answers NULL rather than failing.
 
@@ -1453,10 +1549,11 @@ def _normalize_name(name: object, extra_params: dict | None = None) -> str:
 def _row_values(raw_row: object, key: str) -> list:
     """Return the row's list under *key*, empty when the row carries none.
 
-    A row that is not a dict, or one whose groupings or metrics are not a list,
-    is answered as a row that brought nothing: the caller pairs by position and
-    reports what it was short of, which says more than an exception raised over
-    a single row of a page that arrived otherwise whole.
+    A row that is not a dict, and one whose groupings or metrics are not a list,
+    both answer as a row that brought nothing.  What that means is the caller's
+    to decide, and it decides it by the number of names the request asked for:
+    a row that brought nothing where anything was asked for is a row the answer
+    cannot be read out of at all.
     """
     values = raw_row.get(key) if isinstance(raw_row, dict) else None
     return values if isinstance(values, list) else []
@@ -1467,40 +1564,68 @@ def _named_values(
     values: list,
     extra_params: dict | None,
     kind: str,
+    date: str,
     campaign_id: object,
 ) -> dict:
     """Pair requested *names* with the *values* the answer returned, by position.
 
     The answer carries values in the order they were asked for and names none of
     them, so position is the only thing tying a number to the metric it
-    measures.  A name the answer has no value for is present and empty, which
-    keeps every record of a request carrying the same keys; a value no name
-    claims has nowhere to go and is left out.  Either way the mismatch is
-    logged, because both mean the request and the answer disagree about the
-    report.
+    measures.  A row carrying another number of values is therefore a row whose
+    values cannot be told apart: keeping what lines up would leave keys empty or
+    drop the values no name claims, while the row counts towards ``total_rows``
+    either way, so the day would pass its completeness check and be written with
+    values missing from a row.  Such a row fails the day instead, naming the
+    campaign, the day and the two counts.
+
+    An empty value is written through as it arrived, on both halves.  A metric
+    typed ``percents`` or ``currency`` — ``am:e:ctr``, ``am:e:cpm``, the
+    ``video*Percent`` family — comes back empty wherever its denominator or its
+    cost is, so a report asking for those alone answers in rows of empty
+    numbers; a grouping the API has no value for is what ``include_undefined``
+    asks to be sent.  Each is a documented answer, reaches the record as
+    ``None`` and is written as JSON ``null``, which BigQuery reads as NULL.
+
+    Two requested names can normalise to one record key — the two spellings of
+    a parameterised name do, and ``am:e:goal12345Reaches`` beside
+    ``am:e:goal<goal_id>Reaches`` with ``goal_id=12345`` is the case that
+    happens.  The record holds one value under the key, the later of the two,
+    and a WARNING names the two by their position in the request and the key by
+    its length.  The requested names themselves never reach the log: they are
+    the caller's own text, a credential is among the things a caller can write
+    there, and this function has no token to hold such text against.
     """
     if len(values) != len(names):
-        log.warning(
-            "AdMetrica returned %d %s value(s) for campaign %s where %d were asked "
-            "for; the record keeps what lines up by position.",
-            len(values),
-            kind,
-            campaign_id,
-            len(names),
+        raise _MaskedError(
+            f"AdMetrica answered with {len(values)} {kind} value(s) in a row of "
+            f"campaign {campaign_id} on {date}, where the request asks for "
+            f"{len(names)}. "
+            f"The answer names none of them, so position is all that ties a value "
+            f"to the name it was asked for by, and a row of another length is a "
+            f"row whose values cannot be told apart — while it counts towards "
+            f"total_rows whatever is read out of it. The day stops here rather "
+            f"than being written with values missing from a row."
         )
     record: dict = {}
+    first_position: dict[str, int] = {}
     for position, name in enumerate(names):
         key = _normalize_name(name, extra_params)
-        if key in record:
+        if key in first_position:
             log.warning(
-                "%s %r writes the record key %r, which an earlier %s of the same "
-                "request already writes; the later value is the one in the record.",
-                kind.capitalize(),
-                name,
-                key,
+                "The %s at position %d of this request writes the record key that "
+                "the %s at position %d already writes, a key of %d character(s); "
+                "the record holds the later value under it. The two are named by "
+                "their position rather than quoted: a requested name is the "
+                "caller's own text and this line is read from a task log.",
                 kind,
+                position + 1,
+                kind,
+                first_position[key] + 1,
+                len(key),
             )
-        record[key] = values[position] if position < len(values) else None
+        else:
+            first_position[key] = position
+        record[key] = values[position]
     return record
 
 
@@ -1515,9 +1640,15 @@ def _map_row(
 ) -> dict:
     """Return one record of statistics built from one row of a report.
 
-    Pure: it reads its arguments and returns a dict, so what a record looks like
-    is decided in one place and can be checked without a network or a
+    Pure: it reads its arguments and answers out of them alone — a dict, or a
+    failure over a row it will not make a record of — so what a record looks
+    like is decided in one place and can be checked without a network or a
     connection.
+
+    A row carrying another number of values than the request asked for fails the
+    day here.  It would otherwise become a record with nothing under some of its
+    keys while counting towards the total the day is checked against, so the
+    file would look whole with a row of it hollowed out.
 
     The service fields are flat and typed.  ``date`` is stamped here because the
     report has no date in it at all: a day is asked for as ``date1=date2`` and
@@ -1548,6 +1679,7 @@ def _map_row(
             _row_values(raw_row, "dimensions"),
             extra_params,
             "dimension",
+            date,
             campaign_id,
         ),
         "metrics": _named_values(
@@ -1555,6 +1687,7 @@ def _map_row(
             _row_values(raw_row, "metrics"),
             extra_params,
             "metric",
+            date,
             campaign_id,
         ),
     }
@@ -1571,17 +1704,28 @@ def _row_key(raw_row: object) -> tuple:
 
     The projection is spelled out rather than left to the objects themselves,
     which are dicts and cannot be put in a set.  Each grouping contributes its
-    ``id`` where the answer carried one and its ``name`` otherwise, tagged with
-    which of the two it is: two placements sharing a name and differing in ``id``
-    are two rows, and reading the name alone would call the second one a
-    duplicate and fail a day that is perfectly whole.
+    ``id`` where the answer carried a value under it and its ``name`` otherwise,
+    tagged with which of the two it is: two placements sharing a name and
+    differing in ``id`` are two rows, and reading the name alone would call the
+    second one a duplicate and fail a day that is perfectly whole.  The
+    specification guarantees ``name`` alone, so an ``id`` holding ``null`` — an
+    unregistered creative, a placement the answer has no number for — says as
+    little as one that never arrived, and the name is what tells such rows
+    apart.
+
+    A value carrying neither, and a value that is not an object at all, are read
+    whole instead: the whole of what arrived is what tells two such rows apart,
+    and projecting them onto a constant would call every one of them a repeat of
+    the first and fail a day nothing is wrong with.
     """
     key = []
     for value in _row_values(raw_row, "dimensions"):
-        if isinstance(value, dict) and "id" in value:
+        if isinstance(value, dict) and value.get("id") is not None:
             key.append(("id", str(value["id"])))
+        elif isinstance(value, dict) and "name" in value:
+            key.append(("name", str(value["name"])))
         elif isinstance(value, dict):
-            key.append(("name", str(value.get("name"))))
+            key.append(("raw", str(sorted((str(k), str(v)) for k, v in value.items()))))
         else:
             key.append(("raw", str(value)))
     return tuple(key)
@@ -1599,13 +1743,73 @@ def _describe_row_key(key: tuple, token: object) -> str:
     return _safe_text(str(key), token) or f"<{len(key)} grouping value(s)>"
 
 
-def _check_report_limits(dimensions: Sequence[str], metrics: Sequence[str]) -> None:
-    """Fail on a request the API documents as too large, before it is sent.
+def check_date(date: object) -> None:
+    """Fail on a day that is not a day, before anything is requested.
+
+    ``date1`` and ``date2`` carry this value and the endpoint reads a day in one
+    spelling only, so a day written any other way is a 400 whose body says
+    considerably less, after the wait for it has been paid.  The same value is
+    stamped onto every record and, above this module, names a file and a
+    partition, so holding it to :data:`DATE_FORMAT` here is what makes those
+    three agree.
+
+    The parse is written back out and compared: ``strptime`` reads an unpadded
+    month, and a day spelled ``2026-8-20`` would go out as one string and name
+    records that no other day of the export matches.
+
+    The refusal names the value by type and length rather than quoting it.  The
+    day arrives from the caller and may hold anything at all, a credential among
+    the possibilities, while this text is read from a task log and a traceback
+    like every other text this module lets out.
+    """
+    parsed = None
+    if type(date) is str:
+        try:
+            parsed = datetime.strptime(date, DATE_FORMAT)
+        except ValueError:
+            parsed = None
+    if parsed is None or parsed.strftime(DATE_FORMAT) != date:
+        given = (
+            f"a str of {len(date)} character(s)"
+            if type(date) is str
+            else f"a value of type {type(date).__name__}"
+        )
+        raise ValueError(
+            f"date must be a day written as {DATE_FORMAT}, as in 2026-08-20; "
+            f"{given} was given."
+        )
+
+
+def _check_report_limits(
+    dimensions: Sequence[str], metrics: Sequence[str], limit: object
+) -> None:
+    """Fail on a request the API documents as out of bounds, before it is sent.
 
     The ceilings are the documented ones, and the refusal names which list is
     over and by how much — an unchecked request comes back as a 400 whose body
     says considerably less, after the wait for it has been paid.
+
+    A report with no metrics is refused here for the same reason: the parameter
+    is required, an empty one goes out as ``metrics=``, and the 400 that answers
+    it says nothing about which parameter was empty.
+
+    ``limit`` is checked at both ends.  Above the documented ceiling the API
+    refuses the request; at or below zero it silently falls back to its own
+    default of 100 rows, and a page shorter than the one the walk believes it
+    asked for is then never short — the walk would go on until the page cap
+    stops it.
+
+    A ``limit`` that is not a whole number is named by its type rather than
+    quoted: it arrives from the caller and may hold anything at all, a
+    credential among the possibilities, while this text is read from a task log
+    and a traceback like every other text this module lets out.  A whole number
+    is quoted as itself, since a number says nothing beyond the range it fell
+    outside of.
     """
+    if not metrics:
+        raise ValueError(
+            "AdMetrica needs at least one metric per request; none were given."
+        )
     if len(metrics) > _MAX_METRICS:
         raise ValueError(
             f"AdMetrica accepts at most {_MAX_METRICS} metrics per request; "
@@ -1615,6 +1819,12 @@ def _check_report_limits(dimensions: Sequence[str], metrics: Sequence[str]) -> N
         raise ValueError(
             f"AdMetrica accepts at most {_MAX_DIMENSIONS} dimensions per request; "
             f"{len(dimensions)} were given."
+        )
+    if type(limit) is not int or not 0 < limit <= _MAX_LIMIT:
+        given = repr(limit) if type(limit) is int else f"a {type(limit).__name__}"
+        raise ValueError(
+            f"limit must be a whole number between 1 and {_MAX_LIMIT}; {given} "
+            f"was given."
         )
 
 
@@ -1687,6 +1897,13 @@ class AdmetricaHook(BaseHook):
 
     Diagnostics are opt-in.  Without a sink the hook still runs and still logs;
     with one, every attempt at every endpoint leaves an event behind.
+
+    :meth:`test_connection` is a helper to call from a DAG or a shell rather than
+    the Airflow UI's Test button: this provider declares no ``connection-types``,
+    so Airflow never registers the class, and a connection of type HTTP is tested
+    by the HTTP provider's own hook.  The class attributes below say which
+    connection kind this hook reads and what to call it, and nothing in Airflow
+    dispatches on them.
     """
 
     conn_name_attr = "admetrica_conn_id"
@@ -1699,8 +1916,8 @@ class AdmetricaHook(BaseHook):
         *,
         admetrica_conn_id: str = default_conn_name,
         loki: LokiClient | None = None,
-        request_delay: float = _DEFAULT_REQUEST_DELAY,
-        limit: int = _DEFAULT_LIMIT,
+        request_delay: float = DEFAULT_REQUEST_DELAY,
+        limit: int = DEFAULT_LIMIT,
     ) -> None:
         super().__init__()
         self.admetrica_conn_id = admetrica_conn_id
@@ -1710,6 +1927,10 @@ class AdmetricaHook(BaseHook):
         self._loki = loki
         #: The connection, read on first use and kept for the hook's lifetime.
         self._connection: Connection | None = None
+        #: The advertiser the connection names, read on first use and kept.
+        self._advertiser_id: int | None = None
+        #: The OAuth token, read out of the connection on first use and kept.
+        self._token: str | None = None
         #: The advertiser's campaigns, fetched on first use and kept: the
         #: statistics and the dictionary of one run are served by one answer.
         self._campaigns: list[dict] | None = None
@@ -1746,10 +1967,16 @@ class AdmetricaHook(BaseHook):
         return extra if isinstance(extra, dict) else {}
 
     def _get_token(self) -> str:
-        """Return the OAuth token, or fail with what to put where."""
-        token = _token_from_password(self._get_connection().password)
+        """Return the OAuth token, or fail with what to put where.
+
+        Read out of the connection once and kept, so that the value the masking
+        gate searches for is the one value this hook ever read.
+        """
+        if self._token is None:
+            self._token = _token_from_password(self._get_connection().password)
+        token = self._token
         if token is None:
-            raise AirflowException(
+            raise _MaskedError(
                 f"Connection {self.admetrica_conn_id!r} holds no OAuth token. "
                 f"Put the token in the connection's password field, without the "
                 f"{_TOKEN_SCHEME!r} scheme in front of it."
@@ -1836,6 +2063,10 @@ class AdmetricaHook(BaseHook):
             # Per attempt, so that a network failure reports the absence of a
             # response instead of the body the previous attempt received.
             resp: requests.Response | None = None
+            # Set by the safety net below for an interruption of the task
+            # itself, and read in `finally` as the one answer to "may this
+            # attempt still be reported".
+            interrupted = False
             try:
                 started = time.monotonic()
                 try:
@@ -1847,10 +2078,16 @@ class AdmetricaHook(BaseHook):
                     event["outcome"] = "network_error"
                     _record_exception(event, e)
                     if last_attempt:
-                        raise AirflowException(
+                        # Raised with no exception attached: the original is
+                        # the environment's own writing — a proxy URL with the
+                        # credential in it, a wrapped socket error — and an
+                        # exception carried as cause or context is printed with
+                        # its own text into the task log, past every gate. What
+                        # it said travels as the scrubbed text above instead.
+                        raise _MaskedError(
                             f"Request to {url} failed after {max_attempts} attempts: "
                             f"{_exception_text(e, token)}"
-                        ) from e
+                        ) from None
                     retry_delay = _BACKOFF_DELAYS[attempt]
                 else:
                     _stamp_duration(event, started)
@@ -1869,10 +2106,14 @@ class AdmetricaHook(BaseHook):
                             _record_exception(event, e)
                             position = event["exception_message"]
                             detail = f" ({position})" if position else ""
-                            raise AirflowException(
+                            # Nothing attached, for the reason the network
+                            # failure above is raised the same way: an exception
+                            # carried along would print its own text, which is
+                            # the decoder's report of a body no gate has seen.
+                            raise _MaskedError(
                                 f"AdMetrica {endpoint} returned an HTTP 200 body "
                                 f"that is not JSON{detail}"
-                            ) from e
+                            ) from None
 
                         if _classify_payload(event, data):
                             _stamp_report_meta(event, data, token)
@@ -1887,7 +2128,7 @@ class AdmetricaHook(BaseHook):
                             event["error_code"], event["error_message"] = _summarize_error(
                                 error, token
                             )
-                        raise AirflowException(
+                        raise _MaskedError(
                             _with_error(
                                 f"AdMetrica {endpoint} returned HTTP 200 with "
                                 f"{_describe_unreadable_body(event)}",
@@ -1898,7 +2139,7 @@ class AdmetricaHook(BaseHook):
                     elif resp.status_code == 401:
                         event["outcome"] = "auth_error"
                         _stamp_response_error(event, resp, token)
-                        raise AirflowException(
+                        raise _MaskedError(
                             _with_error(
                                 f"AdMetrica {endpoint} returned 401 Unauthorized: the OAuth "
                                 f"token in connection {self.admetrica_conn_id!r} was refused, "
@@ -1913,43 +2154,64 @@ class AdmetricaHook(BaseHook):
                             _record_rate_limit(event, resp, token)
                         _stamp_response_error(event, resp, token)
                         if last_attempt:
-                            raise AirflowException(
+                            raise _MaskedError(
                                 _with_error(
                                     f"AdMetrica {endpoint} returned {resp.status_code} for "
                                     f"{url} on attempt {max_attempts} of {max_attempts}",
                                     event,
                                 )
                             )
-                        retry_delay = _retry_delay(resp, _BACKOFF_DELAYS[attempt])
+                        # The server's own `Retry-After` wins whenever it
+                        # named one, in both directions: a longer wait is a
+                        # window that has not passed yet, a shorter one an
+                        # invitation to come back before the ladder would.
+                        asked = _retry_after(resp)
+                        retry_delay = (
+                            _BACKOFF_DELAYS[attempt] if asked is None else asked
+                        )
 
                     else:
                         event["outcome"] = "http_error"
                         _stamp_response_error(event, resp, token)
-                        raise AirflowException(
+                        raise _MaskedError(
                             _with_error(
                                 f"AdMetrica {endpoint} returned {resp.status_code} for {url}",
                                 event,
                             )
                         )
             except BaseException as e:
-                # Safety net: record what escaped, then let the original
-                # exception through untouched — type, message and traceback are
-                # the caller's contract.  `BaseException` so that an interrupted
-                # attempt is classified too: the push in `finally` runs for those
-                # as well, and `outcome` must never reach Loki as the
-                # placeholder "unknown".
+                # Safety net: record what escaped, then decide how it leaves.
+                # `BaseException` so that an interrupted attempt is classified
+                # too: the push in `finally` runs for those as well, and
+                # `outcome` must never reach Loki as the placeholder "unknown".
                 _record_exception(event, e)
                 if event["outcome"] == _OUTCOME_UNKNOWN:
                     event["outcome"] = "unexpected_error"
-                raise
+                interrupted = not isinstance(e, Exception)
+                if interrupted or isinstance(e, _MaskedError):
+                    # An interruption is the task being stopped and belongs to
+                    # Airflow whole; a `_MaskedError` is this module's own
+                    # wording, every one of them out of text the gate has
+                    # already seen.
+                    raise
+                # Anything else was raised by the environment, and its text is
+                # the environment's own writing — a library naming the proxy it
+                # dialled, credentials and all.  It leaves as text the gate has
+                # seen, with the type named so the failure is still identifiable,
+                # and with nothing attached: an exception carried as cause or
+                # context is printed with its own text into the task log, past
+                # every gate.
+                raise _MaskedError(
+                    f"Request to {url} failed with an unexpected "
+                    f"{type(e).__name__}: {_exception_text(e, token)}"
+                ) from None
             finally:
                 # An interruption on its way out means the task is being
                 # stopped, with the alarm or signal behind it firing once:
                 # pushing here would hold the stop for the length of a push, so
                 # the attempt a stop cut short goes unreported, deliberately —
                 # the reason for it is in the Airflow task log.
-                in_flight = sys.exc_info()[1]
-                if in_flight is None or isinstance(in_flight, Exception):
+                if not interrupted:
                     try:
                         if event["outcome"] != "success":
                             # The task log gets the chronicle of the page: one
@@ -1984,15 +2246,21 @@ class AdmetricaHook(BaseHook):
         The way out of the connection for a number the written records carry and
         the paths in S3 are built from: a caller that needs the advertiser reads
         it here instead of being configured with it a second time.
+
+        Read once and kept, like the connection it comes from: a day of one
+        advertiser asks for it dozens of times, and an extra that names no
+        advertiser would otherwise write its WARNING once per ask.
         """
-        config = parse_connection(self._get_extra())
-        if config is None:
-            raise AirflowException(
-                f"Connection {self.admetrica_conn_id!r} names no advertiser. "
-                f"Its extra must hold a positive whole 'advertiser_id', as in "
-                f'{{"advertiser_id": 17004}}.'
-            )
-        return config.advertiser_id
+        if self._advertiser_id is None:
+            advertiser_id = parse_connection(self._get_extra())
+            if advertiser_id is None:
+                raise _MaskedError(
+                    f"Connection {self.admetrica_conn_id!r} names no advertiser. "
+                    f"Its extra must hold a positive whole 'advertiser_id', as in "
+                    f'{{"advertiser_id": 17004}}.'
+                )
+            self._advertiser_id = advertiser_id
+        return self._advertiser_id
 
     def get_campaigns(self) -> list[dict]:
         """Return the advertiser's campaigns, one record per campaign.
@@ -2002,18 +2270,35 @@ class AdmetricaHook(BaseHook):
         real as an active one's — a filter here would silently shorten every
         re-export of an earlier period.
 
+        A campaign whose ``campaign_id`` is not a positive whole number fails
+        the export.  Statistics are asked for one campaign at a time and named
+        by that id, so such a campaign is one whose rows no request can ask for:
+        leaving it out would write a day short of everything it ran, and the
+        shortfall would be found weeks later, when the period can no longer be
+        re-requested.
+
         Pagination walks the list with ``limit`` and ``offset`` spelled out, the
         offset counting the rows already skipped and therefore starting at zero.
-        It ends on the declared total or on a page shorter than the one asked
-        for, and the count collected is checked against the total afterwards:
-        a page cut short before the total is closed means whole campaigns were
-        lost, and with them every row of statistics they would have contributed,
-        so the day fails instead of arriving short.  An answer that declares no
-        readable total leaves that check nothing to compare against and says so
-        in the log.
+        It ends on a page shorter than the one asked for — the answer's own word
+        that the campaigns have run out — and the declared total is what the
+        collected list is checked against, never where the walk stops.  A total
+        reached exactly on a full page would end the walk on the API's count of
+        the list rather than on the list itself, and a count that is one page
+        stale would leave every campaign after it unasked for, along with every
+        row of statistics they ran.  The price is one further request whenever
+        the list ends exactly on a page boundary, and it buys the tail.
 
-        The list is fetched once and kept for the hook's lifetime: the
-        statistics and the dictionary of one run are two readers of one answer.
+        A page cut short before the total is reached means whole campaigns were
+        lost, so the export fails instead of arriving short.  The total is read
+        from every page and has to be there and stay the same: a page declaring
+        no readable total is a page nothing can check the list against, and a
+        total that changes between pages leaves two answers to how long the list
+        is; either way the export fails rather than claiming a completeness it
+        cannot show.
+
+        The list is fetched once and kept for the hook's lifetime, which is one
+        task instance: the statistics and the dictionary of one day are two
+        readers of one answer.
 
         ``snapshot_date`` is not here.  The field belongs to the operator, which
         writes it into every record, names the file with the same date and
@@ -2025,9 +2310,11 @@ class AdmetricaHook(BaseHook):
 
         advertiser_id = self.advertiser_id
         campaigns: list[dict] = []
+        seen: set[int] = set()
         total: int | None = None
         offset = 0
-        while True:
+        budget = _page_budget(_CAMPAIGNS_LIMIT, _MAX_CAMPAIGNS)
+        for _ in range(budget):
             page = self._request_page(
                 "campaigns",
                 {
@@ -2040,25 +2327,65 @@ class AdmetricaHook(BaseHook):
             # A list of dicts under the endpoint's rows key is the only body the
             # request path hands back at all; every other shape has already
             # failed the attempt there.
-            rows = page["campaigns"]
-            campaigns.extend(_campaign_record(row) for row in rows)
+            rows = page[_ROWS_KEYS["campaigns"]]
+            for row in rows:
+                record = _campaign_record(row)
+                campaign_id = record["campaign_id"]
+                if campaign_id is None:
+                    raise _MaskedError(
+                        f"AdMetrica listed a campaign of advertiser {advertiser_id} "
+                        f"whose campaign_id is not a positive whole number "
+                        f"({_describe_campaign(row, self._maskable_token())}). "
+                        f"Statistics are asked for one campaign at a time and named "
+                        f"by that id, so a campaign that cannot be named is a "
+                        f"campaign whose rows would be missing from every day "
+                        f"exported, and missing quietly. The export stops here."
+                    )
+                if campaign_id in seen:
+                    raise _MaskedError(
+                        f"AdMetrica listed campaign {campaign_id} of advertiser "
+                        f"{advertiser_id} twice. A list that repeats a campaign is "
+                        f"a list the offset is not moving through, so the walk "
+                        f"stops here rather than reading the same page forever."
+                    )
+                seen.add(campaign_id)
+                campaigns.append(record)
+            declared = _declared_total(page.get("total"))
+            if declared is None:
+                raise _MaskedError(
+                    f"AdMetrica answered a page of campaigns for advertiser "
+                    f"{advertiser_id} at offset {offset} with no readable total "
+                    f"(the field holds {type(page.get('total')).__name__}). The total "
+                    f"is what the collected list is checked against, so a list without "
+                    f"one is a list whose missing campaigns would take all of their "
+                    f"statistics with them, quietly. The export stops here."
+                )
             if total is None:
-                total = _declared_total(page.get("total"))
+                total = declared
+            elif declared != total:
+                raise _MaskedError(
+                    f"AdMetrica declared {total} campaigns for advertiser "
+                    f"{advertiser_id} on an earlier page and {declared} on the page at "
+                    f"offset {offset}. The declared total is what the collected list "
+                    f"is checked against, so a total that changes under the walk is "
+                    f"one neither answer can be trusted from. The export stops here "
+                    f"rather than being checked against a number the API has already "
+                    f"replaced."
+                )
             if len(rows) < _CAMPAIGNS_LIMIT:
                 break
             offset += len(rows)
-            if total is not None and len(campaigns) >= total:
-                break
-
-        if total is None:
-            log.warning(
-                "AdMetrica declared no readable campaign total for advertiser %s; "
-                "%d campaigns were collected and their completeness is unverified.",
-                advertiser_id,
-                len(campaigns),
+        else:
+            raise _MaskedError(
+                f"AdMetrica kept answering with full pages of campaigns for "
+                f"advertiser {advertiser_id} after {budget} of them, "
+                f"{budget * _CAMPAIGNS_LIMIT} campaigns in all. A walk that does "
+                f"not converge is one the offset is not moving through, so it "
+                f"stops here rather than running for the length of the task."
             )
-        elif len(campaigns) != total:
-            raise AirflowException(
+
+        if len(campaigns) != total:
+            raise _MaskedError(
                 f"AdMetrica returned {len(campaigns)} campaigns for advertiser "
                 f"{advertiser_id} while declaring {total}. A campaign missing from "
                 f"the list takes all of its statistics with it, so the export stops "
@@ -2071,33 +2398,27 @@ class AdmetricaHook(BaseHook):
     def _maskable_token(self) -> str | None:
         """Return the token already read, or ``None`` while none has been.
 
-        What the masking gate looks for, taken from the connection this hook
-        holds rather than by reading one: it answers while a failure is being
-        described, and a failure that arrives before the connection was read
-        arrived before anything could carry the token, so there is nothing to
-        search the text for.  Never raises.
+        What the masking gate looks for, taken from what this hook has already
+        read rather than by reading a connection: it answers while a failure is
+        being described, and a failure that arrives before the token was read
+        arrived before anything could carry it, so there is nothing to search
+        the text for.  Never raises.
         """
-        connection = self._connection
-        if connection is None:
-            return None
-        try:
-            return _token_from_password(connection.password)
-        except Exception:
-            return None
+        return self._token
 
     def test_connection(self) -> tuple[bool, str]:
-        """Answer the Test Connection button: does this connection work.
+        """Answer whether this connection works, as a flag and a sentence.
 
         The check is the campaign list, because it exercises at once everything
         a task depends on — the token is accepted, the advertiser is real and
         the account may read the API — and it costs one request to an endpoint
         that returns no statistics.
 
-        Both halves of the answer belong to the button, so nothing leaves here
-        as an exception, and the text of a failure passes through the same gate
-        every text leaves this module by: a server, a proxy or a wrapped network
-        failure can word an error with the credential inside it, and the button
-        shows its text to whoever pressed it.
+        The whole answer is the returned pair, so nothing leaves here as an
+        exception, and the text of a failure passes through the same gate every
+        text leaves this module by: a server, a proxy or a wrapped network
+        failure can word an error with the credential inside it, and the text is
+        written to be read by a person.
         """
         try:
             # First, so that a connection Airflow cannot find is reported as
@@ -2139,8 +2460,8 @@ class AdmetricaHook(BaseHook):
         A campaign is a request because the API offers no grouping by campaign
         and sums the campaigns named in ``ids`` together: one request per
         campaign is the only way the split survives at all.  The list of
-        campaigns comes from :meth:`get_campaigns`, so one run asks the
-        management API once however many days it exports.
+        campaigns comes from :meth:`get_campaigns`, so one task instance asks
+        the management API once however many campaigns it walks.
 
         ``sort`` goes out naming every grouping that was asked for.  The report
         is aggregated by them, so their combination orders the rows completely
@@ -2149,18 +2470,19 @@ class AdmetricaHook(BaseHook):
         within that tail is the API's to choose — and rows would move between
         pages while the walk was reading them.
 
-        The documented ceilings and the parameters this hook owns are checked
-        before the first request, so a report configured wrongly costs nothing
-        and says what is wrong.
+        The day, the documented ceilings and the parameters this hook owns are
+        checked before the first request, so a report configured wrongly costs
+        nothing and says what is wrong.
 
-        Raises :class:`ValueError` on a request the API documents as too large
-        or on an ``extra_params`` key the hook owns, and
-        :class:`~airflow.exceptions.AirflowException` on a day that came back
-        incomplete.
+        Raises :class:`ValueError` on a day not written as :data:`DATE_FORMAT`,
+        on a request the API documents as too large or on an ``extra_params``
+        key the hook owns, and :class:`~airflow.exceptions.AirflowException` on
+        a day that came back incomplete.
         """
+        check_date(date)
         dimensions = list(dimensions)
         metrics = list(metrics)
-        _check_report_limits(dimensions, metrics)
+        _check_report_limits(dimensions, metrics, self.limit)
         _check_extra_params(extra_params)
 
         advertiser_id = self.advertiser_id
@@ -2178,11 +2500,17 @@ class AdmetricaHook(BaseHook):
 
         records: list[dict] = []
         for campaign in self.get_campaigns():
+            # A positive whole number for every campaign of the list, because
+            # `get_campaigns` fails the export over one it could not read: `ids`
+            # is required, and `requests` drops a parameter of `None`, so the
+            # request would go out asking for every campaign at once and come
+            # back summed, with the rows stamped as belonging to no campaign.
+            campaign_id = campaign["campaign_id"]
             records.extend(
                 self._collect_campaign(
                     date=date,
                     advertiser_id=advertiser_id,
-                    campaign_id=campaign["campaign_id"],
+                    campaign_id=campaign_id,
                     base_params=base_params,
                     dimensions=dimensions,
                     metrics=metrics,
@@ -2259,15 +2587,26 @@ class AdmetricaHook(BaseHook):
         The offset counts rows from one, which is this endpoint's own numbering:
         a walk starting at zero would ask for the first row twice.
 
-        Where the walk stops depends on ``total_rows_rounded``.  With the flag
-        clear the declared total is a number to stop on, alongside a page
-        shorter than the one asked for.  With it set only the short page stops
-        the walk, because a rounded total is unusable as a stopping condition:
-        10 437 rows declared as 10 000 against ``limit=10000`` would fill the
-        first page exactly, match the total, and end the export with the tail
-        left behind.  The flag is remembered once seen, so a total declared
-        exactly on an earlier page cannot re-arm a check the answer has since
-        disowned.
+        The walk ends on a page shorter than the one asked for, and on nothing
+        else: that short page is the report's own word that the rows have run
+        out, while ``total_rows`` is a number about the report rather than the
+        report itself.  Stopping on it would end a day early whenever it is low
+        by a page — 10 437 rows declared as 10 000 against ``limit=10000`` fill
+        the first page exactly, match the total and leave the tail behind — and
+        ``total_rows_rounded`` says outright that such a number may be off.  So
+        the total is what the collected rows are checked against afterwards, and
+        the walk pays one further request whenever a campaign-day ends exactly
+        on a page boundary.
+
+        ``total_rows`` and ``total_rows_rounded`` are read from every page and
+        both have to be readable: a page without a usable ``total_rows``, one
+        whose ``total_rows_rounded`` is not a boolean, and — while the totals
+        are exact — one naming a different total than an earlier page all fail
+        the day.  Each is a completeness signal the day would otherwise be
+        called whole without, and a rounded total is exempt from the last only
+        because approximations are free to differ.  The rounding flag is
+        remembered once seen, so a later page declaring an exact total cannot
+        re-arm a check the answer has already disowned.
 
         Rows are checked against each other by the identity of their groupings,
         and the set of what has been seen lives here — one campaign, one set.
@@ -2278,14 +2617,22 @@ class AdmetricaHook(BaseHook):
         pages that overlap are pages that also skip, and counting rows cannot
         tell the two apart.  With no groupings asked for the report is a single
         row, there is no pagination and nothing to check.
+
+        :func:`_page_budget` bounds the walk whatever the answers say.  A short
+        page is the one thing that ends it, so an endpoint answering every
+        offset with a full page of rows would be read for as long as the task
+        lives; the budget turns that into a failure naming it, and is worked out
+        from ``limit`` so that the rows a walk is allowed are the same however
+        small the pages carrying them.
         """
         records: list[dict] = []
         seen: set[tuple] = set()
         total: int | None = None
         rounded = False
         offset = _STAT_OFFSET_BASE
+        budget = _page_budget(self.limit, _MAX_ROWS)
 
-        while True:
+        for _ in range(budget):
             page = self._request_page(
                 "stat",
                 {"ids": campaign_id, **base_params, "offset": offset},
@@ -2299,17 +2646,48 @@ class AdmetricaHook(BaseHook):
             # A list of dicts under the endpoint's rows key is the only body the
             # request path hands back at all; every other shape has already
             # failed the attempt there.
-            rows = page["data"]
+            rows = page[_ROWS_KEYS["stat"]]
             _log_report_caveats(page, date, campaign_id, self._maskable_token())
+            declared_rounded = page.get("total_rows_rounded", _ABSENT)
+            flag = _declared_rounded(declared_rounded)
+            if flag is None:
+                raise _MaskedError(
+                    f"AdMetrica answered for campaign {campaign_id} on {date} at "
+                    f"offset {offset} with a total_rows_rounded that is not a boolean "
+                    f"(the field holds {type(declared_rounded).__name__}). The flag "
+                    f"says whether total_rows may be matched exactly, so it decides "
+                    f"how strictly the day is checked. The day stops here rather than "
+                    f"being checked under a guess."
+                )
+            rounded = rounded or flag
+            declared = _declared_total(page.get("total_rows"))
+            if declared is None:
+                raise _MaskedError(
+                    f"AdMetrica answered for campaign {campaign_id} on {date} at "
+                    f"offset {offset} with no readable total_rows (the field holds "
+                    f"{type(page.get('total_rows')).__name__}). The total is what the "
+                    f"collected rows are checked against, so an answer without one is "
+                    f"an answer a short day would pass unnoticed under. The day stops "
+                    f"here."
+                )
             if total is None:
-                total = _declared_total(page.get("total_rows"))
-            rounded = rounded or bool(page.get("total_rows_rounded"))
+                total = declared
+            elif declared != total and not rounded:
+                raise _MaskedError(
+                    f"AdMetrica declared {total} rows for campaign {campaign_id} on "
+                    f"{date} on an earlier page and {declared} on the page at offset "
+                    f"{offset}, both of them exact. The declared total is what the "
+                    f"collected rows are checked against, so a total that changes "
+                    f"under the walk is one neither answer can be trusted from. The "
+                    f"day stops here rather than being checked against a number the "
+                    f"API has already replaced."
+                )
 
             for raw_row in rows:
                 if dimensions:
                     key = _row_key(raw_row)
                     if key in seen:
-                        raise AirflowException(
+                        raise _MaskedError(
                             f"AdMetrica returned a row for campaign {campaign_id} on "
                             f"{date} that an earlier page of the same campaign already "
                             f"carried ({_describe_row_key(key, self._maskable_token())}). "
@@ -2333,8 +2711,14 @@ class AdmetricaHook(BaseHook):
             if len(rows) < self.limit:
                 break
             offset += len(rows)
-            if not rounded and total is not None and len(records) >= total:
-                break
+        else:
+            raise _MaskedError(
+                f"AdMetrica kept answering with full pages for campaign "
+                f"{campaign_id} on {date} after {budget} of them, "
+                f"{budget * self.limit} rows in all. A walk that does not converge "
+                f"is one the offset is not moving through, so it stops here rather "
+                f"than running for the length of the task."
+            )
 
         self._check_row_total(
             collected=len(records),
@@ -2349,7 +2733,7 @@ class AdmetricaHook(BaseHook):
     def _check_row_total(
         *,
         collected: int,
-        total: int | None,
+        total: int,
         rounded: bool,
         date: str,
         campaign_id: object,
@@ -2363,19 +2747,10 @@ class AdmetricaHook(BaseHook):
 
         A rounded total cannot be matched exactly by definition, so the same
         difference is a warning: something to read when the numbers look wrong,
-        not a reason to fail a day that is probably whole.  An answer declaring
-        no readable total leaves the check nothing to compare against and says
-        so, so that an unverified day is at least visibly unverified.
+        not a reason to fail a day that is probably whole.  The walk under a
+        rounded total ends only on a short page, which is the API's own word
+        that the rows have run out.
         """
-        if total is None:
-            log.warning(
-                "AdMetrica declared no readable total_rows for campaign %s on %s; "
-                "%d rows were collected and their completeness is unverified.",
-                campaign_id,
-                date,
-                collected,
-            )
-            return
         if collected == total:
             return
         summary = (
@@ -2389,7 +2764,7 @@ class AdmetricaHook(BaseHook):
                 summary,
             )
             return
-        raise AirflowException(
+        raise _MaskedError(
             f"{summary}. Rows lost between pages are lost silently, so the day "
             f"stops here rather than being written short."
         )

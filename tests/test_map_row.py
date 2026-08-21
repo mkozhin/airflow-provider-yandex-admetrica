@@ -6,6 +6,7 @@ import json
 import logging
 
 import pytest
+from airflow.exceptions import AirflowException
 
 from airflow_provider_yandex_admetrica.hooks.yandex_admetrica import (
     _map_row,
@@ -81,6 +82,7 @@ class TestNormalizeName:
         assert "<" not in key and ">" not in key
         assert key != _normalize_name("am:e:goalReaches")
         assert "goal_id" in caplog.text
+        assert "am:e:goal" not in caplog.text
 
     def test_extra_params_of_another_kind_is_ignored(self):
         """A parameter set that is not a mapping leaves the placeholder unanswered."""
@@ -92,6 +94,18 @@ class TestNormalizeName:
         """Whatever a name carries, the key is letters, digits and separators."""
         key = _normalize_name("am:e:ecommerce<currency>Revenue", {"currency": "US $"})
         assert key == "ecommerce_us_revenue"
+
+    @pytest.mark.parametrize(
+        ("currency", "key"),
+        [("$RUB", "ecommerce_rub_revenue"), ("RUB$", "ecommerce_rub_revenue")],
+        ids=["leading", "trailing"],
+    )
+    def test_a_key_neither_starts_nor_ends_with_a_separator(self, currency, key):
+        """A substituted value edged with a non-key character renames no column."""
+        assert _normalize_name("am:e:ecommerce<currency>Revenue", {"currency": currency}) == key
+
+    def test_a_name_that_is_all_separators_leaves_no_edges_behind(self):
+        assert _normalize_name("am:e:$$$") == ""
 
 
 class TestServiceFields:
@@ -185,17 +199,30 @@ class TestDimensions:
         assert record["dimensions"] == {}
         assert record["metrics"] == {"renders": 42}
 
-    def test_missing_value_is_empty(self, caplog):
-        """A grouping the answer sent nothing for is present and empty."""
-        with caplog.at_level(logging.WARNING, logger=_HOOK_LOGGER):
-            record = _record(
+    def test_a_row_short_of_a_grouping_stops_the_day(self):
+        """A row carrying fewer groupings than were asked for is unreadable."""
+        with pytest.raises(AirflowException) as failure:
+            _record(
                 {"dimensions": [{"name": "Main"}], "metrics": []},
                 ["am:e:placement", "am:e:deviceType"],
                 [],
             )
 
-        assert record["dimensions"] == {"placement": {"name": "Main"}, "device_type": None}
-        assert "dimension" in caplog.text
+        message = str(failure.value)
+        assert "1 dimension value(s)" in message
+        assert "the request asks for 2" in message
+        assert str(CAMPAIGN_ID) in message
+        assert DATE in message
+
+    def test_a_grouping_the_api_has_no_value_for_is_kept(self):
+        """An empty grouping value is an answer: it is what include_undefined asks for."""
+        record = _record(
+            {"dimensions": [None], "metrics": [1]},
+            ["am:e:placement"],
+            ["am:e:renders"],
+        )
+
+        assert record["dimensions"] == {"placement": None}
 
 
 class TestMetrics:
@@ -221,25 +248,38 @@ class TestMetrics:
 
         assert list(record["metrics"]) == ["video_complete_percent", "renders", "clicks"]
 
-    def test_short_metric_array(self, caplog):
-        """A metric the answer is short of is empty, and the shortfall is logged."""
-        with caplog.at_level(logging.WARNING, logger=_HOOK_LOGGER):
-            record = _record(
+    def test_short_metric_array_stops_the_day(self):
+        """A row short of a metric would be written with an empty column."""
+        with pytest.raises(AirflowException) as failure:
+            _record(
                 {"dimensions": [], "metrics": [1]},
                 [],
                 ["am:e:renders", "am:e:clicks"],
             )
 
-        assert record["metrics"] == {"renders": 1, "clicks": None}
-        assert "metric" in caplog.text
+        message = str(failure.value)
+        assert "1 metric value(s)" in message
+        assert "the request asks for 2" in message
 
-    def test_long_metric_array(self, caplog):
-        """A number no metric claims has no key to go under and is logged."""
-        with caplog.at_level(logging.WARNING, logger=_HOOK_LOGGER):
-            record = _record({"dimensions": [], "metrics": [1, 2, 3]}, [], ["am:e:renders"])
+    def test_long_metric_array_stops_the_day(self):
+        """A number no metric claims would be dropped from a row that still counts."""
+        with pytest.raises(AirflowException) as failure:
+            _record({"dimensions": [], "metrics": [1, 2, 3]}, [], ["am:e:renders"])
 
-        assert record["metrics"] == {"renders": 1}
-        assert "metric" in caplog.text
+        message = str(failure.value)
+        assert "3 metric value(s)" in message
+        assert "the request asks for 1" in message
+
+    def test_a_row_of_empty_numbers_is_an_answer(self):
+        """A report of ratios alone answers in empty numbers where no ratio exists."""
+        record = _record(
+            {"dimensions": [], "metrics": [None, None]},
+            [],
+            ["am:e:ctr", "am:e:cpm"],
+        )
+
+        assert record["metrics"] == {"ctr": None, "cpm": None}
+        assert json.loads(json.dumps(record))["metrics"] == {"ctr": None, "cpm": None}
 
     def test_parameterised_metric(self):
         """A goal named through a request parameter is a column of that goal."""
@@ -268,17 +308,33 @@ class TestMetrics:
 
         assert record["metrics"] == {"renders": None, "clicks": 0, "ctr": "1.5"}
 
+    def test_a_row_of_one_number_and_no_more(self):
+        """A row that measured something keeps the empty numbers beside it."""
+        record = _record(
+            {"dimensions": [], "metrics": [None, 7]},
+            [],
+            ["am:e:renders", "am:e:clicks"],
+        )
+
+        assert record["metrics"] == {"renders": None, "clicks": 7}
+
 
 class TestMalformedRows:
-    """Rows that do not carry what a row carries still become a record."""
+    """Rows that do not carry what a row carries stop the day they belong to."""
 
     @pytest.mark.parametrize("raw_row", [None, [], "row", {}, {"dimensions": {}, "metrics": None}])
     def test_row_without_lists(self, raw_row):
-        """Nothing readable in the row leaves every requested key empty."""
-        record = _record(raw_row, ["am:e:placement"], ["am:e:renders"])
+        """Nothing readable in the row is a row no value can be read out of."""
+        with pytest.raises(AirflowException) as failure:
+            _record(raw_row, ["am:e:placement"], ["am:e:renders"])
 
-        assert record["dimensions"] == {"placement": None}
-        assert record["metrics"] == {"renders": None}
+        assert "0 dimension value(s)" in str(failure.value)
+
+    def test_a_row_of_a_report_asking_for_nothing(self):
+        """A report of one row asks for no groupings, and the row carries none."""
+        record = _record({"dimensions": [], "metrics": [1]}, [], ["am:e:renders"])
+
+        assert record["dimensions"] == {}
         assert record["date"] == DATE
 
     def test_names_that_collide(self, caplog):
@@ -291,7 +347,10 @@ class TestMalformedRows:
             )
 
         assert record["metrics"] == {"device_type": 2}
-        assert "device_type" in caplog.text
+        assert "position 1" in caplog.text
+        assert "position 2" in caplog.text
+        assert "deviceType" not in caplog.text
+        assert "device_type" not in caplog.text
 
 
 class TestRecordIsWritable:
@@ -309,3 +368,31 @@ class TestRecordIsWritable:
         assert "Главная" in line
         assert list(json.loads(line)) == list(record)
         assert json.loads(line) == record
+
+
+class TestTwoNamesWantingOneKey:
+    """One key is one column, so a request asking twice for it gets it once."""
+
+    def test_both_spellings_of_one_metric_write_one_key(self, caplog):
+        raw_row = {"dimensions": [], "metrics": [7, 9]}
+        with caplog.at_level(logging.WARNING, logger=_HOOK_LOGGER):
+            record = _record(
+                raw_row,
+                [],
+                ["am:e:goal12345Reaches", "am:e:goal<goal_id>Reaches"],
+                {"goal_id": 12345},
+            )
+
+        assert record["metrics"] == {"goal12345_reaches": 9}
+        assert "position 2" in caplog.text
+
+    def test_the_warning_names_the_two_by_position_and_quotes_neither(self, caplog):
+        """A requested name is the caller's own text, so the log gives its place."""
+        raw_row = {"dimensions": [], "metrics": [7, 9]}
+        with caplog.at_level(logging.WARNING, logger=_HOOK_LOGGER):
+            _record(raw_row, [], ["am:e:goalReaches", "am:e:goal_reaches"], None)
+
+        assert "position 1" in caplog.text
+        assert "position 2" in caplog.text
+        assert "already writes" in caplog.text
+        assert "goal" not in caplog.text

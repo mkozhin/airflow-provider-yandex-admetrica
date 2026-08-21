@@ -5,28 +5,32 @@ from __future__ import annotations
 import json
 import os
 import re
-from datetime import datetime, timezone
-from typing import Sequence, TypedDict
+import tempfile
+from datetime import datetime
+from datetime import timezone as _timezone
+from typing import TYPE_CHECKING, TypedDict
 
 from airflow.models import BaseOperator
 
 from airflow_provider_yandex_admetrica.hooks.loki import LokiClient
 from airflow_provider_yandex_admetrica.hooks.yandex_admetrica import (
-    _DEFAULT_LIMIT,
-    _DEFAULT_REQUEST_DELAY,
+    DATE_FORMAT,
+    DEFAULT_LIMIT,
+    DEFAULT_REQUEST_DELAY,
     AdmetricaHook,
+    check_date,
 )
 
+if TYPE_CHECKING:
+    from collections.abc import Sequence
+
 #: Directory segments under the advertiser that hold the statistics of a day.
-_STATS_PARTS = ("stats",)
+STATS_PARTS = ("stats",)
 
 #: Directory segments under the advertiser that hold the campaign dictionary.
 #: The kind of dictionary names the last segment, so another dictionary lands
 #: beside this one instead of mixing into it.
-_DICT_CAMPAIGNS_PARTS = ("dict", "campaigns")
-
-#: Format of the day that names a file and stamps a dictionary record.
-_DATE_FORMAT = "%Y-%m-%d"
+DICT_CAMPAIGNS_PARTS = ("dict", "campaigns")
 
 #: Characters allowed in a path segment built from an identifier; everything
 #: else becomes an underscore, so a run id carrying a timestamp with colons and
@@ -51,9 +55,9 @@ class ExportRecord(TypedDict):
 class YandexAdmetricaStatsOperator(BaseOperator):
     """Collect one day of statistics for every campaign of one advertiser.
 
-    A task is a day. The period is expanded by the DAG and fed in through
-    ``expand(date=dates)``, so each day is its own map index: one day failing
-    leaves the others alone, and re-running it is a clear of that map index.
+    A task is a day. The period is expanded by the DAG, which hands each day to
+    a map index of its own: one day failing leaves the others alone, and
+    re-running it is a clear of that map index.
 
     The output is JSONL, one record per line, because the set of columns is not
     known from the request — the groupings and metrics of a record are nested
@@ -81,8 +85,8 @@ class YandexAdmetricaStatsOperator(BaseOperator):
         filters: str | None = None,
         accuracy: str | None = "full",
         include_undefined: bool = True,
-        limit: int = _DEFAULT_LIMIT,
-        request_delay: float = _DEFAULT_REQUEST_DELAY,
+        limit: int = DEFAULT_LIMIT,
+        request_delay: float = DEFAULT_REQUEST_DELAY,
         timezone: str | None = None,
         lang: str | None = None,
         extra_params: dict | None = None,
@@ -120,10 +124,19 @@ class YandexAdmetricaStatsOperator(BaseOperator):
         The run id sits in the path so two runs exporting the same day never
         write the same file; it stays local, since the S3 key addresses a day
         of an advertiser and nothing else.
+
+        Both the run id and the day are sanitised the same way, because both
+        arrive from outside: the run id is Airflow's, and the day is a template
+        field a DAG parameter fills in.  Every character outside the letters,
+        digits, underscore and hyphen a directory name is allowed to hold
+        becomes an underscore, so a segment can name nothing but a directory of
+        its own — a day written as ``../../etc`` addresses a file under the base
+        directory, spelled oddly, rather than a file anywhere on the worker.
         """
         safe_run_id = _UNSAFE_SEGMENT_RE.sub("_", run_id)
+        safe_date = _UNSAFE_SEGMENT_RE.sub("_", date)
         return os.path.join(
-            self.base_dir, safe_run_id, str(advertiser_id), *parts, f"{date}.json"
+            self.base_dir, safe_run_id, str(advertiser_id), *parts, f"{safe_date}.json"
         )
 
     def _write(self, records: Sequence[dict], path: str) -> None:
@@ -131,11 +144,29 @@ class YandexAdmetricaStatsOperator(BaseOperator):
 
         ``ensure_ascii=False`` keeps placement and campaign names readable in
         the file itself; the encoding is UTF-8 either way.
+
+        The lines go to a temporary file in the same directory and the finished
+        file is moved onto *path* in one step.  The campaign dictionary of a run
+        has one path for every map index of it, so two days running at once
+        write one file; a move puts the whole of one of them there, where a
+        shared handle would leave the truncated middle of both for the upload to
+        find.
         """
         os.makedirs(os.path.dirname(path), exist_ok=True)
-        with open(path, "w", encoding="utf-8") as f:
-            for row in records:
-                f.write(json.dumps(row, ensure_ascii=False) + "\n")
+        fd, staged = tempfile.mkstemp(
+            dir=os.path.dirname(path), prefix=os.path.basename(path), suffix=".part"
+        )
+        try:
+            with os.fdopen(fd, "w", encoding="utf-8") as f:
+                for row in records:
+                    f.write(json.dumps(row, ensure_ascii=False) + "\n")
+            os.replace(staged, path)
+        except BaseException:
+            # The half-written file names the day a reader would take it for, so
+            # it goes rather than staying behind for an upload to find.
+            if os.path.exists(staged):
+                os.unlink(staged)
+            raise
 
     def _build_loki_client(self, context) -> LokiClient | None:
         """Return the diagnostics sink for this run, or ``None`` when it is off.
@@ -167,9 +198,9 @@ class YandexAdmetricaStatsOperator(BaseOperator):
         two halves of a run disagreeing about which day they describe.
         """
         started = getattr(context.get("dag_run"), "start_date", None) or datetime.now(
-            timezone.utc
+            _timezone.utc
         )
-        return started.strftime(_DATE_FORMAT)
+        return started.strftime(DATE_FORMAT)
 
     def _export_campaigns(
         self,
@@ -203,7 +234,7 @@ class YandexAdmetricaStatsOperator(BaseOperator):
             {"snapshot_date": snapshot_date, **campaign} for campaign in campaigns
         ]
         path = self._build_path(
-            run_id, advertiser_id, _DICT_CAMPAIGNS_PARTS, snapshot_date
+            run_id, advertiser_id, DICT_CAMPAIGNS_PARTS, snapshot_date
         )
         self._write(records, path)
         return ExportRecord(
@@ -214,6 +245,10 @@ class YandexAdmetricaStatsOperator(BaseOperator):
         )
 
     def execute(self, context) -> list[ExportRecord]:
+        # Before the hook is built, because the day is also what names the file
+        # and the partition: a value that is not a day is refused by name here
+        # rather than writing a file named after whatever the template held.
+        check_date(self.date)
         hook = AdmetricaHook(
             admetrica_conn_id=self.admetrica_conn_id,
             loki=self._build_loki_client(context),
@@ -236,7 +271,7 @@ class YandexAdmetricaStatsOperator(BaseOperator):
             extra_params=self.extra_params,
         )
         if rows:
-            path = self._build_path(run_id, advertiser_id, _STATS_PARTS, self.date)
+            path = self._build_path(run_id, advertiser_id, STATS_PARTS, self.date)
             self._write(rows, path)
             result.append(
                 ExportRecord(

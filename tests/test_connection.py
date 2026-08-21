@@ -10,14 +10,13 @@ from airflow.exceptions import AirflowException
 from airflow.models import Connection
 
 from airflow_provider_yandex_admetrica.hooks.yandex_admetrica import (
-    _DEFAULT_LIMIT,
-    _DEFAULT_REQUEST_DELAY,
+    DEFAULT_LIMIT,
+    DEFAULT_REQUEST_DELAY,
     AdmetricaHook,
-    AdvertiserConfig,
     parse_connection,
 )
 
-TOKEN = "y0_AgAAAABexampletokenvalue"
+TOKEN = "y0__xDf" + "MIDDLE-OF-THE-SECRET" + "q9Az"
 
 
 def _hook(*, password: str | None = TOKEN, extra: object = None, **kwargs) -> AdmetricaHook:
@@ -37,17 +36,13 @@ def _hook(*, password: str | None = TOKEN, extra: object = None, **kwargs) -> Ad
 
 class TestParseConnection:
     def test_reads_a_whole_number(self):
-        assert parse_connection({"advertiser_id": 17004}) == AdvertiserConfig(advertiser_id=17004)
+        assert parse_connection({"advertiser_id": 17004}) == 17004
 
     def test_reads_a_number_written_as_text(self):
-        assert parse_connection({"advertiser_id": "17004"}) == AdvertiserConfig(
-            advertiser_id=17004
-        )
+        assert parse_connection({"advertiser_id": "17004"}) == 17004
 
     def test_reads_a_number_written_as_padded_text(self):
-        assert parse_connection({"advertiser_id": " 17004 "}) == AdvertiserConfig(
-            advertiser_id=17004
-        )
+        assert parse_connection({"advertiser_id": " 17004 "}) == 17004
 
     def test_empty_extra_names_no_advertiser(self, caplog):
         assert parse_connection({}) is None
@@ -84,8 +79,7 @@ class TestParseConnection:
         assert TOKEN not in caplog.text
 
     def test_other_extra_fields_are_not_read(self):
-        config = parse_connection({"advertiser_id": 17004, "token": TOKEN, "limit": 5})
-        assert config == AdvertiserConfig(advertiser_id=17004)
+        assert parse_connection({"advertiser_id": 17004, "token": TOKEN, "limit": 5}) == 17004
 
 
 class TestHookAttributes:
@@ -98,8 +92,8 @@ class TestHookAttributes:
     def test_defaults(self):
         hook = AdmetricaHook()
         assert hook.admetrica_conn_id == AdmetricaHook.default_conn_name
-        assert hook.request_delay == _DEFAULT_REQUEST_DELAY
-        assert hook.limit == _DEFAULT_LIMIT
+        assert hook.request_delay == DEFAULT_REQUEST_DELAY
+        assert hook.limit == DEFAULT_LIMIT
         assert hook._loki is None
 
     def test_lazy_fields_start_empty(self):

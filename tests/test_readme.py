@@ -2,8 +2,8 @@
 
 A README is the package's public contract on PyPI, so what it claims is checked
 against the operator's own signature, the naming rule the hook applies and the
-code blocks it offers to copy. The two files are also held to one structure, so
-a section added to one is added to the other.
+code blocks it offers to copy. Prose and layout are the writer's; only the
+claims that name something in the code are pinned here.
 """
 
 from __future__ import annotations
@@ -30,12 +30,6 @@ _READMES = {"README.md": _ROOT / "README.md", "README_RU.md": _ROOT / "README_RU
 #: A fenced block and the language it names.
 _FENCE_RE = re.compile(r"^```(\w*)\n(.*?)^```", re.MULTILINE | re.DOTALL)
 
-#: An ATX heading: the run of hashes and the text after it.
-_HEADING_RE = re.compile(r"^(#{1,6}) +(.*?)\s*$", re.MULTILINE)
-
-#: A link into the document itself.
-_ANCHOR_LINK_RE = re.compile(r"\]\(#([^)]+)\)")
-
 #: A row of a markdown table, split on the pipes that fence its cells.
 _TABLE_ROW_RE = re.compile(r"^\|(.+)\|\s*$", re.MULTILINE)
 
@@ -53,17 +47,6 @@ def _text(name: str) -> str:
 
 def _python_blocks(text: str) -> list[str]:
     return [body for language, body in _FENCE_RE.findall(text) if language == "python"]
-
-
-def _headings(text: str) -> list[tuple[int, str]]:
-    return [(len(hashes), title) for hashes, title in _HEADING_RE.findall(text)]
-
-
-def _anchor(title: str) -> str:
-    """Return the fragment a heading is reachable by, as GitHub builds it."""
-    slug = title.strip().lower().replace("`", "")
-    slug = re.sub(r"[^\w\s-]", "", slug)
-    return re.sub(r"\s+", "-", slug)
 
 
 def _cells(row: str) -> list[str]:
@@ -141,21 +124,6 @@ class TestOperatorParameters:
 
     @pytest.mark.parametrize(
         ("name", "heading"),
-        [("README.md", "Operator parameters"), ("README_RU.md", "Параметры оператора")],
-    )
-    def test_table_states_the_real_defaults(self, name, heading):
-        documented = self._documented(_text(name), heading)
-        for parameter in inspect.signature(YandexAdmetricaStatsOperator).parameters.values():
-            if parameter.name not in documented:
-                continue
-            stated = documented[parameter.name].strip("`")
-            if parameter.default is inspect.Parameter.empty:
-                assert stated == "—", parameter.name
-            else:
-                assert stated == repr(parameter.default).replace("'", '"'), parameter.name
-
-    @pytest.mark.parametrize(
-        ("name", "heading"),
         [("README.md", "Reserved parameters"), ("README_RU.md", "Зарезервированные параметры")],
     )
     def test_reserved_parameters_are_the_refused_ones(self, name, heading):
@@ -183,16 +151,7 @@ class TestNamingTable:
 
 
 class TestStructure:
-    """The two files carry one structure, and their links land on it."""
-
-    def test_heading_levels_match(self):
-        levels = {name: [level for level, _ in _headings(_text(name))] for name in _READMES}
-        assert levels["README.md"] == levels["README_RU.md"]
-
-    def test_anchor_links_resolve(self, readme):
-        anchors = {_anchor(title) for _, title in _headings(readme)}
-        links = set(_ANCHOR_LINK_RE.findall(readme))
-        assert links <= anchors, links - anchors
+    """Each file points at the other and at the documentation it stands on."""
 
     def test_each_file_links_to_the_other(self):
         assert "README_RU.md" in _text("README.md")

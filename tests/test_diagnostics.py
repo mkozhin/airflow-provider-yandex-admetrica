@@ -14,7 +14,10 @@ from airflow_provider_yandex_admetrica.hooks.yandex_admetrica import (
     _ENDPOINT_URLS,
     _HEADER_LIMIT,
     _OUTCOME_UNKNOWN,
-    _PARAMS_LIMIT,
+    _PARAM_NAME_EMPTY,
+    _PARAM_NAME_LIMIT,
+    _PARAM_VALUE_LIMIT,
+    _PARAMS_MAX,
     _PARAMS_TRUNCATED,
     _SCHEMA_VERSION,
     _TEXT_LIMIT,
@@ -30,13 +33,17 @@ from airflow_provider_yandex_admetrica.hooks.yandex_admetrica import (
     _declared_charset,
     _decoder_position,
     _describe_error,
-    _describe_error_code,
     _describe_unreadable_body,
+    _seconds_until,
+    _stamp_report_meta,
+    _summarize_rows,
     _drop_cut_token,
+    _declared_total,
     _emit_event,
     _event_level,
     _find_error,
     _mask_token,
+    _meta_value,
     _new_event,
     _one_line,
     _record_exception,
@@ -674,21 +681,67 @@ class TestRedactParams:
         assert TOKEN not in json.dumps(redacted)
         assert redacted["oauth_token"] == _TOKEN_REDACTED
 
+    def test_a_name_carrying_the_token_travels_masked(self):
+        """A credential lands in the name of a parameter as readily as in its value."""
+        redacted = _redact_params({f"proxy {TOKEN}": "1"}, TOKEN)
+
+        assert TOKEN not in json.dumps(redacted)
+        assert list(redacted) == [f"proxy {_TOKEN_REDACTED}"]
+
+    def test_a_name_the_gate_leaves_nothing_of_still_describes_its_parameter(self):
+        """Whitespace alone says nothing, and the parameter is described anyway."""
+        redacted = _redact_params({"  ": "2", "\t": "3"}, TOKEN)
+
+        assert list(redacted.values()) == ["2", "3"]
+        assert all(_PARAM_NAME_EMPTY in name for name in redacted)
+
+    def test_a_name_is_flattened_onto_one_line(self):
+        assert _redact_params({"a\n b": "1"}, TOKEN) == {"a b": "1"}
+
+    def test_two_names_sharing_a_bounded_prefix_keep_both_values(self):
+        """A name cut to its budget must not take another parameter's place."""
+        params = {"n" * 500 + str(i): str(i) for i in range(3)}
+
+        redacted = _redact_params(params, TOKEN)
+
+        assert len(redacted) == 3
+        assert sorted(redacted.values()) == ["0", "1", "2"]
+        assert all(len(name) <= _PARAM_NAME_LIMIT for name in redacted)
+
     def test_a_value_is_flattened_onto_one_line(self):
         assert _redact_params({"filters": "a\n b"}, TOKEN) == {"filters": "a b"}
 
-    def test_the_parameters_share_one_budget(self):
-        params = {f"p{i}": "x" * 1000 for i in range(20)}
+    def test_a_long_value_is_cut_to_the_value_budget(self):
+        redacted = _redact_params({"filters": "x" * 10000}, TOKEN)
+
+        assert len(redacted["filters"]) == _PARAM_VALUE_LIMIT
+
+    def test_a_long_name_is_cut_to_the_name_budget(self):
+        redacted = _redact_params({"n" * 500: "x"}, TOKEN)
+
+        (name,) = redacted
+        assert len(name) == _PARAM_NAME_LIMIT
+
+    def test_only_so_many_parameters_are_described_at_all(self):
+        params = {f"p{i}": "x" * 1000 for i in range(_PARAMS_MAX + 7)}
+
+        redacted = _redact_params(params, TOKEN)
+
+        described = {k: v for k, v in redacted.items() if k != _PARAMS_TRUNCATED}
+        assert len(described) == _PARAMS_MAX
+        assert redacted[_PARAMS_TRUNCATED] == 7
+
+    def test_the_field_cannot_outgrow_its_share_of_the_line(self):
+        params = {"n" * 500 + str(i): "x" * 10000 for i in range(_PARAMS_MAX + 7)}
 
         redacted = _redact_params(params, TOKEN)
 
         described = {k: v for k, v in redacted.items() if k != _PARAMS_TRUNCATED}
         spent = sum(len(k) + len(v or "") for k, v in described.items())
-        assert spent <= _PARAMS_LIMIT
-        assert redacted[_PARAMS_TRUNCATED] == 20 - len(described)
+        assert spent <= _PARAMS_MAX * (_PARAM_NAME_LIMIT + _PARAM_VALUE_LIMIT)
 
     def test_parameters_within_the_budget_are_all_described(self):
-        params = {f"p{i}": "x" * 10 for i in range(20)}
+        params = {f"p{i}": "x" * 10 for i in range(_PARAMS_MAX)}
 
         assert _redact_params(params, TOKEN) == params
 
@@ -951,9 +1004,6 @@ class TestSummarizeError:
 
 
 class TestDescribeError:
-    def test_a_code_is_printed_bare(self):
-        assert _describe_error_code(403) == "403"
-
     def test_both_parts(self):
         assert _describe_error(403, "Forbidden") == "code 403: Forbidden"
 
@@ -1105,7 +1155,7 @@ class TestEventLevel:
             (_event(outcome="retryable_error", attempt=1, max_attempts=4), "warn"),
             (_event(outcome="retryable_error", attempt=4, max_attempts=4), "error"),
             (_event(outcome="auth_error", attempt=1, max_attempts=4), "error"),
-            (_event(outcome="api_error", attempt=1, max_attempts=4), "error"),
+            (_event(outcome="http_error", attempt=1, max_attempts=4), "error"),
             (_event(outcome="network_error", attempt=1, max_attempts=4), "warn"),
             (_event(outcome="network_error", attempt=4, max_attempts=4), "error"),
             (_event(outcome="invalid_json"), "error"),
@@ -1118,7 +1168,7 @@ class TestEventLevel:
             "retryable_with_an_attempt_left",
             "retryable_on_the_last_attempt",
             "auth_error",
-            "api_error",
+            "http_error",
             "network_with_an_attempt_left",
             "network_on_the_last_attempt",
             "invalid_json",
@@ -1145,13 +1195,11 @@ class TestEmitEvent:
         assert sink.pushed[0]["level"] == "info"
         assert sink.pushed[0]["response_body"] is None
 
-    @pytest.mark.parametrize(
-        "event",
-        [_event(outcome="retryable_error"), _event(outcome="empty_shape")],
-        ids=["warn", "error"],
-    )
-    def test_everything_else_travels_with_its_body(self, event):
+    @pytest.mark.parametrize("outcome", ["retryable_error", "empty_shape"], ids=["warn", "error"])
+    def test_everything_else_travels_with_its_body(self, outcome):
+        """The event is built here: `_emit_event` writes into the one it is given."""
         sink = _Sink()
+        event = _event(outcome=outcome)
 
         _emit_event(sink, event, _Answer(content=b"upstream refused"), TOKEN)
 
@@ -1200,3 +1248,110 @@ class TestEmitEvent:
         _emit_event(Bare(), _event(outcome="success"), _Answer(), TOKEN)
 
         assert len(pushed) == 1
+
+
+# ---------------------------------------------------------------------------
+# _meta_value and _declared_total
+# ---------------------------------------------------------------------------
+
+
+class TestMetaValue:
+    @pytest.mark.parametrize("value", [0, 1234, 0.5, True, False, None])
+    def test_numbers_and_flags_travel_as_they_arrived(self, value):
+        assert _meta_value(value, TOKEN) is value
+
+    def test_text_leaves_by_the_gate_every_text_leaves_by(self):
+        assert _meta_value(f"{_TOKEN_SCHEME} {TOKEN}", TOKEN) == f"{_TOKEN_SCHEME} {_TOKEN_REDACTED}"
+
+    def test_a_value_of_another_kind_is_named_by_its_type(self):
+        """Converting it would run code the answer chose."""
+        assert _meta_value({"share": 0.1}, TOKEN) == "<dict>"
+        assert _meta_value([1, 2], TOKEN) == "<list>"
+        assert _meta_value(object(), TOKEN) == "<object>"
+
+
+class TestDeclaredTotal:
+    def test_a_whole_number_is_the_total(self):
+        assert _declared_total(0) == 0
+        assert _declared_total(1234) == 1234
+
+    @pytest.mark.parametrize("value", [True, False], ids=["true", "false"])
+    def test_a_flag_declares_no_total(self, value):
+        """Python counts a flag as an int; `total_rows: true` is not a count of one."""
+        assert _declared_total(value) is None
+
+    @pytest.mark.parametrize("value", ["1500", 1500.0, None, [], {"total": 1}])
+    def test_anything_else_declares_no_total(self, value):
+        assert _declared_total(value) is None
+
+
+# ---------------------------------------------------------------------------
+# The "never raises" promises, met with values that answer in code of their own
+# ---------------------------------------------------------------------------
+
+
+class _HostileMapping(dict):
+    """A mapping whose own reading raises, as a substituted answer may."""
+
+    def items(self):
+        raise RuntimeError("boom")
+
+
+class _HostileBool:
+    """A value whose truthiness raises."""
+
+    def __bool__(self):
+        raise RuntimeError("boom")
+
+
+class TestNothingHereRaises:
+    """Each of these runs while an event is assembled, often with a failure in flight."""
+
+    def test_headers_that_refuse_to_be_read_are_no_headers(self):
+        assert _redact(_HostileMapping(), TOKEN) is None
+
+    def test_parameters_that_refuse_to_be_read_are_no_parameters(self):
+        assert _redact_params(_HostileMapping(), TOKEN) is None
+
+    def test_a_header_value_of_another_kind_is_named_by_its_type(self):
+        assert _bounded_header(42) == "<non-str header: int>"
+        assert _bounded_header(None) is None
+        assert _bounded_header("") is None
+
+    def test_a_header_name_of_another_kind_is_named_by_its_type(self):
+        assert _redact({7: "x"}, TOKEN) == {"<non-str header name: int>": None}
+
+    def test_a_rows_value_whose_truthiness_raises_is_the_loud_half(self):
+        count, shape_ok, kind = _summarize_rows({"data": _HostileBool()}, "data")
+        assert (count, shape_ok, kind) == (None, False, "rows_non_list")
+
+    def test_a_rows_value_present_but_empty_of_another_type_is_a_dict_body(self):
+        assert _summarize_rows({"data": ""}, "data") == (None, False, "dict")
+
+    def test_a_body_that_is_not_a_dict_carries_no_caveats(self):
+        event = _event()
+        _stamp_report_meta(event, "not a dict", TOKEN)
+        assert event["total_rows"] is None
+
+    def test_a_body_that_refuses_to_be_read_carries_no_caveats(self):
+        event = _event()
+        _stamp_report_meta(event, _HostileMapping(), TOKEN)
+        assert event["sampled"] is None
+
+    @pytest.mark.parametrize(
+        "value",
+        ["not a date at all", "", "Tue, 99 Xxx 2026 00:00:00 GMT"],
+        ids=["words", "empty", "impossible"],
+    )
+    def test_a_wait_nobody_can_parse_is_a_wait_nobody_asked_for(self, value):
+        assert _seconds_until(value) is None
+
+    def test_a_response_that_refuses_to_be_read_carries_no_rate_limit(self):
+        class Hostile:
+            @property
+            def headers(self):
+                raise RuntimeError("boom")
+
+        event = _event()
+        _record_rate_limit(event, Hostile(), TOKEN)
+        assert (event["rate_limit_limit"], event["rate_limit_remaining"]) == (None, None)

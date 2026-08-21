@@ -1,5 +1,6 @@
-"""Проверки метаданных провайдера, которые Airflow читает через entry point."""
+"""Tests for the provider metadata Airflow reads through the entry point."""
 
+import importlib
 import re
 from pathlib import Path
 
@@ -8,9 +9,9 @@ from airflow_provider_yandex_admetrica import get_provider_info
 
 PYPROJECT = Path(__file__).resolve().parent.parent / "pyproject.toml"
 
-# Модули из `operators`/`hooks` здесь не импортируются: набор проверок повторяет
-# `airflow-provider-avito/tests/test_provider_info.py` и ограничен самим словарём
-# метаданных. Импортируемость объявленных модулей проверяется отдельно.
+# The declared modules are imported as well as listed: Airflow reads this dict
+# while loading the provider, so a typo in `python-modules` breaks it there
+# rather than here.
 
 
 def _distribution_name() -> str:
@@ -18,7 +19,7 @@ def _distribution_name() -> str:
         match = re.fullmatch(r'name\s*=\s*"([^"]+)"', line.strip())
         if match:
             return match.group(1)
-    raise AssertionError("в pyproject.toml нет строки с именем дистрибутива")
+    raise AssertionError("pyproject.toml has no line naming the distribution")
 
 
 def test_provider_info_keys():
@@ -62,7 +63,7 @@ def test_integration_entries():
 def test_operators_and_hooks_declare_modules():
     info = get_provider_info()
     for key in ("operators", "hooks"):
-        assert len(info[key]) > 0, f"пустой список {key}"
+        assert len(info[key]) > 0, f"empty list: {key}"
         for entry in info[key]:
             assert entry["integration-name"] == "Yandex AdMetrica"
             modules = entry["python-modules"]
@@ -70,3 +71,4 @@ def test_operators_and_hooks_declare_modules():
             assert modules
             for module in modules:
                 assert module.startswith("airflow_provider_yandex_admetrica.")
+                assert importlib.import_module(module) is not None

@@ -11,12 +11,18 @@ from airflow.exceptions import AirflowException
 from airflow.models import Connection
 
 from airflow_provider_yandex_admetrica.hooks.yandex_admetrica import (
+    _CAMPAIGNS_LIMIT,
     _ENDPOINT_URLS,
     _MAX_DIMENSIONS,
+    _MAX_CAMPAIGNS,
+    _MAX_LIMIT,
     _MAX_METRICS,
+    _MAX_PAGES,
+    _MAX_ROWS,
     _RESERVED_PARAMS,
     _STAT_OFFSET_BASE,
     AdmetricaHook,
+    _page_budget,
 )
 
 TOKEN = "y0__xDf" + "MIDDLE-OF-THE-SECRET" + "q9Az"
@@ -178,6 +184,13 @@ class TestOnePage:
         records, _ = _collect(_hook(), campaigns, pages)
         assert [r["campaign_id"] for r in records] == [2]
 
+    def test_a_report_of_ratios_alone_comes_back_whole(self):
+        """A ratio without a denominator is empty, and a day of them is a day."""
+        rows = [_row(metrics=(None, None))]
+        with patch("requests.get", side_effect=_api([_campaign(1)], [_page(rows, total=1)])):
+            records = _hook().get_stats(DATE, [], ["am:e:ctr", "am:e:cpm"])
+        assert [r["metrics"] for r in records] == [{"ctr": None, "cpm": None}]
+
     def test_a_day_of_an_advertiser_without_campaigns_is_empty(self):
         records, mock_get = _collect(_hook(), [], [])
         assert records == []
@@ -268,6 +281,21 @@ class TestExtraParams:
                 _hook().get_stats(DATE, DIMENSIONS, METRICS, extra_params={name: "x"})
         assert mock_get.call_count == 0
 
+    def test_it_adds_names_and_overrides_none(self):
+        """One-directional merge: a name the query already carries stays as it is."""
+        _, mock_get = _collect(
+            _hook(),
+            [_campaign(1)],
+            [_page([], total=0)],
+            filters="am:e:placement=='A'",
+            extra_params={"pretty": True},
+        )
+        sent = _stat_params(mock_get)[0]
+        assert sent["pretty"] is True
+        assert sent["filters"] == "am:e:placement=='A'"
+        assert sent["date1"] == DATE
+        assert sent["metrics"] == ",".join(METRICS)
+
     def test_a_key_of_its_own_reaches_the_query(self):
         _, mock_get = _collect(
             _hook(),
@@ -310,6 +338,52 @@ class TestDocumentedLimits:
         with patch("requests.get", side_effect=_api([_campaign(1)], [_page([], 0)])):
             assert _hook().get_stats(DATE, dimensions, metrics) == []
 
+    def test_a_report_without_metrics_is_refused_before_any_request(self):
+        """`metrics` is required; an empty one goes out as `metrics=` and 400s."""
+        with patch("requests.get") as mock_get:
+            with pytest.raises(ValueError, match="at least one metric"):
+                _hook().get_stats(DATE, DIMENSIONS, [])
+        assert mock_get.call_count == 0
+
+    @pytest.mark.parametrize(
+        "limit",
+        [0, -1, _MAX_LIMIT + 1, 200000, 1.5, "10000", True, None],
+        ids=["zero", "negative", "over", "far_over", "fraction", "text", "flag", "none"],
+    )
+    def test_a_limit_outside_the_documented_range_is_refused(self, limit):
+        """At or below zero the API falls back to 100 and no page is ever short."""
+        with patch("requests.get") as mock_get:
+            with pytest.raises(ValueError, match="limit must be"):
+                _hook(limit=limit).get_stats(DATE, DIMENSIONS, METRICS)
+        assert mock_get.call_count == 0
+
+    @pytest.mark.parametrize("limit", [1, 10000, _MAX_LIMIT])
+    def test_a_limit_inside_it_is_allowed(self, limit):
+        with patch("requests.get", side_effect=_api([_campaign(1)], [_page([], 0)])):
+            assert _hook(limit=limit).get_stats(DATE, DIMENSIONS, METRICS) == []
+
+
+class TestTheDayAsked:
+    """The hook holds its own boundary: a day is a day whoever calls it."""
+
+    @pytest.mark.parametrize(
+        "date",
+        ["20260820", "2026-8-20", "2026-08-20 00:00:00", "not-a-day", "", None, 20260820],
+        ids=["compact", "unpadded", "timestamp", "words", "empty", "none", "number"],
+    )
+    def test_a_day_that_is_not_a_day_is_refused_before_any_request(self, date):
+        with patch("requests.get") as mock_get:
+            with pytest.raises(ValueError, match="date must be a day"):
+                _hook().get_stats(date, DIMENSIONS, METRICS)
+        assert mock_get.call_count == 0
+
+    def test_the_refusal_names_the_day_by_shape_and_never_quotes_it(self):
+        with patch("requests.get"):
+            with pytest.raises(ValueError) as excinfo:
+                _hook().get_stats(TOKEN, DIMENSIONS, METRICS)
+        assert TOKEN not in str(excinfo.value)
+        assert f"{len(TOKEN)} character(s)" in str(excinfo.value)
+
 
 # ---------------------------------------------------------------------------
 # Walking a campaign
@@ -338,16 +412,28 @@ class TestPagination:
         _, mock_get = _collect(_hook(limit=2), [_campaign(1)], pages)
         assert [p["offset"] for p in _stat_params(mock_get)] == [1, 3]
 
-    def test_a_closed_total_stops_the_walk_on_a_full_page(self):
+    def test_a_reached_total_on_a_full_page_still_asks_for_the_page_after_it(self):
+        """The rows run out when the report says so, not when its count is met."""
         rows = [
             _row(_placement("A", 1), {"name": "mobile"}),
             _row(_placement("B", 2), {"name": "mobile"}),
         ]
-        records, mock_get = _collect(
-            _hook(limit=2), [_campaign(1)], [_page(rows, total=2, rounded=False)]
-        )
+        pages = [_page(rows, total=2, rounded=False), _page([], total=2, rounded=False)]
+        records, mock_get = _collect(_hook(limit=2), [_campaign(1)], pages)
         assert len(records) == 2
-        assert len(_stat_params(mock_get)) == 1
+        assert [p["offset"] for p in _stat_params(mock_get)] == [1, 3]
+
+    def test_a_total_a_later_page_raises_never_ends_the_walk_early(self):
+        """A count that was one page stale would leave the tail behind."""
+        first = [
+            _row(_placement("A", 1), {"name": "mobile"}),
+            _row(_placement("B", 2), {"name": "mobile"}),
+        ]
+        second = [_row(_placement("C", 3), {"name": "mobile"})]
+        pages = [_page(first, total=2, rounded=False), _page(second, total=3, rounded=False)]
+        with patch("requests.get", side_effect=_api([_campaign(1)], pages)):
+            with pytest.raises(AirflowException, match="on an earlier page"):
+                _hook(limit=2).get_stats(DATE, DIMENSIONS, METRICS)
 
     def test_a_rounded_total_never_stops_the_walk(self):
         first = [
@@ -386,10 +472,12 @@ class TestPagination:
         ]
         pages = [
             _page(rows, total=2, rounded=False),
+            _page([], total=2, rounded=False),
             _page(rows, total=2, rounded=False),
+            _page([], total=2, rounded=False),
         ]
         _, mock_get = _collect(_hook(limit=2), [_campaign(1), _campaign(2)], pages)
-        assert [p["offset"] for p in _stat_params(mock_get)] == [1, 1]
+        assert [p["offset"] for p in _stat_params(mock_get)] == [1, 3, 1, 3]
 
 
 # ---------------------------------------------------------------------------
@@ -427,6 +515,57 @@ class TestRowIdentity:
             with pytest.raises(AirflowException, match="already carried"):
                 _hook(limit=1).get_stats(DATE, DIMENSIONS, METRICS)
 
+    def test_two_names_sharing_an_empty_id_are_two_rows(self):
+        """Only `name` is guaranteed, so an `id` holding null tells nothing apart."""
+        first = _row({"id": None, "name": "Главная"}, {"name": "mobile"})
+        second = _row({"id": None, "name": "Раздел"}, {"name": "mobile"})
+        pages = [
+            _page([first], total=2, rounded=False),
+            _page([second], total=2, rounded=False),
+            _page([], total=2, rounded=False),
+        ]
+        records, _ = _collect(_hook(limit=1), [_campaign(1)], pages)
+        assert [r["dimensions"]["placement"]["name"] for r in records] == ["Главная", "Раздел"]
+
+    def test_one_name_under_an_empty_id_repeated_between_pages_is_a_repeat(self):
+        rows = [_row({"id": None, "name": "Главная"}, {"name": "mobile"})]
+        pages = [_page(rows, total=2, rounded=False), _page(rows, total=2, rounded=False)]
+        with patch("requests.get", side_effect=_api([_campaign(1)], pages)):
+            with pytest.raises(AirflowException, match="already carried"):
+                _hook(limit=1).get_stats(DATE, DIMENSIONS, METRICS)
+
+    def test_two_rows_whose_values_are_scalars_are_two_rows(self):
+        """The API can send a scalar where an object is documented."""
+        first = _row("Главная", "mobile")
+        second = _row("Раздел", "desktop")
+        pages = [
+            _page([first], total=2, rounded=False),
+            _page([second], total=2, rounded=False),
+            _page([], total=2, rounded=False),
+        ]
+        records, _ = _collect(_hook(limit=1), [_campaign(1)], pages)
+        assert len(records) == 2
+
+    def test_a_scalar_repeated_between_pages_is_still_a_repeat(self):
+        rows = [_row("Главная", "mobile")]
+        pages = [_page(rows, total=2, rounded=False), _page(rows, total=2, rounded=False)]
+        with patch("requests.get", side_effect=_api([_campaign(1)], pages)):
+            with pytest.raises(AirflowException, match="already carried"):
+                _hook(limit=1).get_stats(DATE, DIMENSIONS, METRICS)
+
+    def test_two_values_carrying_neither_id_nor_name_are_two_rows(self):
+        """A degenerate value is read whole; projecting it onto a constant would
+        call every such row a repeat of the first."""
+        first = _row({"segment": "A"}, {"name": "mobile"})
+        second = _row({"segment": "B"}, {"name": "mobile"})
+        pages = [
+            _page([first], total=2, rounded=False),
+            _page([second], total=2, rounded=False),
+            _page([], total=2, rounded=False),
+        ]
+        records, _ = _collect(_hook(limit=1), [_campaign(1)], pages)
+        assert len(records) == 2
+
     def test_without_groupings_the_single_row_is_never_checked(self):
         with patch("requests.get", side_effect=_api([_campaign(1)], [_page([_row()], 1)])):
             records = _hook().get_stats(DATE, [], METRICS)
@@ -454,19 +593,62 @@ class TestCompleteness:
         assert len(records) == 1
         assert any("total_rows_rounded" in r.getMessage() for r in caplog.records)
 
-    def test_an_answer_without_a_readable_total_warns_and_goes_on(self, caplog):
+    def test_an_answer_without_a_readable_total_fails_the_day(self):
+        """Rows nothing can be checked against are rows nothing may trust."""
         rows = [_row(_placement("A", 1), {"name": "mobile"})]
-        with caplog.at_level(logging.WARNING, logger=_HOOK_LOGGER):
-            records, _ = _collect(_hook(), [_campaign(1)], [_page(rows)])
-        assert len(records) == 1
-        assert any("unverified" in r.getMessage() for r in caplog.records)
+        with patch("requests.get", side_effect=_api([_campaign(1)], [_page(rows)])):
+            with pytest.raises(AirflowException, match="no readable total_rows"):
+                _hook().get_stats(DATE, DIMENSIONS, METRICS)
 
-    def test_a_total_that_is_not_a_number_is_no_total_at_all(self, caplog):
+    def test_a_total_that_is_not_a_number_is_no_total_at_all(self):
         rows = [_row(_placement("A", 1), {"name": "mobile"})]
-        with caplog.at_level(logging.WARNING, logger=_HOOK_LOGGER):
-            records, _ = _collect(_hook(), [_campaign(1)], [_page(rows, total="5")])
-        assert len(records) == 1
-        assert any("unverified" in r.getMessage() for r in caplog.records)
+        with patch("requests.get", side_effect=_api([_campaign(1)], [_page(rows, total="5")])):
+            with pytest.raises(AirflowException, match="no readable total_rows"):
+                _hook().get_stats(DATE, DIMENSIONS, METRICS)
+
+    @pytest.mark.parametrize("flag", ["false", "true", 0, 1, "", []])
+    def test_a_rounding_flag_that_is_not_a_boolean_fails_the_day(self, flag):
+        """A flag read as truthy would disown the exact check and pass a short day."""
+        rows = [_row(_placement("A", 1), {"name": "mobile"})]
+        pages = [_page(rows, total=5, rounded=flag)]
+        with patch("requests.get", side_effect=_api([_campaign(1)], pages)):
+            with pytest.raises(AirflowException, match="not a boolean"):
+                _hook().get_stats(DATE, DIMENSIONS, METRICS)
+
+    def test_a_rounding_flag_that_is_null_fails_the_day(self):
+        """A field holding `null` is one the answer carried and nothing can read."""
+        rows = [_row(_placement("A", 1), {"name": "mobile"})]
+        pages = [_page(rows, total=5, total_rows_rounded=None)]
+        with patch("requests.get", side_effect=_api([_campaign(1)], pages)):
+            with pytest.raises(AirflowException, match="not a boolean"):
+                _hook().get_stats(DATE, DIMENSIONS, METRICS)
+
+    def test_a_missing_rounding_flag_leaves_the_exact_check_armed(self):
+        """An answer that says nothing about rounding declares an exact total."""
+        rows = [_row(_placement("A", 1), {"name": "mobile"})]
+        with patch("requests.get", side_effect=_api([_campaign(1)], [_page(rows, total=5)])):
+            with pytest.raises(AirflowException, match="1 rows"):
+                _hook().get_stats(DATE, DIMENSIONS, METRICS)
+
+    def test_two_exact_totals_that_disagree_fail_the_day(self):
+        first = [_row(_placement("A", 1), {"name": "mobile"})]
+        second = [_row(_placement("B", 2), {"name": "mobile"})]
+        pages = [_page(first, total=2, rounded=False), _page(second, total=7, rounded=False)]
+        with patch("requests.get", side_effect=_api([_campaign(1)], pages)):
+            with pytest.raises(AirflowException, match="on an earlier page"):
+                _hook(limit=1).get_stats(DATE, DIMENSIONS, METRICS)
+
+    def test_rounded_totals_that_disagree_are_two_approximations(self):
+        """Numbers the report calls approximate are free to differ between pages."""
+        first = [_row(_placement("A", 1), {"name": "mobile"})]
+        second = [_row(_placement("B", 2), {"name": "mobile"})]
+        pages = [
+            _page(first, total=2, rounded=True),
+            _page(second, total=7, rounded=True),
+            _page([], total=7, rounded=True),
+        ]
+        records, _ = _collect(_hook(limit=1), [_campaign(1)], pages)
+        assert len(records) == 2
 
     def test_a_matching_total_says_nothing(self, caplog):
         rows = [_row(_placement("A", 1), {"name": "mobile"})]
@@ -579,3 +761,136 @@ class TestCampaignList:
         list_calls = [c for c in mock_get.call_args_list if c.args[0] == _ENDPOINT_URLS["campaigns"]]
         assert len(list_calls) == 1
         assert len(_stat_params(mock_get)) == 2
+
+
+# ---------------------------------------------------------------------------
+# A walk that does not converge
+# ---------------------------------------------------------------------------
+
+
+class TestTheWalkIsBounded:
+    """An endpoint that ignores the offset must cost a task a bounded amount."""
+
+    def test_the_budget_is_the_rows_a_walk_may_collect(self):
+        """The same amount of data whatever page size it is read in."""
+        assert _page_budget(10000, _MAX_ROWS) * 10000 == _MAX_ROWS
+        assert _page_budget(1000, _MAX_ROWS) * 1000 == _MAX_ROWS
+        assert _page_budget(_MAX_ROWS, _MAX_ROWS) == 1
+
+    def test_a_page_too_small_to_reach_the_ceiling_runs_out_of_requests(self):
+        """A row ceiling says nothing about how long a walk may take."""
+        assert _page_budget(1, _MAX_ROWS) == _MAX_PAGES
+        assert _page_budget(0, _MAX_ROWS) == _MAX_PAGES
+
+    def test_a_ceiling_that_does_not_divide_evenly_is_reached_and_not_missed(self):
+        assert _page_budget(3, 10) == 4
+
+    def test_full_pages_of_new_rows_stop_at_the_page_budget(self):
+        hook = _hook(limit=1)
+        budget = 25
+
+        def endless(url, **kwargs):
+            if url == _ENDPOINT_URLS["campaigns"]:
+                return _response({"campaigns": [_campaign(1)], "total": 1})
+            # A new row every time: the seen-key set never fires and no page is
+            # ever short, so nothing but the cap ends this walk.
+            endless.seen += 1
+            return _response(
+                _page(
+                    [_row(_placement("A", endless.seen), {"name": "mobile"})],
+                    total=_MAX_ROWS,
+                    rounded=True,
+                )
+            )
+
+        endless.seen = 0
+
+        with patch(f"{_HOOK_LOGGER}._MAX_PAGES", budget):
+            with patch("requests.get", side_effect=endless) as mock_get:
+                with pytest.raises(AirflowException, match="full pages"):
+                    hook.get_stats(DATE, DIMENSIONS, METRICS)
+
+        assert len(_stat_params(mock_get)) == budget
+
+    def test_a_campaign_list_that_never_ends_stops_at_the_page_budget(self):
+        hook = _hook()
+        counter = {"n": 0}
+
+        def endless(url, **kwargs):
+            counter["n"] += 1
+            start = counter["n"] * _CAMPAIGNS_LIMIT
+            return _response(
+                {
+                    "campaigns": [_campaign(start + i) for i in range(_CAMPAIGNS_LIMIT)],
+                    "total": _MAX_CAMPAIGNS,
+                }
+            )
+
+        with patch("requests.get", side_effect=endless) as mock_get:
+            with pytest.raises(AirflowException, match="full pages"):
+                hook.get_campaigns()
+
+        assert mock_get.call_count == _page_budget(_CAMPAIGNS_LIMIT, _MAX_CAMPAIGNS)
+
+    def test_a_list_that_repeats_a_campaign_fails_at_once(self):
+        """A repeated id says the offset is not moving through the list."""
+        hook = _hook()
+        page = [_campaign(i) for i in range(1, _CAMPAIGNS_LIMIT + 1)]
+
+        body = {"campaigns": page, "total": 2 * _CAMPAIGNS_LIMIT}
+        with patch("requests.get", return_value=_response(body)) as mock_get:
+            with pytest.raises(AirflowException, match="twice"):
+                hook.get_campaigns()
+
+        assert mock_get.call_count == 2
+
+
+# ---------------------------------------------------------------------------
+# A campaign the answer named no usable id for
+# ---------------------------------------------------------------------------
+
+
+class TestCampaignsWithoutAnId:
+    """Such a campaign fails the export rather than quietly leaving it short."""
+
+    @pytest.mark.parametrize(
+        "raw",
+        [
+            {},
+            {"campaign_id": None},
+            {"campaign_id": 123456.0},
+            {"campaign_id": "12-34"},
+            {"campaign_id": 0},
+        ],
+        ids=["absent", "null", "fractional", "not a number", "zero"],
+    )
+    def test_a_campaign_whose_id_cannot_be_read_fails_the_day(self, raw):
+        campaigns = [{"name": "No usable id", **raw}, _campaign(2)]
+
+        with pytest.raises(AirflowException, match="not a positive whole number"):
+            _collect(_hook(), campaigns, [_page([], 0)])
+
+    def test_the_failure_names_the_campaign_it_could_not_read(self):
+        campaigns = [{"name": "Autumn brand", "campaign_id": 123456.0}]
+
+        with pytest.raises(AirflowException) as excinfo:
+            _collect(_hook(), campaigns, [_page([], 0)])
+
+        assert "float" in str(excinfo.value)
+        assert "Autumn brand" in str(excinfo.value)
+
+    def test_the_day_is_not_asked_for_one_campaign_at_a_time_instead(self):
+        """The list fails, so no statistics request goes out for the rest of it."""
+        campaigns = [{"name": "No usable id"}, _campaign(2)]
+
+        with patch("requests.get", side_effect=_api(campaigns, [])) as mock_get:
+            with pytest.raises(AirflowException, match="not a positive whole number"):
+                _hook().get_stats(DATE, DIMENSIONS, METRICS)
+
+        assert _stat_params(mock_get) == []
+
+    @pytest.mark.parametrize("raw", ["7", 7], ids=["text", "number"])
+    def test_an_id_written_either_way_names_the_same_campaign(self, raw):
+        campaigns = [{**_campaign(7), "campaign_id": raw}]
+        _, mock_get = _collect(_hook(), campaigns, [_page([], 0)])
+        assert _stat_params(mock_get)[0]["ids"] == 7

@@ -1,3 +1,5 @@
+"""Client that ships this provider's diagnostic events to a Loki instance."""
+
 from __future__ import annotations
 
 import json

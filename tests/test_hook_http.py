@@ -10,12 +10,13 @@ from unittest.mock import MagicMock, patch
 
 import pytest
 import requests
-from airflow.exceptions import AirflowException
+from airflow.exceptions import AirflowException, AirflowTaskTimeout
 from airflow.models import Connection
 
 from airflow_provider_yandex_admetrica.hooks.yandex_admetrica import (
     _BACKOFF_DELAYS,
     _ENDPOINT_URLS,
+    _OUTCOME_UNKNOWN,
     _REQUEST_TIMEOUT,
     _RETRY_AFTER_HEADER,
     _RETRY_AFTER_MAX,
@@ -514,17 +515,19 @@ class TestDiagnostics:
         assert sink.pushed[0]["rate_limit_remaining"] == "0"
 
     @pytest.mark.parametrize(
-        "answer",
+        "make_answer",
         [
-            _response(401, {"error": {"code": 401, "message": f"OAuth {TOKEN}"}}),
-            _response(500, {"message": f"upstream sent OAuth {TOKEN}"}),
-            _response(200, {"data": "nope", "hint": f"OAuth {TOKEN}"}),
+            lambda: _response(401, {"error": {"code": 401, "message": f"OAuth {TOKEN}"}}),
+            lambda: _response(500, {"message": f"upstream sent OAuth {TOKEN}"}),
+            lambda: _response(200, {"data": "nope", "hint": f"OAuth {TOKEN}"}),
         ],
+        ids=["auth_error", "retryable_error", "empty_shape"],
     )
-    def test_no_pushed_event_of_any_failure_spells_the_token_out(self, answer):
+    def test_no_pushed_event_of_any_failure_spells_the_token_out(self, make_answer):
+        """The answer is built here: a shared mock accumulates calls between tests."""
         sink = _Sink()
         hook = _hook(loki=sink)
-        with patch("requests.get", return_value=answer):
+        with patch("requests.get", return_value=make_answer()):
             with pytest.raises(AirflowException):
                 _call(hook)
         assert sink.pushed
@@ -592,3 +595,77 @@ class TestPace:
                 _call(hook)
                 _call(hook)
         sleep.assert_not_called()
+
+
+# ---------------------------------------------------------------------------
+# The safety net around an attempt
+# ---------------------------------------------------------------------------
+
+
+class TestAnAttemptThatFailedInAnUnforeseenWay:
+    """Whatever escapes the branches is classified, and nothing is left "unknown"."""
+
+    def test_an_unexpected_exception_is_pushed_as_such_and_reworded(self):
+        sink = _Sink()
+        hook = _hook(loki=sink)
+        boom = AttributeError("a response object of an unforeseen shape")
+
+        with patch("requests.get", side_effect=boom):
+            with pytest.raises(AirflowException) as excinfo:
+                _call(hook)
+
+        assert "AttributeError" in str(excinfo.value)
+        assert "a response object of an unforeseen shape" in str(excinfo.value)
+        (event,) = sink.pushed
+        assert event["outcome"] == "unexpected_error"
+        assert event["exception_type"] == "AttributeError"
+        assert event["level"] == "error"
+
+    def test_an_unexpected_exception_is_raised_with_nothing_attached(self):
+        """The original would print its own text into the task log, past the gate."""
+        hook = _hook()
+
+        with patch("requests.get", side_effect=AttributeError(f"OAuth {TOKEN}")):
+            with pytest.raises(AirflowException) as excinfo:
+                _call(hook)
+
+        assert excinfo.value.__cause__ is None
+        assert excinfo.value.__suppress_context__ is True
+        assert TOKEN not in str(excinfo.value)
+        assert _TOKEN_REDACTED in str(excinfo.value)
+
+    def test_a_timeout_of_the_task_travels_unchanged(self):
+        """A stop Airflow itself raised is the caller's own signal, not a failure."""
+        hook = _hook()
+        stop = AirflowTaskTimeout("Timeout, PID: 4242")
+
+        with patch("requests.get", side_effect=stop):
+            with pytest.raises(AirflowTaskTimeout) as excinfo:
+                _call(hook)
+
+        assert excinfo.value is stop
+
+    def test_an_interrupted_attempt_is_neither_logged_nor_pushed(self, caplog):
+        """A stop of the task itself must not be held for the length of a push."""
+        sink = _Sink()
+        hook = _hook(loki=sink)
+        stop = KeyboardInterrupt()
+
+        with caplog.at_level(logging.DEBUG, logger=_HOOK_LOGGER):
+            with patch("requests.get", side_effect=stop):
+                with pytest.raises(KeyboardInterrupt) as excinfo:
+                    _call(hook)
+
+        assert excinfo.value is stop
+        assert sink.pushed == []
+        assert [r for r in caplog.records if r.name == _HOOK_LOGGER] == []
+
+    def test_the_placeholder_outcome_never_reaches_the_sink(self):
+        sink = _Sink()
+        hook = _hook(loki=sink)
+
+        with patch("requests.get", side_effect=AttributeError("boom")):
+            with pytest.raises(AirflowException):
+                _call(hook)
+
+        assert all(event["outcome"] != _OUTCOME_UNKNOWN for event in sink.pushed)

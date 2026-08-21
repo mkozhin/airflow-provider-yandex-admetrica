@@ -14,8 +14,8 @@ from airflow.models import Connection
 
 from airflow_provider_yandex_admetrica.hooks.yandex_admetrica import (
     _CAMPAIGN_FIELDS,
-    _DEFAULT_LIMIT,
-    _DEFAULT_REQUEST_DELAY,
+    DEFAULT_LIMIT,
+    DEFAULT_REQUEST_DELAY,
     AdmetricaHook,
     _campaign_record,
 )
@@ -311,8 +311,8 @@ class TestParametersReachTheHook:
         op = _operator(base_dir=str(tmp_path))
         with _Run([_row()]) as run:
             op.execute(_context())
-        assert run.hook.limit == _DEFAULT_LIMIT
-        assert run.hook.request_delay == _DEFAULT_REQUEST_DELAY
+        assert run.hook.limit == DEFAULT_LIMIT
+        assert run.hook.request_delay == DEFAULT_REQUEST_DELAY
 
     def test_connection_id_reaches_the_hook(self, tmp_path):
         op = _operator(base_dir=str(tmp_path), admetrica_conn_id="other_advertiser")
@@ -335,9 +335,16 @@ class TestDiagnostics:
         assert run.hook._loki is None
 
     def test_an_empty_connection_id_leaves_the_context_unread(self, tmp_path):
+        """The context of this run carries no "ti"; reading one would raise."""
         op = _operator(base_dir=str(tmp_path))
-        with _Run([_row()]):
-            op.execute(_context())  # no "ti" in the context at all
+        context = _context()
+        assert "ti" not in context
+
+        with _Run([_row()]) as run:
+            result = op.execute(context)
+
+        assert run.hook._loki is None
+        assert [r["kind"] for r in result] == ["stats", "dict"]
 
     def test_a_named_connection_builds_the_sink(self, tmp_path):
         op = _operator(base_dir=str(tmp_path), loki_conn_id="loki")
@@ -357,8 +364,8 @@ class TestDiagnostics:
 
 
 class TestDeclaration:
-    def test_templated_fields_cover_the_day_and_the_connections(self):
-        for field in ("date", "admetrica_conn_id", "loki_conn_id"):
+    def test_templated_fields_cover_the_day_the_connections_and_the_directory(self):
+        for field in ("date", "admetrica_conn_id", "loki_conn_id", "base_dir"):
             assert field in YandexAdmetricaStatsOperator.template_fields
 
     def test_the_operator_has_a_colour(self):
@@ -406,11 +413,18 @@ class TestCampaignDictionary:
         ]
 
     def test_falls_back_to_the_current_day_without_a_run(self, tmp_path):
+        """The clock is frozen: a real one moves the day under a run at midnight."""
         op = _operator(base_dir=str(tmp_path))
-        with _Run([_row()]):
-            result = op.execute(_context(start_date=None))
+        frozen = datetime(2026, 8, 21, 23, 59, 59, tzinfo=timezone.utc)
+        with patch(
+            "airflow_provider_yandex_admetrica.operators.stats.datetime"
+        ) as clock:
+            clock.now.return_value = frozen
+            clock.strptime = datetime.strptime
+            with _Run([_row()]):
+                result = op.execute(_context(start_date=None))
         (record,) = [r for r in result if r["kind"] == "dict"]
-        assert record["date"] == datetime.now(timezone.utc).strftime("%Y-%m-%d")
+        assert record["date"] == "2026-08-21"
 
     def test_column_file_name_and_result_name_one_day(self, tmp_path):
         op = _operator(base_dir=str(tmp_path))
@@ -468,3 +482,59 @@ class TestCampaignDictionary:
             result = op.execute(_context())
         (record,) = [r for r in result if r["kind"] == "dict"]
         assert record["advertiser_id"] == 42
+
+
+class TestTheDayIsHeldToItsFormat:
+    """The day names a file and is asked of the API, so it is checked first."""
+
+    @pytest.mark.parametrize(
+        "date",
+        [
+            "../../../../tmp/pwned",
+            "2026-08-20/../../etc/passwd",
+            "20260820",
+            "2026-8-20",
+            "not-a-day",
+            "",
+            None,
+        ],
+        ids=["traversal", "escaping_segment", "compact", "unpadded", "words", "empty", "none"],
+    )
+    def test_a_day_that_is_not_a_day_is_refused_before_anything_runs(self, date, tmp_path):
+        op = _operator(base_dir=str(tmp_path), date=date)
+        with _Run([_row()]) as run:
+            with pytest.raises(ValueError, match="date must be a day"):
+                op.execute(_context())
+        run.get_stats.assert_not_called()
+        assert not list(tmp_path.rglob("*.json"))
+
+    def test_a_day_can_name_nothing_outside_the_base_directory(self, tmp_path):
+        """Even reached directly, the path stays under the base directory."""
+        op = _operator(base_dir=str(tmp_path))
+        path = op._build_path(RUN_ID, ADVERTISER_ID, ("stats",), "../../../../tmp/pwned")
+        assert os.path.normpath(path).startswith(str(tmp_path) + os.sep)
+
+
+class TestFailureLeavesNoFile:
+    def test_a_day_the_hook_could_not_read_writes_nothing(self, tmp_path):
+        op = _operator(base_dir=str(tmp_path))
+        with _Run([_row()]) as run:
+            run.get_stats.side_effect = AirflowException("total_rows does not match")
+            with pytest.raises(AirflowException):
+                op.execute(_context())
+        assert not list(tmp_path.rglob("*.json"))
+
+
+class TestTheWriteIsAtomic:
+    """Map indices of one run share the dictionary path, so a half file is fatal."""
+
+    def test_the_path_never_holds_a_half_written_file(self, tmp_path):
+        op = _operator(base_dir=str(tmp_path))
+        path = op._build_path(RUN_ID, ADVERTISER_ID, ("stats",), DATE)
+        op._write([_row(55)], path)
+
+        with pytest.raises(TypeError):
+            op._write([_row(56), {"unserializable": object()}], path)
+
+        assert _read(path) == [json.dumps(_row(55), ensure_ascii=False)]
+        assert list(os.listdir(os.path.dirname(path))) == [os.path.basename(path)]

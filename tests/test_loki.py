@@ -1,3 +1,5 @@
+"""Tests for the diagnostics sink: what it sends, and what it does when it cannot."""
+
 from __future__ import annotations
 
 import json
@@ -11,15 +13,18 @@ from airflow.exceptions import AirflowTaskTerminated, AirflowTaskTimeout
 from airflow.models import Connection
 
 from airflow_provider_yandex_admetrica.hooks.loki import (
-    LokiClient,
-    _build_target,
     _SERVICE,
+    LokiClient,
     _TargetError,
+    _build_target,
 )
 from airflow_provider_yandex_admetrica.hooks.yandex_admetrica import (
     _BODY_LIMIT,
     _HEADER_LIMIT,
-    _PARAMS_LIMIT,
+    _PARAM_NAME_LIMIT,
+    _PARAM_VALUE_LIMIT,
+    _PARAMS_MAX,
+    _PARAMS_TRUNCATED,
     _TEXT_LIMIT,
     _new_event,
 )
@@ -508,32 +513,37 @@ def _full_event(response_body: str, filler: str) -> dict:
     Every bounded field sits at its budget and every optional one is filled,
     each free-text one with the character the measurement is being made in, so
     the result covers the event a bad day produces rather than a typical one.
-    The request parameters are the widest the statistics endpoint accepts: the
-    documented limits are 20 metrics, 10 dimensions and a filter of 10 000
-    characters, and every one of them is written in the same filler.
+    The request parameters are the widest an event describes: as many of them as
+    the field carries at all, each named and valued past its own budget, so what
+    the line pays for them is what it would pay for a DAG that added a parameter
+    of its own for every name the report already sends.
 
     The schema and the budgets come from the hook module, and the measurement
     belongs here: how long a line the client may hand to Loki is a property of
     the client, so the fixture is built from the widest event the hook can
     produce.
     """
+    params = {
+        "ids": 123456,
+        "date1": "2026-08-20",
+        "date2": "2026-08-20",
+        "metrics": ",".join(f"am:e:{filler * 20}{i}" for i in range(20)),
+        "dimensions": ",".join(f"am:e:{filler * 20}{i}" for i in range(10)),
+        "sort": ",".join(f"am:e:{filler * 20}{i}" for i in range(10)),
+        "limit": 10000,
+        "offset": 40001,
+        "accuracy": "full",
+        "include_undefined": "true",
+        "filters": filler * 10000,
+        "timezone": "+03:00",
+        "lang": "ru",
+    }
+    params.update(
+        {f"{i}{filler * _PARAM_NAME_LIMIT}": filler * 10000 for i in range(_PARAMS_MAX)}
+    )
     event = _new_event(
         endpoint="stat",
-        params={
-            "ids": 123456,
-            "date1": "2026-08-20",
-            "date2": "2026-08-20",
-            "metrics": ",".join(f"am:e:{filler * 20}{i}" for i in range(20)),
-            "dimensions": ",".join(f"am:e:{filler * 20}{i}" for i in range(10)),
-            "sort": ",".join(f"am:e:{filler * 20}{i}" for i in range(10)),
-            "limit": 10000,
-            "offset": 40001,
-            "accuracy": "full",
-            "include_undefined": "true",
-            "filters": filler * 10000,
-            "timezone": "+03:00",
-            "lang": "ru",
-        },
+        params=params,
         headers={"Authorization": f"OAuth {_TOKEN}", "Accept": "application/json"},
         token=_TOKEN,
         advertiser_id=17004,
@@ -624,8 +634,10 @@ class TestPushedLineFitsTheLokiLimit:
         """The measurement is only worth as much as the fixture's own size."""
         params = _full_event("", "x")["request_params"]
 
-        spent = sum(len(k) + len(v) for k, v in params.items() if isinstance(v, str))
-        assert spent > _PARAMS_LIMIT // 2
+        described = {k: v for k, v in params.items() if k != _PARAMS_TRUNCATED}
+        assert len(described) == _PARAMS_MAX
+        spent = sum(len(k) + len(v) for k, v in described.items() if isinstance(v, str))
+        assert spent > _PARAMS_MAX * (_PARAM_NAME_LIMIT + _PARAM_VALUE_LIMIT) // 2
 
 
 # ---------------------------------------------------------------------------

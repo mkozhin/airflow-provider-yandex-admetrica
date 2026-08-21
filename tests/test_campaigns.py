@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import json
-import logging
 from unittest.mock import MagicMock, patch
 
 import pytest
@@ -20,8 +19,6 @@ from airflow_provider_yandex_admetrica.hooks.yandex_admetrica import (
 TOKEN = "y0__xDf" + "MIDDLE-OF-THE-SECRET" + "q9Az"
 
 ADVERTISER_ID = 17004
-
-_HOOK_LOGGER = "airflow_provider_yandex_admetrica.hooks.yandex_admetrica"
 
 
 def _hook(**kwargs) -> AdmetricaHook:
@@ -164,19 +161,19 @@ class TestEveryStatusIsAsked:
 class TestPagination:
     def test_several_pages_are_collected_in_order(self):
         hook = _hook()
-        first = [_campaign(i) for i in range(_CAMPAIGNS_LIMIT)]
-        second = [_campaign(_CAMPAIGNS_LIMIT), _campaign(_CAMPAIGNS_LIMIT + 1)]
+        first = [_campaign(i) for i in range(1, _CAMPAIGNS_LIMIT + 1)]
+        second = [_campaign(_CAMPAIGNS_LIMIT + 1), _campaign(_CAMPAIGNS_LIMIT + 2)]
         total = len(first) + len(second)
         pages = [_page(first, total=total), _page(second, total=total)]
         with patch("requests.get", side_effect=pages) as mock_get:
             campaigns = hook.get_campaigns()
         assert mock_get.call_count == 2
-        assert [c["campaign_id"] for c in campaigns] == list(range(total))
+        assert [c["campaign_id"] for c in campaigns] == list(range(1, total + 1))
 
     def test_limit_and_offset_go_out_with_every_request(self):
         hook = _hook()
-        first = [_campaign(i) for i in range(_CAMPAIGNS_LIMIT)]
-        second = [_campaign(_CAMPAIGNS_LIMIT)]
+        first = [_campaign(i) for i in range(1, _CAMPAIGNS_LIMIT + 1)]
+        second = [_campaign(_CAMPAIGNS_LIMIT + 1)]
         total = len(first) + len(second)
         pages = [_page(first, total=total), _page(second, total=total)]
         with patch("requests.get", side_effect=pages) as mock_get:
@@ -192,12 +189,14 @@ class TestPagination:
             hook.get_campaigns()
         assert mock_get.call_args.kwargs["params"]["offset"] == 0
 
-    def test_a_closed_total_stops_the_walk_on_a_full_page(self):
+    def test_a_reached_total_on_a_full_page_still_asks_for_the_page_after_it(self):
+        """The list ends where the answer runs short, not where its count is met."""
         hook = _hook()
-        rows = [_campaign(i) for i in range(_CAMPAIGNS_LIMIT)]
-        with patch("requests.get", return_value=_page(rows, total=_CAMPAIGNS_LIMIT)) as mock_get:
+        rows = [_campaign(i) for i in range(1, _CAMPAIGNS_LIMIT + 1)]
+        pages = [_page(rows, total=_CAMPAIGNS_LIMIT), _page([], total=_CAMPAIGNS_LIMIT)]
+        with patch("requests.get", side_effect=pages) as mock_get:
             campaigns = hook.get_campaigns()
-        assert mock_get.call_count == 1
+        assert mock_get.call_count == 2
         assert len(campaigns) == _CAMPAIGNS_LIMIT
 
 
@@ -216,21 +215,40 @@ class TestCompleteness:
         assert "1 campaigns" in message
         assert "5" in message
 
-    def test_an_answer_without_a_readable_total_warns_and_goes_on(self, caplog):
+    def test_an_answer_without_a_readable_total_fails_the_task(self):
+        """A list nothing can be checked against is a list nothing may trust."""
         hook = _hook()
-        with caplog.at_level(logging.WARNING, logger=_HOOK_LOGGER):
-            with patch("requests.get", return_value=_page([_campaign(1)])):
-                campaigns = hook.get_campaigns()
-        assert [c["campaign_id"] for c in campaigns] == [1]
-        assert any("unverified" in record.getMessage() for record in caplog.records)
+        with patch("requests.get", return_value=_page([_campaign(1)])):
+            with pytest.raises(AirflowException, match="no readable total"):
+                hook.get_campaigns()
 
-    def test_a_total_that_is_not_a_number_is_no_total_at_all(self, caplog):
+    def test_a_total_that_is_not_a_number_is_no_total_at_all(self):
         hook = _hook()
-        with caplog.at_level(logging.WARNING, logger=_HOOK_LOGGER):
-            with patch("requests.get", return_value=_page([_campaign(1)], total="5")):
-                campaigns = hook.get_campaigns()
-        assert len(campaigns) == 1
-        assert any("unverified" in record.getMessage() for record in caplog.records)
+        with patch("requests.get", return_value=_page([_campaign(1)], total="5")):
+            with pytest.raises(AirflowException, match="no readable total"):
+                hook.get_campaigns()
+
+    def test_a_total_that_changes_between_pages_fails_the_task(self):
+        """Two answers about the list's length, one of which would stop the walk."""
+        first = [_campaign(i) for i in range(1, _CAMPAIGNS_LIMIT + 1)]
+        second = [_campaign(_CAMPAIGNS_LIMIT + 1)]
+        pages = [_page(first, total=_CAMPAIGNS_LIMIT), _page(second, total=_CAMPAIGNS_LIMIT + 1)]
+        with patch("requests.get", side_effect=pages):
+            with pytest.raises(AirflowException, match="on an earlier page"):
+                _hook().get_campaigns()
+
+    def test_a_growing_total_is_read_before_the_walk_stops_on_the_stale_one(self):
+        """The page that changes the count is a full one, so the walk reaches it."""
+        first = [_campaign(i) for i in range(1, _CAMPAIGNS_LIMIT + 1)]
+        second = [_campaign(_CAMPAIGNS_LIMIT + i) for i in range(1, _CAMPAIGNS_LIMIT + 1)]
+        pages = [
+            _page(first, total=_CAMPAIGNS_LIMIT),
+            _page(second, total=2 * _CAMPAIGNS_LIMIT),
+        ]
+        with patch("requests.get", side_effect=pages) as mock_get:
+            with pytest.raises(AirflowException, match="on an earlier page"):
+                _hook().get_campaigns()
+        assert mock_get.call_count == 2
 
 
 class TestUnreadableAnswer:

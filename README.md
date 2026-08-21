@@ -35,7 +35,7 @@ Create an Airflow connection of type **HTTP** with `conn_id = yandex_admetrica_d
 
 No other field of the connection is read. **Host** is ignored: the API host is fixed at `https://api.media.metrika.yandex.net`.
 
-Pressing **Test** on the connection asks for the advertiser's campaign list, which exercises at once everything an export depends on — the token is accepted, the advertiser is real, and the account may read the API — and answers `Connected to AdMetrica as advertiser 17004: 42 campaigns are readable.`
+`AdmetricaHook.test_connection()` answers whether a connection works: it asks for the advertiser's campaign list, which exercises at once everything an export depends on — the token is accepted, the advertiser is real, and the account may read the API — and returns `(True, "Connected to AdMetrica as advertiser 17004: 42 campaigns are readable.")`, or `(False, <the failure, with the token masked>)`. It is a helper to call from a DAG or a shell, not the Airflow UI's **Test** button: the provider registers no connection type of its own, so a connection of type HTTP is tested by the HTTP provider's own hook.
 
 Diagnostics use a second connection, described under [Loki connection](#loki-connection).
 
@@ -67,7 +67,7 @@ def admetrica_one_day():
 admetrica_one_day()
 ```
 
-**A task is a day.** The operator takes one date and collects every campaign of the advertiser for it. A period is expanded by the DAG and fed in through `expand(date=dates)`, so each day is its own map index: one day failing leaves the others alone, and re-running it is a clear of that map index. The example DAG does exactly this — see [Examples](#examples).
+**A task is a day.** The operator takes one date and collects every campaign of the advertiser for it. A period is expanded by the DAG, which hands each day to a map index of its own: one day failing leaves the others alone, and re-running it is a clear of that map index. The example DAG puts the whole way of a day into that map index — both uploads and the BigQuery load included — so every day loads on its own as well; see [Examples](#examples).
 
 The operator writes JSONL files and returns a `list[dict]`, one entry per file written:
 
@@ -80,7 +80,7 @@ The operator writes JSONL files and returns a `list[dict]`, one entry per file w
 
 `advertiser_id` travels with every entry because the tasks downstream build the S3 key and the table name from it and have nowhere else to read it: the advertiser is named in the connection, which only the hook opens.
 
-**Plan for a long task.** A day is one request per campaign, plus one page more for every full page a campaign fills, plus the walk over the campaign list. An advertiser with 70 campaigns therefore costs about 70 requests for a day of ordinary volume, each spaced by `request_delay` and bounded by a 30 s timeout, and a storm of retries adds up to 7 s of backoff to any one of them. Size `execution_timeout` for the number of days a run exports — the example DAG allows two hours.
+**Plan for a long task.** A day is one request per campaign, plus one page more for every full page a campaign fills, plus the walk over the campaign list. An advertiser with 70 campaigns therefore costs about 70 requests for a day of ordinary volume, each spaced by `request_delay` and bounded by a 30 s timeout. A storm of retries adds up to 7 s of backoff to any one of them when the ladder decides the wait — but a server that sends `Retry-After` names the wait itself, and each of the three rungs then costs up to 300 s, so one request can hold the task for 15 minutes. Size `execution_timeout` for the number of days a run exports — the example DAG allows two hours.
 
 ### Operator parameters
 
@@ -104,20 +104,22 @@ The operator writes JSONL files and returns a `list[dict]`, one entry per file w
 
 `date`, `admetrica_conn_id`, `loki_conn_id` and `base_dir` are template fields.
 
-Two of these are checked before the first request goes out, so a report configured wrongly costs nothing: more than 20 metrics or more than 10 dimensions raises `ValueError` naming the list that is over and by how much.
+The request is checked before it goes out, so a report configured wrongly costs nothing. `ValueError` answers an empty `metrics`, more than 20 metrics, more than 10 dimensions and a `limit` outside 1…100 000, naming what is wrong. `date` is held to `YYYY-MM-DD` by the hook itself, so a DAG calling `get_stats` directly is answered the same way: it is the day the API is asked for, the day stamped onto every record and the day that names the file, and it arrives rendered from a template.
 
 #### Reserved parameters
 
-`extra_params` may not carry `ids`, `date1`, `date2`, `metrics`, `dimensions`, `limit`, `offset`, `sort`, `accuracy`, `include_undefined`, `filters`, `timezone` and `lang`; passing one raises `ValueError` before anything is requested. Each of them is either the question being asked or an answer to how it is asked, and a silent override would be invisible in the data: another `date1` would fetch another day while the records still carry the operator's date, and `accuracy` or `include_undefined` would drop the defaults that stand against drifting and truncated numbers — with the completeness check still passing, because `total_rows` agrees with the truncated selection. The last five have parameters of their own on the operator, so nothing needs this route to reach them.
+`extra_params` may not carry `ids`, `date1`, `date2`, `metrics`, `dimensions`, `preset`, `limit`, `offset`, `sort`, `accuracy`, `include_undefined`, `filters`, `timezone` and `lang`; passing one raises `ValueError` before anything is requested. Each of them is either the question being asked or an answer to how it is asked, and a silent override would be invisible in the data: another `date1` would fetch another day while the records still carry the operator's date, and `accuracy` or `include_undefined` would drop the defaults that stand against drifting and truncated numbers — with the completeness check still passing, because `total_rows` agrees with the truncated selection. `preset` lets the API define the report's own metrics and dimensions, while values are paired by position against the names that were requested, so the numbers would land under the wrong keys. `filters`, `timezone`, `lang`, `accuracy` and `include_undefined` have parameters of their own on the operator, so nothing needs this route to reach them.
 
 ### How a day is collected
 
-- **One request per campaign.** The API offers no grouping by campaign and sums the campaigns named in `ids` together, so a request per campaign is the only way the split survives. The campaign list is fetched once per run and serves both the statistics and the dictionary.
+- **One request per campaign.** The API offers no grouping by campaign and sums the campaigns named in `ids` together, so a request per campaign is the only way the split survives. The campaign list is fetched once per task instance — the hook lives for one `execute`, so a run spread over one map index per day walks the list once per day — and serves both the statistics and the dictionary of that day. A campaign the answer names no usable `campaign_id` for fails the export: `ids` is required and names one campaign, so such a campaign is one whose rows nothing can ask for, and a day written without them would be short without saying so.
 - **Every campaign status.** No `status` filter goes out: an archived campaign ran in the past and its statistics are as real as an active one's, and a filter here would silently shorten every re-export of an earlier period. Campaigns are not filtered by `date_start`/`date_end` either — those are the campaign's declared dates, not a promise about where impressions are.
 - **`date1 = date2 = <day>`.** The report carries no date of its own, so the day is asked for one at a time and stamped onto every record by the provider. A one-day selection is also small enough for sampling to be unlikely.
 - **`sort` names every requested grouping.** The report is aggregated by them, so their combination orders the rows completely and repeatably from page to page; sorting by a metric would not, since a long tail of placements shares `renders=1`.
 - **Pagination is checked, not trusted.** Rows are identified by what their groupings matched, and a row seen twice while walking one campaign fails the day: pages that overlap are pages that also skip, and counting rows cannot tell the two apart. The same combination in two different campaigns is ordinary — one placement runs in several — so the set of seen rows is reset for each campaign.
-- **Completeness is checked against `total_rows`.** A count that does not match an exact total fails the day with an `AirflowException`: rows lost between pages are lost silently, and what is not in the file is discovered weeks later. When the answer sets `total_rows_rounded`, the same difference is only a warning — and the rounded number is not used to stop the walk either, since 10 437 rows declared as 10 000 against `limit=10000` would fill the first page exactly, match the total, and leave the tail behind.
+- **The walk stops on a short page, never on a total.** A campaign-day is read until a page comes back shorter than the one asked for, which is the report's own word that its rows have run out. A declared total is a number about the report rather than the report itself, and one that is low by a page would end a day with its tail left behind: 10 437 rows declared as 10 000 against `limit=10000` fill the first page exactly and match the total. The price is one further request whenever a campaign-day ends exactly on a page boundary. The campaign list is walked by the same rule.
+- **Completeness is checked against `total_rows`.** A count that does not match an exact total fails the day with an `AirflowException`: rows lost between pages are lost silently, and what is not in the file is discovered weeks later. When the answer sets `total_rows_rounded`, the same difference is only a warning — the number is an approximation by the API's own word, and the collected rows are the ones written.
+- **A completeness signal that cannot be read fails the day.** Every page has to carry a whole-number `total_rows`, a `total_rows_rounded` that is a boolean whenever the field is there at all (a `null` is a flag with no reading, while a page carrying no such field declares an exact total), and — while the totals are exact — the same total as the pages before it. A missing total leaves the day nothing to be checked against, a `"false"` read as truthy would disown the exact check altogether, and two different exact totals leave two answers to how long the report is. An export that cannot read its completeness signal cannot claim completeness, so it fails instead. The campaign list is held to the same rule for its own `total`.
 - **Caveats reach the task log.** `sampled` is a WARNING carrying `sample_share`, `sample_size` and `sample_space`; `contains_sensitive_data` is a WARNING saying the day is short by whatever the API withheld; `data_lag` is an INFO.
 
 ## Output records
@@ -143,6 +145,8 @@ Nesting is what makes a new field in the answer a change to a JSON value rather 
 | `dimensions` | One key per requested grouping, in the order they were requested. The value is the object the API returned, with **exactly** the fields it arrived with — nothing is dropped, nothing is added, and the field names inside it are not touched |
 | `metrics` | One key per requested metric, in the order they were requested, holding the number the answer returned |
 
+**One key per requested name — and two names can want one key.** The two spellings of a parameterised name normalise to the same key, so asking for `am:e:goal12345Reaches` and `am:e:goal<goal_id>Reaches` with `extra_params={"goal_id": 12345}` in one request writes `goal12345_reaches` once: the record keeps the later value, a WARNING names both by their position in the request, and one of the two requested metrics is not in the file. Ask for either spelling, never both. The names themselves never reach the log: a name is the caller's own text and can hold anything, credentials included.
+
 **Key naming.** The shared `am:e:` prefix comes off, a parameter spelled into the name is replaced by its value, and the camelCase that is left becomes snake_case. One rule serves groupings and metrics alike, because the API names both the same way:
 
 | Requested name | Record key |
@@ -156,13 +160,13 @@ Nesting is what makes a new field in the answer a change to a JSON value rather 
 | `am:e:goal12345Reaches` | `goal12345_reaches` |
 | `am:e:goal<goal_id>Reaches` with `extra_params={"goal_id": 12345}` | `goal12345_reaches` |
 
-A parameterised name reaches the API in two spellings — the value written into the name, or a placeholder in the name and the value in a field of its own — and substituting the value makes the record key the same for both, so a report rewritten from one spelling to the other keeps writing the column it already did. A placeholder no parameter answers keeps the parameter's name in its place and logs a WARNING: dropping it instead would merge every goal of the account into one column, and the merge would only be visible as numbers that are too large.
+A parameterised name reaches the API in two spellings — the value written into the name, or a placeholder in the name and the value in a field of its own — and substituting the value makes the record key the same for both, so a report rewritten from one spelling to the other keeps writing the column it already did. A placeholder no parameter answers keeps the parameter's name in its place and logs a WARNING naming the name by its length: dropping the placeholder instead would merge every goal of the account into one column, and the merge would only be visible as numbers that are too large.
 
 This key is a public contract: it is what an analyst writes in `JSON_VALUE(dimensions, '$.device_type')`.
 
 Key order is fixed — the service fields, then the groupings in the order they were requested, then the metrics in theirs — so files written from the same request are byte-comparable and a re-export is reviewable as a diff.
 
-If the answer returns fewer values than were asked for, the names left over are present and empty, and the mismatch is a WARNING: every record of a request keeps the same keys.
+A row carrying another number of values than were asked for fails the day. The answer names none of its values, so position is all that ties a number to its metric, and a row of another length cannot be read at all: some keys would be left empty or some numbers dropped, while the row counts towards `total_rows` exactly like a whole one — so the completeness check would pass and the file would look whole. An empty value is written through as it arrived. A metric typed `percents` or `currency` — `am:e:ctr`, `am:e:cpm`, the `video*Percent` family — is empty wherever its denominator or its cost is, so a report asking for those alone answers in rows of empty numbers; an empty **grouping** value is what `include_undefined=True` asks for. Each reaches the file as JSON `null`, which BigQuery reads as NULL.
 
 ### Campaign dictionary
 
@@ -176,7 +180,9 @@ The statistics carry only `campaign_id`; the campaign's name lives in a dictiona
 
 `snapshot_date` is the day the **export ran**, not the day it reports on: the management API answers with the state the campaigns are in right now, and there is no way to ask it about a past day. It is the operator that stamps it, names the file with the same date and reports it as the `date` of the result, so the column of a row, the key it is loaded from and the partition it is loaded into always name one day. The date is taken from the DAG run's `start_date` rather than from the clock, so a run whose days are spread over map indices produces one snapshot even when it crosses midnight.
 
-Every day of a run exports the dictionary, so the same file appears in the result of every map index — deduplicate by `path` before building load parameters, as the example DAG does.
+Every day of a run exports the dictionary, so the same file appears in the result of every map index. There is no reason to load it once per day of the period: take the `kind="dict"` entry of any day that reported one and load the snapshot once per run, as the example DAG does.
+
+The path is the same for every map index too, because the snapshot date is, so map indices running at once write one file. The write is atomic — the lines go to a temporary file that is moved onto the path in one step — so what an upload finds is always one whole snapshot rather than the truncated middle of two. Serialising the mapped task with `max_active_tis_per_dag=1`, as the example DAG does, or leaving `collect_dictionaries=True` on a single index, avoids the repeated work as well.
 
 The measures the answer carries beside these fields — spend, impressions, days left, conversions — describe the campaign at the moment of the request rather than the campaign itself, and a measure belongs to the statistics table. They are not written.
 
@@ -207,7 +213,7 @@ Locally, the run id isolates two runs exporting the same day from each other:
 {base_dir}/{safe_run_id}/{advertiser_id}/dict/campaigns/{snapshot_date}.json
 ```
 
-`safe_run_id` is the run id with every character outside `[^\w-]` replaced by an underscore, so a run id carrying a timestamp with colons and a plus sign still names a directory on every filesystem.
+`safe_run_id` is the run id with every character outside `[\w-]` — letters, digits, underscore and hyphen — replaced by an underscore, so a run id carrying a timestamp with colons and a plus sign still names a directory on every filesystem. The day is sanitised the same way, so nothing rendered into `date` can address a file outside `base_dir`.
 
 In S3 the run id is absent and the day is overwritten — no history is kept:
 
@@ -243,16 +249,22 @@ Bringing history to the new shape is a manual operation — re-export the period
 | 401 | Raises at once. The token is long-lived and nothing here refreshes it, so the attempt after it would be refused the same way |
 | 400 and any other 4xx | Raises at once, with the server's own words for it read out of the body. The request itself is what is being refused, and a repeat brings back the same answer |
 | An HTTP 200 no rows could be read out of | Raises, naming what the body held instead. **A zero is never green when it came from a failure** — only a well-formed answer, the empty one included, is handed on |
+| A row carrying another number of grouping or metric values than were asked for | `AirflowException` naming the campaign, the day and both counts: position is all that ties a value to its name, and such a row counts towards `total_rows` like a whole one |
 | Rows collected disagree with an exact `total_rows` | `AirflowException` |
 | The same disagreement with `total_rows_rounded` set | WARNING; the collected rows are the ones written |
+| A page declaring no whole-number `total_rows`, or a `total_rows_rounded` that is present and not a boolean | `AirflowException`: a completeness signal that cannot be read leaves the day nothing to be checked against, and a short one would pass unnoticed |
+| Two pages of one campaign-day declaring different exact totals | `AirflowException`: the number the rows are checked against changed under the walk |
 | Campaigns collected disagree with the declared `total` | `AirflowException`: a campaign missing from the list takes all of its statistics with it |
+| A page of the campaign list declaring no whole-number `total`, or two pages declaring different totals | `AirflowException`, for the reason the same answers fail a campaign-day |
+| A campaign whose `campaign_id` is not a positive whole number | `AirflowException` naming the campaign. Statistics are asked for one campaign at a time and named by that id, so such a campaign is one whose rows no request can ask for — and a day written without them would look complete |
+| A walk that keeps answering with full pages | `AirflowException` after the walk's page budget. The budget is ten million rows for one campaign-day and a million campaigns for one advertiser's list, divided by the rows a page of that walk asks for: the statistics walk asks for `limit`, so at `limit=10000` it is allowed 1000 pages and at `limit=100` it is allowed 100 000, while the campaign list asks for a fixed 1000 and is allowed 1000 pages. A page small enough that the ceiling would take more than 100 000 requests to reach runs out of requests instead |
 | `sampled` | WARNING carrying `sample_share`, `sample_size` and `sample_space` |
 | `contains_sensitive_data` | WARNING: part of the rows was withheld by the API |
 | `data_lag` | INFO |
 
 A single request is given 30 s before it counts as one the network did not carry.
 
-**Every unsuccessful attempt leaves one line in the task log**, the last one included, so a minute of waiting reads as a chronicle rather than as a silence:
+**Every unsuccessful attempt leaves one line in the task log**, the last one included, so a minute of waiting reads as a chronicle rather than as a silence. The one exception is an attempt the task itself was stopped in — a `BaseException` that is not an `Exception`, such as an execution timeout or a SIGTERM: it writes no line and pushes no event, deliberately, because the reason for it is already in the Airflow task log and a push would hold the stop for its own length.
 
 ```
 AdMetrica stat campaign_id=123456 date=2026-08-20 offset=1: attempt 1/4 failed — HTTP 429. Retrying in 1 s
@@ -276,7 +288,7 @@ AdMetrica campaigns offset=0: attempt 1/4 failed — HTTP 200, no readable rows 
 
 Optional, off by default. With `loki_conn_id` set, the operator emits one diagnostic event per HTTP attempt against **both** endpoints — the campaign list and the statistics — to a [Loki](https://grafana.com/docs/loki/latest/) instance. An event describes how the attempt went (severity, outcome, timing, HTTP status, the shape of the raw answer, what the report said about its own numbers), the request as it went out, and — for every attempt whose answer was not intelligible — the raw response body, so a past run can be explained afterwards in Grafana. **Read [Content policy](#content-policy) before turning this on: on an anomalous answer the response body travels as it came, and the body is treated as arbitrary sensitive data.**
 
-Turning diagnostics on does not change the export: the same files, the same operator return value, the same exceptions with the same types and messages. A Loki outage cannot fail the task — the first push failure logs one WARNING and disables diagnostics for the rest of the run. The one cost is wall-clock: the push is synchronous, with a 2 s connect timeout and a 3 s read timeout, so an unresponsive Loki holds an attempt for about 5 s — once, before diagnostics switch themselves off. The read half bounds the quiet between received bytes rather than the whole exchange, so a Loki answering in a slow dribble can hold an attempt longer than that; only the response status is used, and the body is never downloaded. What diagnostics never absorb is the task being stopped: an `execution_timeout` firing or a SIGTERM arriving interrupts the task there and then, and the attempt it cut short goes unreported rather than holding the stop for the length of a push.
+Turning diagnostics on does not change the export: the same files, the same operator return value, the same exceptions with the same types and messages. A Loki outage cannot fail the task — the first push failure logs one WARNING and disables diagnostics for the rest of that task instance. The one cost is wall-clock: the push is synchronous, with a 2 s connect timeout and a 3 s read timeout, so an unresponsive Loki holds an attempt for about 5 s — once, before diagnostics switch themselves off. The read half bounds the quiet between received bytes rather than the whole exchange, so a Loki answering in a slow dribble can hold an attempt longer than that; only the response status is used, and the body is never downloaded. What diagnostics never absorb is the task being stopped: an `execution_timeout` firing or a SIGTERM arriving interrupts the task there and then, and the attempt it cut short goes unreported rather than holding the stop for the length of a push.
 
 A run that fails before the first request — a connection Airflow cannot find, an `extra` naming no advertiser, an empty password — sends nothing, so the absence of events for a `dag_run` is not evidence about it: it reads the same as diagnostics being off or Loki being unreachable.
 
@@ -325,7 +337,7 @@ Basic Auth requires HTTPS: with **Login** set and a non-HTTPS URL, nothing is se
 
 Multi-tenant Loki is not supported — no `X-Scope-OrgID` header is sent. The target must be single-tenant or sit behind a gateway that stamps the tenant itself.
 
-A push counts as delivered only on HTTP 204, the status Loki answers with. Anything else — a `200` from a reverse proxy, a redirect (redirects are not followed) — is a failure: one WARNING, and diagnostics are off for the rest of the run.
+A push counts as delivered only on HTTP 204, the status Loki answers with. Anything else — a `200` from a reverse proxy, a redirect (redirects are not followed) — is a failure: one WARNING, and diagnostics are off for the rest of that task instance.
 
 Each entry carries a single stream label, `service="airflow-provider-yandex-admetrica"`, so label cardinality stays constant. Everything else lives in the JSON log line and is queried with LogQL over the parsed body:
 
@@ -353,7 +365,7 @@ Because that label is the same for every task, all tasks write into one stream. 
 | `attempt`, `max_attempts` | Retry counters for one request: `attempt` counts from 1 up to `max_attempts` as 429s, 5xx answers and network failures are retried out of one budget |
 | `request_method`, `request_url` | `"GET"` and the endpoint's address |
 | `request_headers` | The headers the provider sets — `Authorization` (masked, see below) and `Accept` |
-| `request_params` | The query as it went out: `ids`, `date1`, `date2`, `metrics`, `dimensions`, `limit`, `offset`, `sort` and the rest. Bounded to a shared budget of 8192 characters; a query going past it is described up to there and a `<params truncated>` key says how many parameters were left out |
+| `request_params` | The query as it went out: `ids`, `date1`, `date2`, `metrics`, `dimensions`, `limit`, `offset`, `sort` and the rest. Bounded parameter by parameter: at most 24 of them are described, a name at 40 characters and a text value at 300, each cut marked with `…`. A query carrying more than 24 parameters gets a `<params truncated>` key saying how many were left out. A name is a way out of the process like any other, so it passes the same masking gate as a value, and two names the bound reduces to the same text are told apart by the position of the parameter |
 | `duration_ms` | Wall-clock duration of the HTTP attempt |
 | `http_status` | Response status, `null` when the request never got one |
 | `rows_count` | Number of rows the raw answer carried, `null` when no list of rows was recognised |
@@ -416,7 +428,7 @@ The whole 5xx range is retried rather than the familiar four: a proxy in front o
 
 ### Raw response body
 
-`response_body` holds the response text, bounded to 32768 characters (fixed in the provider — there is no connection or operator setting for it). A longer body is cut to that budget and ends with `…[truncated]`. The text is read with the charset the server named in `Content-Type` and as UTF-8 when it named none.
+`response_body` holds the response text, bounded to 32768 characters (fixed in the provider — there is no connection or operator setting for it). A longer body is cut to that budget and ends with `…[truncated]`. The text is read with the charset the server named in `Content-Type`, and as UTF-8 when it named none or named a codec Python does not know. Bytes that do not decode are replaced rather than dropping the body: a body no one can read is worth less here than one read on a good assumption.
 
 | Situation | `response_body` |
 |---|---|
@@ -430,7 +442,7 @@ The key is always present; `null` in it is not a promise that the level was `inf
 
 In a healthy run every event is `info`, so no body travels at all. Volume grows on failing runs — and on retries, since a `retryable_error` or a `network_error` with an attempt left is a `warn`: **every** unsuccessful try ships its body, four of them when a storm exhausts a request's attempts.
 
-One event is one Loki line, and Loki refuses a line longer than `limits_config.max_line_size` — 256 KB by default. With every bounded field at its budget and a body of control characters, the widest they get once JSON has escaped them, a line measures about 200 KB, so the default leaves room. An installation that lowered that limit — Grafana Cloud, a tuned self-hosted Loki — answers such a push with a non-204, and that first refusal disables diagnostics for the rest of the run, exactly as any other push failure does. Check `limits_config.max_line_size` on your instance before turning this on.
+One event is one Loki line, and Loki refuses a line longer than `limits_config.max_line_size` — 256 KB by default. With every bounded field at its budget, a body of control characters and parameters of emoji — the widest each gets once JSON has escaped it — a line measures about 215 KB, so the default leaves room. An installation that lowered that limit — Grafana Cloud, a tuned self-hosted Loki — answers such a push with a non-204, and that first refusal disables diagnostics for the rest of that task instance, exactly as any other push failure does. Check `limits_config.max_line_size` on your instance before turning this on.
 
 ### Content policy
 
@@ -438,7 +450,7 @@ The raw response body leaves the process whenever the answer was not intelligibl
 
 - **A body without recognised rows is not a body without sensitive content.** A response can carry socio-demographic breakdowns, internal identifiers or secrets inside an error object while holding no list of rows at all — and that body ships whole.
 - **Known edge:** an anomalous outcome alongside recognised rows ships a body containing the report itself.
-- **The token guarantee covers every channel.** The OAuth token is masked in `request_headers`, cut out of `response_body`, and cut out of `error_message` and of the text of every exception this module raises — a server or a proxy is free to quote the `Authorization` header back inside a JSON `message`, and a structured description of an error is as much a way out as a raw body. Text the token survives — an answer that spells it out with something standing between its characters, as UTF-16 read as UTF-8 does — is dropped whole rather than shipped: the value outranks the diagnostic. The guarantee covers the task log too, whose lines are built from the same masked fields.
+- **The token guarantee covers every channel.** The OAuth token is masked in `request_headers`, cut out of `response_body`, and cut out of `error_message` and of the text of every exception this module raises — a server or a proxy is free to quote the `Authorization` header back inside a JSON `message`, and a structured description of an error is as much a way out as a raw body. Text the token survives — an answer that spells it out with something standing between its characters, as UTF-16 read as UTF-8 does — is dropped whole rather than shipped: the value outranks the diagnostic. A failure of an unforeseen kind — one neither this module nor the network layer worded — leaves the request path reworded the same way: its type names it and its text passes the same gate. The guarantee covers the task log too, whose lines are built from the same masked fields, and the traceback printed with a failure: an exception this module raises carries no original exception along as its cause or context, because an attached exception prints its own unmasked words underneath.
 - **The structured fields are a structure, not a boundary.** `error_code`/`error_message` and `exception_message` are narrow, queryable summaries; they describe the failure, they do not bound what the event discloses, because the body travels alongside.
 - **There is no setting that keeps diagnostics on and bodies out.** The level table decides what travels; the only way to stop bodies from leaving is to leave `loki_conn_id` unset, which turns the whole feature off.
 - Response headers other than the two `X-RateLimit-*` are not copied.
@@ -462,7 +474,14 @@ How the structured fields are built:
 
 A full production example with S3 and BigQuery upload is in [`examples/`](examples/):
 
-- [`admetrica_to_bq_and_s3_dag.py`](examples/admetrica_to_bq_and_s3_dag.py) — a period expanded into one mapped task per day
+- [`admetrica_to_bq_and_s3_dag.py`](examples/admetrica_to_bq_and_s3_dag.py) — a period expanded into a mapped task group, one map index per day: the collection of a day, both uploads and the BigQuery load live inside the index, so a failed day never holds the others back and re-running a day is a clear of its map index with the tasks below it. The dictionary snapshot is loaded once per run, by a group of its own after the days
+
+It needs more than this provider:
+
+- `apache-airflow-providers-google` and `apache-airflow-providers-amazon`, which this package installs only under its `dev` extra — a deployment running the DAG installs them itself
+- connections `yandex_admetrica_default`, `loki_default`, `google_cloud_default` and `aws_default`
+- a filesystem shared by every worker that runs the DAG's tasks, mounted at `BASE_DIR` on each of them. `collect` writes the day's file there and the two uploads and `cleanup` are separate task instances that read it, and Airflow promises no worker affinity inside a task group: under Celery or Kubernetes with worker-local disks the uploads fail on a missing file and the collected files stay behind on the worker that wrote them. A single-machine `LocalExecutor`, or a shared volume mounted at `BASE_DIR`, is what makes the layout hold
+- a GCS staging bucket, which the DAG's first task creates when it is missing: the BigQuery load reads from GCS, not from the worker's disk, so every file goes to the bucket first. What clears it afterwards is a one-day delete lifecycle rule the DAG adds beside the rules the bucket already carries, scoped by a `matchesPrefix` condition — the bucket may be a shared one, and the rule addresses this DAG's prefix and nothing else
 
 ## License
 
