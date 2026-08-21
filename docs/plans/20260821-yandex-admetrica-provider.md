@@ -613,12 +613,12 @@ API отдаёт только текущее состояние справочн
 **Files:**
 - Create: `.github/workflows/publish.yml`
 
-- [ ] создать workflow, срабатывающий на push тега `v*`
-- [ ] job `test`: матрица Python 3.10/3.11/3.12, `fetch-depth: 0`, установка `pip install -e ".[dev]"`, запуск `pytest tests/ -v`
-- [ ] job `publish`: `needs: test`, `environment: pypi`, `permissions: id-token: write`, `fetch-depth: 0`, сборка `python -m build`, публикация через `pypa/gh-action-pypi-publish@release/v1`
-- [ ] проверить сборку локально: `python -m build` создаёт `.whl` и `.tar.gz`
-- [ ] проверить, что `get_provider_info()` из собранного пакета возвращает корректный dict
-- [ ] запустить тесты — обязаны пройти до перехода к задаче 18
+- [x] создать workflow, срабатывающий на push тега `v*`
+- [x] job `test`: матрица Python 3.10/3.11/3.12, `fetch-depth: 0`, установка `pip install -e ".[dev]"`, запуск `pytest tests/ -v`
+- [x] job `publish`: `needs: test`, `environment: pypi`, `permissions: id-token: write`, `fetch-depth: 0`, сборка `python -m build`, публикация через `pypa/gh-action-pypi-publish@release/v1`
+- [x] проверить сборку локально: `python -m build` создаёт `.whl` и `.tar.gz`
+- [x] проверить, что `get_provider_info()` из собранного пакета возвращает корректный dict
+- [x] запустить тесты — обязаны пройти до перехода к задаче 18
 
 ### Task 18: Проверка критериев приёмки
 
