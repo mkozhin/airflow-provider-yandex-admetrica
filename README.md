@@ -455,6 +455,7 @@ How the structured fields are built:
 
 - [AdMetrica API](https://yandex.ru/dev/admetrica/doc/ru/) — the API this provider speaks
 - [Groupings and metrics](https://yandex.ru/dev/admetrica/doc/ru/attrandmetr/dim_all) — the `am:e:…` names that go into `dimensions` and `metrics`
+- [`docs/metrics-and-dimensions.md`](docs/metrics-and-dimensions.md) — every grouping and metric beside the record key it writes, the filter operators it accepts and the earliest date it answers for
 - [Authorization](https://yandex.ru/dev/admetrica/doc/ru/authorization) — obtaining the OAuth token
 
 ## Examples

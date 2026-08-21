@@ -455,6 +455,7 @@ Basic Auth требует HTTPS: с заданным **Login** и не-HTTPS-а�
 
 - [API AdMetrica](https://yandex.ru/dev/admetrica/doc/ru/) — API, на котором говорит провайдер
 - [Группировки и метрики](https://yandex.ru/dev/admetrica/doc/ru/attrandmetr/dim_all) — имена `am:e:…`, которые идут в `dimensions` и `metrics`
+- [`docs/metrics-and-dimensions.md`](docs/metrics-and-dimensions.md) — все группировки и метрики рядом с ключом, под которым каждая попадает в запись, операторами фильтрации и минимальной датой отчёта
 - [Авторизация](https://yandex.ru/dev/admetrica/doc/ru/authorization) — получение OAuth-токена
 
 ## Примеры
