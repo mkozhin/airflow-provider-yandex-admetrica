@@ -316,20 +316,20 @@ API отдаёт только текущее состояние справочн
 - Create: `tests/test_provider_info.py`
 - Modify: `LICENSE`
 
-- [ ] проверить существующий `LICENSE` (MIT из initial commit), при необходимости обновить год и правообладателя
-- [ ] создать `pyproject.toml`: имя `airflow-provider-yandex-admetrica`, `dynamic = ["version"]`, `description`, `readme = "README.md"`, `requires-python = ">=3.10"`, `license`, `authors`, `keywords`, `classifiers` с `Framework :: Apache Airflow :: Provider`
-- [ ] дописать в `pyproject.toml` зависимости `apache-airflow>=2.9.1,<3.0` и `requests>=2.28`, `[project.urls]` (Homepage, Documentation, Repository, Changelog, Issues)
-- [ ] дописать `[project.optional-dependencies] dev = ["pytest>=7.0", "apache-airflow-providers-amazon", "apache-airflow-providers-google"]` — оба провайдера нужны тесту импорта примера DAG (Task 13) и в рантайме самого провайдера не используются
-- [ ] дописать `[project.entry-points."apache_airflow_provider"] provider_info = "airflow_provider_yandex_admetrica:get_provider_info"`, `[tool.setuptools.packages.find] include`, `[tool.setuptools_scm] version_file`, `[tool.pytest.ini_options] testpaths = ["tests"]`, `pythonpath = ["."]`
-- [ ] создать `README.md` заготовкой с названием и одной строкой описания, чтобы `readme` из `pyproject.toml` разрешался
-- [ ] создать `.gitignore` по образцу avito, обязательно с `airflow_provider_yandex_admetrica/_version.py`
-- [ ] создать `CHANGELOG.md` с разделом `[Unreleased]`
-- [ ] создать `__init__.py` с `get_provider_info()`: `package-name`, `name` = "Yandex AdMetrica", описание, `versions` из `_version.__version__`, `integrations` со ссылкой на `https://yandex.ru/dev/admetrica/doc/ru/`, `operators` и `hooks` с python-модулями
-- [ ] создать пустые `hooks/__init__.py`, `operators/__init__.py`, `tests/__init__.py`
-- [ ] создать `tests/conftest.py` с автофикстурой, патчащей `time.sleep` (по образцу avito)
-- [ ] написать `tests/test_provider_info.py`: ключи присутствуют, типы значений верны, `versions` берётся из `_version.__version__`, `package-name` совпадает с именем дистрибутива, списки `operators`/`hooks` непусты. Тест **не импортирует** объявленные модули: они создаются в задачах 3 и 11, а гейт «тесты обязаны пройти» стоит уже здесь. Импортируемость объявленных модулей проверяется в задаче 18, когда они существуют — тот же объём проверки, что в `airflow-provider-avito/tests/test_provider_info.py`
-- [ ] выполнить `pip install -e ".[dev]"` и убедиться, что `_version.py` сгенерирован
-- [ ] запустить тесты — обязаны пройти до перехода к задаче 2
+- [x] проверить существующий `LICENSE` (MIT из initial commit), при необходимости обновить год и правообладателя
+- [x] создать `pyproject.toml`: имя `airflow-provider-yandex-admetrica`, `dynamic = ["version"]`, `description`, `readme = "README.md"`, `requires-python = ">=3.10"`, `license`, `authors`, `keywords`, `classifiers` с `Framework :: Apache Airflow :: Provider`
+- [x] дописать в `pyproject.toml` зависимости `apache-airflow>=2.9.1,<3.0` и `requests>=2.28`, `[project.urls]` (Homepage, Documentation, Repository, Changelog, Issues)
+- [x] дописать `[project.optional-dependencies] dev = ["pytest>=7.0", "apache-airflow-providers-amazon", "apache-airflow-providers-google"]` — оба провайдера нужны тесту импорта примера DAG (Task 13) и в рантайме самого провайдера не используются
+- [x] дописать `[project.entry-points."apache_airflow_provider"] provider_info = "airflow_provider_yandex_admetrica:get_provider_info"`, `[tool.setuptools.packages.find] include`, `[tool.setuptools_scm] version_file`, `[tool.pytest.ini_options] testpaths = ["tests"]`, `pythonpath = ["."]`
+- [x] создать `README.md` заготовкой с названием и одной строкой описания, чтобы `readme` из `pyproject.toml` разрешался
+- [x] создать `.gitignore` по образцу avito, обязательно с `airflow_provider_yandex_admetrica/_version.py`
+- [x] создать `CHANGELOG.md` с разделом `[Unreleased]`
+- [x] создать `__init__.py` с `get_provider_info()`: `package-name`, `name` = "Yandex AdMetrica", описание, `versions` из `_version.__version__`, `integrations` со ссылкой на `https://yandex.ru/dev/admetrica/doc/ru/`, `operators` и `hooks` с python-модулями
+- [x] создать пустые `hooks/__init__.py`, `operators/__init__.py`, `tests/__init__.py`
+- [x] создать `tests/conftest.py` с автофикстурой, патчащей `time.sleep` (по образцу avito)
+- [x] написать `tests/test_provider_info.py`: ключи присутствуют, типы значений верны, `versions` берётся из `_version.__version__`, `package-name` совпадает с именем дистрибутива, списки `operators`/`hooks` непусты. Тест **не импортирует** объявленные модули: они создаются в задачах 3 и 11, а гейт «тесты обязаны пройти» стоит уже здесь. Импортируемость объявленных модулей проверяется в задаче 18, когда они существуют — тот же объём проверки, что в `airflow-provider-avito/tests/test_provider_info.py`
+- [x] выполнить `pip install -e ".[dev]"` и убедиться, что `_version.py` сгенерирован
+- [x] запустить тесты — обязаны пройти до перехода к задаче 2
 
 ### Task 2: Перенос LokiClient
 

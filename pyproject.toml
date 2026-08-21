@@ -1,0 +1,57 @@
+[build-system]
+requires = ["setuptools>=68", "wheel", "setuptools-scm>=8"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "airflow-provider-yandex-admetrica"
+dynamic = ["version"]
+description = "Apache Airflow provider for the Yandex Metrica for Display Advertising (AdMetrica) report API — collect display campaign statistics"
+readme = "README.md"
+requires-python = ">=3.10"
+license = {text = "MIT"}
+authors = [{name = "Michael Kozhin", email = "michael@kozhin.cc"}]
+keywords = ["airflow", "yandex", "admetrica", "metrica", "provider", "display", "advertising"]
+classifiers = [
+    "Framework :: Apache Airflow",
+    "Framework :: Apache Airflow :: Provider",
+    "Development Status :: 4 - Beta",
+    "Topic :: Software Development :: Libraries :: Python Modules",
+    "Topic :: Internet :: WWW/HTTP",
+    "License :: OSI Approved :: MIT License",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+]
+dependencies = [
+    "apache-airflow>=2.9.1,<3.0",
+    "requests>=2.28",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=7.0",
+    "apache-airflow-providers-amazon",
+    "apache-airflow-providers-google",
+]
+
+[project.urls]
+Homepage = "https://github.com/mkozhin/airflow-provider-yandex-admetrica"
+Documentation = "https://github.com/mkozhin/airflow-provider-yandex-admetrica#readme"
+Repository = "https://github.com/mkozhin/airflow-provider-yandex-admetrica"
+Changelog = "https://github.com/mkozhin/airflow-provider-yandex-admetrica/blob/main/CHANGELOG.md"
+Issues = "https://github.com/mkozhin/airflow-provider-yandex-admetrica/issues"
+
+[project.entry-points."apache_airflow_provider"]
+provider_info = "airflow_provider_yandex_admetrica:get_provider_info"
+
+[tool.setuptools_scm]
+version_file = "airflow_provider_yandex_admetrica/_version.py"
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["airflow_provider_yandex_admetrica*"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["."]
