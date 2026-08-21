@@ -1,10 +1,11 @@
-"""Operator that exports one day of AdMetrica display statistics to a local file."""
+"""Operator that exports AdMetrica display statistics and campaigns to local files."""
 
 from __future__ import annotations
 
 import json
 import os
 import re
+from datetime import datetime, timezone
 from typing import Sequence, TypedDict
 
 from airflow.models import BaseOperator
@@ -18,6 +19,14 @@ from airflow_provider_yandex_admetrica.hooks.yandex_admetrica import (
 
 #: Directory segments under the advertiser that hold the statistics of a day.
 _STATS_PARTS = ("stats",)
+
+#: Directory segments under the advertiser that hold the campaign dictionary.
+#: The kind of dictionary names the last segment, so another dictionary lands
+#: beside this one instead of mixing into it.
+_DICT_CAMPAIGNS_PARTS = ("dict", "campaigns")
+
+#: Format of the day that names a file and stamps a dictionary record.
+_DATE_FORMAT = "%Y-%m-%d"
 
 #: Characters allowed in a path segment built from an identifier; everything
 #: else becomes an underscore, so a run id carrying a timestamp with colons and
@@ -52,6 +61,11 @@ class YandexAdmetricaStatsOperator(BaseOperator):
 
     A day with no rows writes no file and adds nothing to the result, so a
     previously exported copy of that day stays where it is.
+
+    Beside the statistics the task exports the dictionary of campaigns, unless
+    ``collect_dictionaries`` turns it off.  The dictionary is a snapshot of the
+    day the export runs rather than of the day it reports on, because the
+    management API answers with the state the campaigns are in right now.
     """
 
     template_fields = ("date", "admetrica_conn_id", "loki_conn_id", "base_dir")
@@ -144,6 +158,61 @@ class YandexAdmetricaStatsOperator(BaseOperator):
             },
         )
 
+    def _snapshot_date(self, context) -> str:
+        """Return the day this export runs, which dates the campaign snapshot.
+
+        The day is taken from the start of the DAG run, so every map index of
+        one run names the same day: a period spread over map indices that runs
+        across midnight still produces one snapshot in one partition, instead of
+        two halves of a run disagreeing about which day they describe.
+        """
+        started = getattr(context.get("dag_run"), "start_date", None) or datetime.now(
+            timezone.utc
+        )
+        return started.strftime(_DATE_FORMAT)
+
+    def _export_campaigns(
+        self,
+        hook: AdmetricaHook,
+        run_id: str,
+        advertiser_id: int,
+        snapshot_date: str,
+    ) -> ExportRecord | None:
+        """Write the campaign dictionary of *snapshot_date*, or write nothing.
+
+        This is the one place ``snapshot_date`` is put on a record.  The same
+        day names the file and is reported as the date of the result, so the
+        column of a row, the key it is loaded from and the partition decorator
+        it is loaded into always name one day: were they to disagree, the rows
+        would carry a day next to the partition they are written to and the load
+        would be rejected whole.
+
+        The fields of the API keep their own wording, so the dictionary
+        describes the campaign the API knows and nothing renames it on the way.
+        """
+        campaigns = hook.get_campaigns()
+        if not campaigns:
+            self.log.info(
+                "AdMetrica lists no campaigns for advertiser %s; "
+                "no dictionary file written.",
+                advertiser_id,
+            )
+            return None
+
+        records = [
+            {"snapshot_date": snapshot_date, **campaign} for campaign in campaigns
+        ]
+        path = self._build_path(
+            run_id, advertiser_id, _DICT_CAMPAIGNS_PARTS, snapshot_date
+        )
+        self._write(records, path)
+        return ExportRecord(
+            kind="dict",
+            date=snapshot_date,
+            path=path,
+            advertiser_id=advertiser_id,
+        )
+
     def execute(self, context) -> list[ExportRecord]:
         hook = AdmetricaHook(
             admetrica_conn_id=self.admetrica_conn_id,
@@ -183,5 +252,12 @@ class YandexAdmetricaStatsOperator(BaseOperator):
                 advertiser_id,
                 self.date,
             )
+
+        if self.collect_dictionaries:
+            record = self._export_campaigns(
+                hook, run_id, advertiser_id, self._snapshot_date(context)
+            )
+            if record is not None:
+                result.append(record)
 
         return result

@@ -1,9 +1,10 @@
-"""Tests for the operator that writes one day of statistics to a local file."""
+"""Tests for the operator that writes statistics and campaigns to local files."""
 
 from __future__ import annotations
 
 import json
 import os
+from datetime import datetime, timezone
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
@@ -12,9 +13,11 @@ from airflow.exceptions import AirflowException
 from airflow.models import Connection
 
 from airflow_provider_yandex_admetrica.hooks.yandex_admetrica import (
+    _CAMPAIGN_FIELDS,
     _DEFAULT_LIMIT,
     _DEFAULT_REQUEST_DELAY,
     AdmetricaHook,
+    _campaign_record,
 )
 from airflow_provider_yandex_admetrica.operators.stats import (
     YandexAdmetricaStatsOperator,
@@ -29,6 +32,11 @@ DATE = "2026-08-20"
 RUN_ID = "manual__2026-08-21T00:00:00+00:00"
 
 SAFE_RUN_ID = "manual__2026-08-21T00_00_00_00_00"
+
+#: The day the export runs, which is the day after the one it reports on.
+SNAPSHOT_DATE = "2026-08-21"
+
+RUN_START = datetime(2026, 8, 21, 3, 15, tzinfo=timezone.utc)
 
 DIMENSIONS = ["am:e:placement", "am:e:deviceType"]
 
@@ -47,8 +55,12 @@ def _operator(**kwargs) -> YandexAdmetricaStatsOperator:
     return YandexAdmetricaStatsOperator(**defaults)
 
 
-def _context(run_id: str = RUN_ID, ti: SimpleNamespace | None = None) -> dict:
-    context: dict = {"run_id": run_id}
+def _context(
+    run_id: str = RUN_ID,
+    ti: SimpleNamespace | None = None,
+    start_date: datetime | None = RUN_START,
+) -> dict:
+    context: dict = {"run_id": run_id, "dag_run": SimpleNamespace(start_date=start_date)}
     if ti is not None:
         context["ti"] = ti
     return context
@@ -61,6 +73,18 @@ def _connection(advertiser_id: object = ADVERTISER_ID) -> Connection:
         password=TOKEN,
         extra=json.dumps({"advertiser_id": advertiser_id}),
     )
+
+
+def _campaign(campaign_id: int = 123456, name: str = "Летняя кампания") -> dict:
+    return {
+        "campaign_id": campaign_id,
+        "name": name,
+        "status": "active",
+        "date_start": "2026-06-01",
+        "date_end": "2026-08-31",
+        "advertiser_id": ADVERTISER_ID,
+        "advertiser_name": "Рекламодатель",
+    }
 
 
 def _row(placement_id: int = 55, renders: int = 12345) -> dict:
@@ -79,10 +103,18 @@ def _row(placement_id: int = 55, renders: int = 12345) -> dict:
 class _Run:
     """One execute() with the hook's connection and its answers stood in for."""
 
-    def __init__(self, rows: list[dict], advertiser_id: object = ADVERTISER_ID) -> None:
+    def __init__(
+        self,
+        rows: list[dict],
+        advertiser_id: object = ADVERTISER_ID,
+        campaigns: list[dict] | None = None,
+    ) -> None:
         self.rows = rows
         self.connection = _connection(advertiser_id)
         self.get_stats = MagicMock(return_value=rows)
+        self.get_campaigns = MagicMock(
+            return_value=[_campaign()] if campaigns is None else campaigns
+        )
         self.hooks: list[AdmetricaHook] = []
 
     def __enter__(self):
@@ -96,6 +128,7 @@ class _Run:
         self._patches = [
             patch.object(AdmetricaHook, "__init__", record),
             patch.object(AdmetricaHook, "get_stats", self.get_stats),
+            patch.object(AdmetricaHook, "get_campaigns", self.get_campaigns),
         ]
         for p in self._patches:
             p.start()
@@ -184,23 +217,37 @@ class TestWrittenFile:
         (line,) = _read(result[0]["path"])
         assert "Главная страница" in line
 
-    def test_a_day_without_rows_writes_nothing(self, tmp_path):
-        op = _operator(base_dir=str(tmp_path))
+    def test_a_day_without_rows_writes_no_statistics(self, tmp_path):
+        op = _operator(base_dir=str(tmp_path), collect_dictionaries=False)
         with _Run([]):
             result = op.execute(_context())
         assert result == []
         assert list(tmp_path.rglob("*.json")) == []
 
+    def test_a_day_without_rows_still_exports_the_dictionary(self, tmp_path):
+        op = _operator(base_dir=str(tmp_path))
+        with _Run([]):
+            result = op.execute(_context())
+        assert [record["kind"] for record in result] == ["dict"]
+
 
 class TestResult:
     def test_describes_the_file_it_wrote(self, tmp_path):
-        op = _operator(base_dir=str(tmp_path))
+        op = _operator(base_dir=str(tmp_path), collect_dictionaries=False)
         with _Run([_row()]):
             result = op.execute(_context())
         assert len(result) == 1
         assert result[0]["kind"] == "stats"
         assert result[0]["date"] == DATE
         assert os.path.exists(result[0]["path"])
+
+    def test_describes_both_files_of_a_full_run(self, tmp_path):
+        op = _operator(base_dir=str(tmp_path))
+        with _Run([_row()]):
+            result = op.execute(_context())
+        assert [record["kind"] for record in result] == ["stats", "dict"]
+        assert all(record["advertiser_id"] == ADVERTISER_ID for record in result)
+        assert all(os.path.exists(record["path"]) for record in result)
 
     def test_carries_the_advertiser_of_the_connection(self, tmp_path):
         op = _operator(base_dir=str(tmp_path))
@@ -322,3 +369,102 @@ class TestDeclaration:
             task_id="collect", date=DATE, dimensions=DIMENSIONS, metrics=METRICS
         )
         assert op.admetrica_conn_id == AdmetricaHook.default_conn_name
+
+
+class TestCampaignDictionary:
+    def test_writes_the_snapshot_under_the_day_it_ran(self, tmp_path):
+        op = _operator(base_dir=str(tmp_path))
+        with _Run([_row()]):
+            result = op.execute(_context())
+        (record,) = [r for r in result if r["kind"] == "dict"]
+        assert record["path"] == os.path.join(
+            str(tmp_path),
+            SAFE_RUN_ID,
+            str(ADVERTISER_ID),
+            "dict",
+            "campaigns",
+            f"{SNAPSHOT_DATE}.json",
+        )
+
+    def test_dates_the_snapshot_by_the_run_not_by_the_day_reported_on(self, tmp_path):
+        op = _operator(base_dir=str(tmp_path))
+        with _Run([_row()]):
+            result = op.execute(_context())
+        (record,) = [r for r in result if r["kind"] == "dict"]
+        assert record["date"] == SNAPSHOT_DATE
+        assert record["date"] != DATE
+
+    def test_every_map_index_of_one_run_names_one_day(self, tmp_path):
+        earlier = _operator(base_dir=str(tmp_path), date="2026-08-19")
+        later = _operator(base_dir=str(tmp_path), date=DATE)
+        with _Run([_row()]):
+            first = earlier.execute(_context())
+        with _Run([_row()]):
+            second = later.execute(_context())
+        assert [r["path"] for r in first if r["kind"] == "dict"] == [
+            r["path"] for r in second if r["kind"] == "dict"
+        ]
+
+    def test_falls_back_to_the_current_day_without_a_run(self, tmp_path):
+        op = _operator(base_dir=str(tmp_path))
+        with _Run([_row()]):
+            result = op.execute(_context(start_date=None))
+        (record,) = [r for r in result if r["kind"] == "dict"]
+        assert record["date"] == datetime.now(timezone.utc).strftime("%Y-%m-%d")
+
+    def test_column_file_name_and_result_name_one_day(self, tmp_path):
+        op = _operator(base_dir=str(tmp_path))
+        with _Run([_row()], campaigns=[_campaign(1), _campaign(2), _campaign(3)]):
+            result = op.execute(_context())
+        (record,) = [r for r in result if r["kind"] == "dict"]
+        written = [json.loads(line) for line in _read(record["path"])]
+        assert len(written) == 3
+        assert {row["snapshot_date"] for row in written} == {record["date"]}
+        assert os.path.basename(record["path"]) == f"{record['date']}.json"
+
+    def test_keeps_the_fields_of_the_api_as_they_came(self, tmp_path):
+        op = _operator(base_dir=str(tmp_path))
+        with _Run([_row()]):
+            result = op.execute(_context())
+        (record,) = [r for r in result if r["kind"] == "dict"]
+        (line,) = _read(record["path"])
+        written = json.loads(line)
+        assert list(written) == ["snapshot_date", *_CAMPAIGN_FIELDS]
+        assert {k: v for k, v in written.items() if k != "snapshot_date"} == _campaign()
+
+    def test_the_hook_leaves_the_snapshot_day_to_the_operator(self):
+        assert "snapshot_date" not in _CAMPAIGN_FIELDS
+        assert "snapshot_date" not in _campaign_record(
+            {**_campaign(), "snapshot_date": "2000-01-01"}
+        )
+
+    def test_switched_off_it_writes_no_dictionary(self, tmp_path):
+        op = _operator(base_dir=str(tmp_path), collect_dictionaries=False)
+        with _Run([_row()]) as run:
+            result = op.execute(_context())
+        assert [r["kind"] for r in result] == ["stats"]
+        assert not list((tmp_path / SAFE_RUN_ID / str(ADVERTISER_ID)).glob("dict/**/*"))
+        run.get_campaigns.assert_not_called()
+
+    def test_an_advertiser_without_campaigns_writes_nothing(self, tmp_path):
+        op = _operator(base_dir=str(tmp_path))
+        with _Run([_row()], campaigns=[]):
+            result = op.execute(_context())
+        assert [r["kind"] for r in result] == ["stats"]
+        assert not list((tmp_path / SAFE_RUN_ID / str(ADVERTISER_ID)).glob("dict/**/*"))
+
+    def test_a_second_run_of_the_same_day_rewrites_one_file(self, tmp_path):
+        op = _operator(base_dir=str(tmp_path))
+        with _Run([_row()]):
+            first = op.execute(_context())
+        with _Run([_row()]):
+            second = op.execute(_context())
+        assert first == second
+        assert len(list((tmp_path / SAFE_RUN_ID).rglob("dict/campaigns/*.json"))) == 1
+
+    def test_the_advertiser_travels_with_the_dictionary(self, tmp_path):
+        op = _operator(base_dir=str(tmp_path))
+        with _Run([_row()], advertiser_id=42):
+            result = op.execute(_context())
+        (record,) = [r for r in result if r["kind"] == "dict"]
+        assert record["advertiser_id"] == 42
