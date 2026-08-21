@@ -17,6 +17,8 @@ from airflow.exceptions import AirflowException
 from airflow.hooks.base import BaseHook
 
 if TYPE_CHECKING:
+    from collections.abc import Sequence
+
     from airflow.models import Connection
 
     from airflow_provider_yandex_admetrica.hooks.loki import LokiClient
@@ -74,6 +76,33 @@ _CAMPAIGN_FIELDS = (
     "advertiser_id",
     "advertiser_name",
 )
+
+#: Prefix every grouping and metric of the report API carries.  It says which
+#: namespace the name belongs to, which is the same one for every name this
+#: provider sends, so it is dropped from the record key rather than repeated on
+#: every row of every file.
+_NAME_PREFIX = "am:e:"
+
+#: A parameter spelled into a name, as in ``am:e:goal<goal_id>Reaches``, with
+#: the parameter's own name inside the brackets.
+_PLACEHOLDER_RE = re.compile(r"<([^<>]*)>")
+
+#: The two boundaries a camelCase name is cut at.  The first ends a run of
+#: capitals in front of a word that starts with one — ``RUBRevenue`` is a
+#: currency followed by ``Revenue``, not one nine-letter word; the second cuts
+#: between a lowercase letter or a digit and the capital after it, which is
+#: where ``deviceType`` and ``goal12345Reaches`` come apart.  Neither cuts
+#: inside a run of digits, so ``interest2d1`` stays whole.
+_ACRONYM_SPLIT_RE = re.compile(r"([A-Z]+)([A-Z][a-z])")
+_WORD_SPLIT_RE = re.compile(r"([a-z0-9])([A-Z])")
+
+#: What a record key is allowed to hold, and the run of separators it is
+#: collapsed to.  A key is read back by an analyst as ``dimensions.device_type``
+#: and by a warehouse as a JSON path, so anything else a name or a substituted
+#: parameter value carries — a colon, a space, a currency sign — becomes the one
+#: separator the rest of the key already uses.
+_NON_KEY_CHARS_RE = re.compile(r"[^a-z0-9_]+")
+_UNDERSCORE_RUN_RE = re.compile(r"_+")
 
 #: Seconds a single request is given before it counts as one the network did
 #: not carry.  A day of a large advertiser is dozens of requests, so an answer
@@ -1249,6 +1278,178 @@ def _campaign_record(row: dict) -> dict:
     carries the same keys and a table schema written once holds them all.
     """
     return {field: row.get(field) for field in _CAMPAIGN_FIELDS}
+
+
+def _resolve_placeholders(text: str, extra_params: dict | None) -> str:
+    """Return *text* with every ``<parameter>`` replaced by its actual value.
+
+    A parameterised name reaches the API in two spellings — the value written
+    into the name, or a placeholder in the name and the value in a field of its
+    own — and both describe the same column of the same report.  Substituting
+    here makes the record key the same for both, so a report rewritten from one
+    spelling to the other keeps writing the goal or the currency it already did.
+
+    A placeholder no parameter answers stays in the key under its own name.  It
+    reads as wrong wherever it lands, which is the point: dropping it instead
+    would merge every goal of the account into one column, and the merge would
+    only be visible as numbers that are too large.
+    """
+    if "<" not in text:
+        return text
+    params = extra_params if isinstance(extra_params, dict) else {}
+
+    def substitute(match: re.Match) -> str:
+        parameter = match.group(1)
+        if parameter in params:
+            return str(params[parameter])
+        log.warning(
+            "Name %r names the parameter %r, which the request does not carry; "
+            "the record key keeps the parameter's name in place of its value.",
+            text,
+            parameter,
+        )
+        return parameter
+
+    return _PLACEHOLDER_RE.sub(substitute, text)
+
+
+def _normalize_name(name: object, extra_params: dict | None = None) -> str:
+    """Return the record key a grouping or a metric is written under.
+
+    One rule serves both, because both are named the same way by the API:
+    the shared ``am:e:`` prefix comes off, a parameter spelled into the name is
+    replaced by its value, and the camelCase that is left becomes snake_case —
+    ``am:e:deviceType`` is ``device_type``, ``am:e:operatingSystemRoot`` is
+    ``operating_system_root``, ``am:e:videoCompletePercent`` is
+    ``video_complete_percent``, and ``am:e:interest2d1``, which has no capital
+    in it, is ``interest2d1``.
+
+    This key is a public contract: it is what an analyst writes in
+    ``JSON_VALUE(dimensions.device_type)`` and what the documentation lists
+    beside every name.  Changing the rule renames columns of every file written
+    after the change while leaving the ones before it under the old names, and
+    a query that names the old key answers NULL rather than failing.
+
+    The fields *inside* a grouping's value are not touched by this: they are
+    the API's own wording of what the grouping matched, and
+    :func:`_map_row` keeps them as they arrived.
+    """
+    text = str(name)
+    if text.startswith(_NAME_PREFIX):
+        text = text[len(_NAME_PREFIX) :]
+    text = _resolve_placeholders(text, extra_params)
+    text = _WORD_SPLIT_RE.sub(r"\1_\2", _ACRONYM_SPLIT_RE.sub(r"\1_\2", text))
+    return _UNDERSCORE_RUN_RE.sub("_", _NON_KEY_CHARS_RE.sub("_", text.lower())).strip("_")
+
+
+def _row_values(raw_row: object, key: str) -> list:
+    """Return the row's list under *key*, empty when the row carries none.
+
+    A row that is not a dict, or one whose groupings or metrics are not a list,
+    is answered as a row that brought nothing: the caller pairs by position and
+    reports what it was short of, which says more than an exception raised over
+    a single row of a page that arrived otherwise whole.
+    """
+    values = raw_row.get(key) if isinstance(raw_row, dict) else None
+    return values if isinstance(values, list) else []
+
+
+def _named_values(
+    names: Sequence[str],
+    values: list,
+    extra_params: dict | None,
+    kind: str,
+    campaign_id: object,
+) -> dict:
+    """Pair requested *names* with the *values* the answer returned, by position.
+
+    The answer carries values in the order they were asked for and names none of
+    them, so position is the only thing tying a number to the metric it
+    measures.  A name the answer has no value for is present and empty, which
+    keeps every record of a request carrying the same keys; a value no name
+    claims has nowhere to go and is left out.  Either way the mismatch is
+    logged, because both mean the request and the answer disagree about the
+    report.
+    """
+    if len(values) != len(names):
+        log.warning(
+            "AdMetrica returned %d %s value(s) for campaign %s where %d were asked "
+            "for; the record keeps what lines up by position.",
+            len(values),
+            kind,
+            campaign_id,
+            len(names),
+        )
+    record: dict = {}
+    for position, name in enumerate(names):
+        key = _normalize_name(name, extra_params)
+        if key in record:
+            log.warning(
+                "%s %r writes the record key %r, which an earlier %s of the same "
+                "request already writes; the later value is the one in the record.",
+                kind.capitalize(),
+                name,
+                key,
+                kind,
+            )
+        record[key] = values[position] if position < len(values) else None
+    return record
+
+
+def _map_row(
+    raw_row: object,
+    date: str,
+    advertiser_id: int,
+    campaign_id: int,
+    dimensions: Sequence[str],
+    metrics: Sequence[str],
+    extra_params: dict | None = None,
+) -> dict:
+    """Return one record of statistics built from one row of a report.
+
+    Pure: it reads its arguments and returns a dict, so what a record looks like
+    is decided in one place and can be checked without a network or a
+    connection.
+
+    The service fields are flat and typed.  ``date`` is stamped here because the
+    report has no date in it at all: a day is asked for as ``date1=date2`` and
+    the answer says nothing about which day it is, so the day the request was
+    made for is the day the row belongs to.
+
+    The variable half is two nested objects.  Under ``dimensions`` each value is
+    the object the API returned, with exactly the fields it arrived with — a
+    grouping that brings an ``id`` beside its ``name`` keeps it, one that brings
+    only a ``name`` stays that way, and a field neither this provider nor its
+    documentation has seen is carried through untouched.  Under ``metrics`` are
+    the numbers, under the keys their names normalise to.  Nesting is what makes
+    a new field in the answer a change to a JSON value rather than to a table
+    schema, and what lets two rows of the same day carry different fields
+    without either being padded out to match the other.
+
+    Key order is fixed: the service fields, then the groupings in the order they
+    were requested, then the metrics in theirs.  Files written from the same
+    request are byte-comparable that way, which is what makes a re-export
+    reviewable as a diff.
+    """
+    return {
+        "date": date,
+        "advertiser_id": advertiser_id,
+        "campaign_id": campaign_id,
+        "dimensions": _named_values(
+            dimensions,
+            _row_values(raw_row, "dimensions"),
+            extra_params,
+            "dimension",
+            campaign_id,
+        ),
+        "metrics": _named_values(
+            metrics,
+            _row_values(raw_row, "metrics"),
+            extra_params,
+            "metric",
+            campaign_id,
+        ),
+    }
 
 
 class AdmetricaHook(BaseHook):
