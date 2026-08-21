@@ -1061,22 +1061,32 @@ class TestRecordRateLimit:
         event = _event()
         resp = _Answer(headers={"X-RateLimit-Limit": "9" * 100, "X-RateLimit-Remaining": "0"})
 
-        _record_rate_limit(event, resp)
+        _record_rate_limit(event, resp, TOKEN)
 
         assert len(event["rate_limit_limit"]) == _HEADER_LIMIT
         assert event["rate_limit_remaining"] == "0"
 
+    def test_a_header_repeating_the_token_carries_the_marker_instead(self):
+        """A response header is text the server wrote, so it passes the gate too."""
+        event = _event()
+        resp = _Answer(headers={"X-RateLimit-Limit": TOKEN, "X-RateLimit-Remaining": "0"})
+
+        _record_rate_limit(event, resp, TOKEN)
+
+        assert TOKEN not in str(event["rate_limit_limit"])
+        assert event["rate_limit_limit"] == _TOKEN_REDACTED
+
     def test_an_answer_naming_neither_leaves_both_empty(self):
         event = _event()
 
-        _record_rate_limit(event, _Answer(headers={}))
+        _record_rate_limit(event, _Answer(headers={}), TOKEN)
 
         assert (event["rate_limit_limit"], event["rate_limit_remaining"]) == (None, None)
 
     def test_a_response_that_refuses_to_be_read_is_not_an_error(self):
         event = _event()
 
-        _record_rate_limit(event, object())
+        _record_rate_limit(event, object(), TOKEN)
 
         assert (event["rate_limit_limit"], event["rate_limit_remaining"]) == (None, None)
 

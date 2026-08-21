@@ -1093,8 +1093,14 @@ def _stamp_duration(event: dict, started: float) -> None:
     event["duration_ms"] = round((time.monotonic() - started) * 1000)
 
 
-def _record_rate_limit(event: dict, resp: requests.Response) -> None:
-    """Copy the conventional rate-limit headers onto *event*, bounded.
+def _record_rate_limit(event: dict, resp: requests.Response, token: object) -> None:
+    """Copy the conventional rate-limit headers onto *event*, bounded and scrubbed.
+
+    A response header is text the server wrote, so it leaves by the gate every
+    text leaves this module by before it is bounded: the headers named here are
+    conventionally numbers, but what arrives under a name is the answer's to
+    choose, and an answer that put the credential there would otherwise carry it
+    into the event whole.
 
     Runs inside the instrumented request, on the path that decides whether a 429
     is retried, so it never raises and never turns a retryable status into a hard
@@ -1102,8 +1108,14 @@ def _record_rate_limit(event: dict, resp: requests.Response) -> None:
     """
     try:
         headers = resp.headers
-        event["rate_limit_limit"] = _bounded_header(headers.get(_RATE_LIMIT_LIMIT_HEADER))
-        event["rate_limit_remaining"] = _bounded_header(headers.get(_RATE_LIMIT_REMAINING_HEADER))
+        for field, name in (
+            ("rate_limit_limit", _RATE_LIMIT_LIMIT_HEADER),
+            ("rate_limit_remaining", _RATE_LIMIT_REMAINING_HEADER),
+        ):
+            value = headers.get(name)
+            event[field] = _bounded_header(
+                _scrub(value, token) if type(value) is str else value
+            )
     except Exception:
         pass
 
@@ -1575,6 +1587,18 @@ def _row_key(raw_row: object) -> tuple:
     return tuple(key)
 
 
+def _describe_row_key(key: tuple, token: object) -> str:
+    """Return a row's identity in the form the exception naming it may carry.
+
+    The values in a key are the server's own words for what the groupings
+    matched — a placement's name, a campaign's own wording of a segment — so
+    they leave by the gate every text leaves this module by.  A key that gate
+    will not pass is named by its shape alone, which still says which row of the
+    page repeated without quoting anything the answer wrote.
+    """
+    return _safe_text(str(key), token) or f"<{len(key)} grouping value(s)>"
+
+
 def _check_report_limits(dimensions: Sequence[str], metrics: Sequence[str]) -> None:
     """Fail on a request the API documents as too large, before it is sent.
 
@@ -1613,7 +1637,7 @@ def _check_extra_params(extra_params: dict | None) -> None:
         )
 
 
-def _log_report_caveats(page: dict, date: str, campaign_id: object) -> None:
+def _log_report_caveats(page: dict, date: str, campaign_id: object, token: object) -> None:
     """Say in the task log what the answer said about its own numbers.
 
     Sampling and withheld rows are warnings because the numbers written are then
@@ -1621,6 +1645,11 @@ def _log_report_caveats(page: dict, date: str, campaign_id: object) -> None:
     the rows alone.  A lag is information: the day is whole as far as the API
     has it, and how far behind it is says whether the day is worth exporting
     again later.
+
+    The values are the answer's own, so they reach the line through
+    :func:`_meta_value`, the same gate that puts them in the event: the task log
+    is as much a way out of the process as a push to Loki, and a field the API
+    documents as a number is still whatever the answer put there.
     """
     if page.get("sampled"):
         log.warning(
@@ -1628,9 +1657,9 @@ def _log_report_caveats(page: dict, date: str, campaign_id: object) -> None:
             "sample_size=%s of %s); the numbers are an estimate.",
             campaign_id,
             date,
-            page.get("sample_share"),
-            page.get("sample_size"),
-            page.get("sample_space"),
+            _meta_value(page.get("sample_share"), token),
+            _meta_value(page.get("sample_size"), token),
+            _meta_value(page.get("sample_space"), token),
         )
     if page.get("contains_sensitive_data"):
         log.warning(
@@ -1643,7 +1672,7 @@ def _log_report_caveats(page: dict, date: str, campaign_id: object) -> None:
     if data_lag:
         log.info(
             "AdMetrica reports a data lag of %s for campaign %s on %s.",
-            data_lag,
+            _meta_value(data_lag, token),
             campaign_id,
             date,
         )
@@ -1881,7 +1910,7 @@ class AdmetricaHook(BaseHook):
                     elif resp.status_code in _RETRY_STATUSES:
                         event["outcome"] = "retryable_error"
                         if resp.status_code == 429:
-                            _record_rate_limit(event, resp)
+                            _record_rate_limit(event, resp, token)
                         _stamp_response_error(event, resp, token)
                         if last_attempt:
                             raise AirflowException(
@@ -2271,7 +2300,7 @@ class AdmetricaHook(BaseHook):
             # request path hands back at all; every other shape has already
             # failed the attempt there.
             rows = page["data"]
-            _log_report_caveats(page, date, campaign_id)
+            _log_report_caveats(page, date, campaign_id, self._maskable_token())
             if total is None:
                 total = _declared_total(page.get("total_rows"))
             rounded = rounded or bool(page.get("total_rows_rounded"))
@@ -2283,7 +2312,8 @@ class AdmetricaHook(BaseHook):
                         raise AirflowException(
                             f"AdMetrica returned a row for campaign {campaign_id} on "
                             f"{date} that an earlier page of the same campaign already "
-                            f"carried ({key}). Pages that repeat a row are pages that "
+                            f"carried ({_describe_row_key(key, self._maskable_token())}). "
+                            f"Pages that repeat a row are pages that "
                             f"skip another one, so the day stops here rather than "
                             f"being written with a hole in it."
                         )
