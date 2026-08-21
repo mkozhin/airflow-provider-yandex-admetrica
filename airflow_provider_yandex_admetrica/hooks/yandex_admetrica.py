@@ -5,9 +5,11 @@ from __future__ import annotations
 import json
 import logging
 import re
+import sys
 import time
 from dataclasses import dataclass
 from datetime import datetime, timezone
+from email.utils import parsedate_to_datetime
 from typing import TYPE_CHECKING
 
 import requests
@@ -52,6 +54,33 @@ _DEFAULT_REQUEST_DELAY = 0.2
 #: of a large advertiser inside a few pages while leaving a single answer small
 #: enough to hold in memory and to retry cheaply.
 _DEFAULT_LIMIT = 10000
+
+#: Seconds a single request is given before it counts as one the network did
+#: not carry.  A day of a large advertiser is dozens of requests, so an answer
+#: that never comes must cost a bounded amount rather than hold the task until
+#: Airflow's own timeout ends it.
+_REQUEST_TIMEOUT = 30
+
+#: Statuses a repeat can fix: the rate limit, and every server-side failure.
+#: The whole 5xx range is in rather than the familiar four — a proxy in front of
+#: the API answers with codes of its own choosing, and every one of them says
+#: the request never reached the logic that would refuse it on its merits.
+_RETRY_STATUSES = frozenset({429, *range(500, 600)})
+
+#: The pause before each repeat, in seconds.  The length of the ladder is also
+#: the number of repeats, so a request gets one attempt plus one rung per pause.
+#: AdMetrica publishes no quota, so the ladder is short and conservative: a
+#: refusal the server means to last is answered within seconds rather than
+#: minutes, and what a task spends on retries stays small.
+_BACKOFF_DELAYS = [1, 2, 4]
+
+#: The header a server names its own wait in, and the longest such wait this
+#: provider honours.  The header outranks the ladder — a server that says when
+#: to come back knows its window better than a rung chosen in advance — but only
+#: up to the cap: a wait of hours would hold a task slot for the whole of it,
+#: and failing the day costs less than that.
+_RETRY_AFTER_HEADER = "Retry-After"
+_RETRY_AFTER_MAX = 300
 
 #: Outcome a diagnostic event carries until the attempt determines its own.
 #: It never reaches Loki: the request path replaces it before the push.
@@ -301,6 +330,27 @@ def _safe_text(value: object, token: object, *, limit: int = _TEXT_LIMIT) -> str
     if not clean:
         return None
     return _truncate(clean, limit)
+
+
+def _exception_text(exc: BaseException, token: object) -> str:
+    """Return the text of *exc* in the form an exception of this module may carry.
+
+    The text of a failure the environment raised is not this module's writing: a
+    network failure names the proxy it dialled, credentials and all, and a
+    server's own words arrive inside whatever wrapped them.  It therefore leaves
+    the process through the one gate every text leaves by, flattened onto a line
+    and bounded like any other free text.
+
+    Text that says nothing, and text the token survived, both come back as the
+    type name alone: the exception that ends the attempt still names what
+    happened, and no channel has to choose between saying too much and saying
+    nothing.  Never raises — it runs with the real failure already in flight.
+    """
+    try:
+        text = _safe_text(str(exc), token)
+    except Exception:
+        text = None
+    return text or f"<{type(exc).__name__}>"
 
 
 def _bounded_header(value: object) -> str | None:
@@ -764,6 +814,23 @@ def _describe_error(code: int | None, message: str | None) -> str:
     return head or message or "no code and no message"
 
 
+def _with_error(message: str, event: dict) -> str:
+    """Append the refusal *event* parsed to *message*, when it parsed one.
+
+    Every exception this module raises for an answer it read is worded this way,
+    so a reader comparing two failures sees the same two halves in both: what the
+    provider was doing and what the status was, then the server's own words for
+    it.  An answer that named neither a code nor a message is left as it is
+    rather than followed by an empty phrase.
+
+    Reads the event's own keys, so it runs on an event this module assembled.
+    """
+    code, error_message = event["error_code"], event["error_message"]
+    if code is not None or error_message:
+        return f"{message}: {_describe_error(code, error_message)}"
+    return message
+
+
 def _describe_unreadable_body(event: dict) -> str:
     """Say what a body held instead of rows, in the terms the event describes it in.
 
@@ -780,6 +847,72 @@ def _describe_unreadable_body(event: dict) -> str:
     if event["rows_count"] is not None:
         detail = f"{detail}, rows_count={event['rows_count']}"
     return f"no readable rows ({detail})"
+
+
+def _describe_target(event: dict) -> str:
+    """Name the request an attempt was made for, in the terms the event holds.
+
+    The endpoint always, and each of the three locators the statistics endpoint
+    fills in — the campaign, the day, the page — whenever the event carries it.
+    A request for the campaign list names only what it has, so a line never
+    claims a day or a campaign that no request was scoped to.
+
+    Reads the event's own keys, so it runs on an event this module assembled.
+    """
+    located = " ".join(
+        f"{name}={event[name]}"
+        for name in ("campaign_id", "date", "offset")
+        if event[name] is not None
+    )
+    head = f"AdMetrica {event['endpoint']}"
+    return f"{head} {located}" if located else head
+
+
+def _attempt_reason(event: dict) -> str:
+    """Read a finished attempt as the phrase naming why it failed.
+
+    Assembled from parsed fields only — the HTTP status, the refusal the body
+    carried, the label naming what stood in place of rows, the position a JSON
+    document broke at, the type of a network failure.  The raw answer belongs to
+    the other channel: it travels in the event's ``response_body``, bounded and
+    with the token cut out, and never reaches the task log.
+
+    Reads the event's own keys, so it runs on an event this module assembled.
+    """
+    status = event["http_status"]
+    parts = [f"HTTP {status}" if status is not None else "no response"]
+    outcome = event["outcome"]
+    code, message = event["error_code"], event["error_message"]
+    if code is not None or message:
+        parts.append(_describe_error(code, message))
+    if outcome in ("empty_shape", "unexpected_error") and event["payload_kind"] is not None:
+        parts.append(_describe_unreadable_body(event))
+    elif outcome == "invalid_json":
+        position = event["exception_message"]
+        parts.append(f"invalid JSON ({position})" if position else "invalid JSON")
+    elif outcome in ("network_error", "unexpected_error") and event["exception_type"] is not None:
+        parts.append(event["exception_type"])
+    return ", ".join(parts)
+
+
+def _log_attempt(event: dict, retry_delay: float | None) -> None:
+    """Write the one task-log line an unsuccessful attempt leaves behind.
+
+    Every outcome but ``success`` gets a line, the last attempt included: the
+    attempt after which the task fails is the one whose reason is wanted most,
+    and a chronicle that stopped one line short of it would answer the question
+    "what was tried, and why did it end" everywhere except there.  The final line
+    differs by what it lacks — ``Retrying in N s`` appears only where a pause
+    really follows, so a reader and a test tell the two apart by the same word.
+    """
+    line = (
+        f"{_describe_target(event)}: "
+        f"attempt {event['attempt']}/{event['max_attempts']} failed — "
+        f"{_attempt_reason(event)}"
+    )
+    if retry_delay is not None:
+        line = f"{line}. Retrying in {retry_delay} s"
+    log.warning("%s", line)
 
 
 def _stamp_response_error(event: dict, resp: object, token: object) -> None:
@@ -828,6 +961,78 @@ def _record_rate_limit(event: dict, resp: requests.Response) -> None:
         event["rate_limit_remaining"] = _bounded_header(headers.get(_RATE_LIMIT_REMAINING_HEADER))
     except Exception:
         pass
+
+
+def _seconds_until(http_date: str) -> float | None:
+    """Seconds from now to the moment an HTTP-date names, or ``None``.
+
+    ``Retry-After`` is written either as a count of seconds or as the date at
+    which the wait ends, and both spellings are in use; a date left unread would
+    silently become the ladder's rung.  A date already past yields a negative
+    value, which the caller reads as no wait at all.
+
+    Never raises: it runs on a header a server wrote, and a value nobody can
+    parse is a wait nobody asked for.
+    """
+    try:
+        moment = parsedate_to_datetime(http_date)
+    except Exception:
+        return None
+    if moment is None:
+        return None
+    try:
+        if moment.tzinfo is None:
+            # An HTTP-date without a zone is GMT by the specification, and
+            # reading it as local time would move the wait by whole hours.
+            moment = moment.replace(tzinfo=timezone.utc)
+        return (moment - datetime.now(timezone.utc)).total_seconds()
+    except Exception:
+        return None
+
+
+def _retry_after(resp: object) -> float | None:
+    """The wait the server asked for, bounded, or ``None`` when it asked for none.
+
+    Both spellings of the header are read, and the result is capped at
+    :data:`_RETRY_AFTER_MAX`: the value comes from outside and a task slot held
+    for hours costs more than the day it would have saved.  A wait of zero or
+    less, a value in neither spelling, and a header of another type all mean the
+    server named no wait, and the ladder decides instead.
+
+    Runs on the path that decides how long a 429 waits, so it never raises and
+    never turns a retryable status into a hard failure.
+    """
+    try:
+        headers = getattr(resp, "headers", None)
+        value = headers.get(_RETRY_AFTER_HEADER) if hasattr(headers, "get") else None
+    except Exception:
+        return None
+    if type(value) is not str:
+        return None
+    value = value.strip()
+    if not value:
+        return None
+    try:
+        seconds = float(value)
+    except ValueError:
+        seconds = _seconds_until(value)
+    # Written as a comparison rather than as its negation so that a value of
+    # `nan`, which answers every comparison with `False`, is no wait at all.
+    if seconds is None or not seconds > 0:
+        return None
+    return min(seconds, _RETRY_AFTER_MAX)
+
+
+def _retry_delay(resp: object, fallback: float) -> float:
+    """How long to wait before the next attempt: the server's answer, or the rung.
+
+    The server's own ``Retry-After`` wins whenever it named one, in both
+    directions: a wait longer than the rung is a window that has not passed yet,
+    and a shorter one is an invitation to come back sooner than the ladder would
+    have.
+    """
+    asked = _retry_after(resp)
+    return fallback if asked is None else asked
 
 
 def _record_exception(event: dict, exc: BaseException) -> None:
@@ -1034,6 +1239,9 @@ class AdmetricaHook(BaseHook):
         #: The advertiser's campaigns, fetched on first use and kept: the
         #: statistics and the dictionary of one run are served by one answer.
         self._campaigns: list[dict] | None = None
+        #: Whether a request has already gone out, which is what the pace is
+        #: measured from: the first one of a task waits for nothing.
+        self._request_made = False
 
     def _get_connection(self) -> Connection:
         """Return the connection, reading it from Airflow exactly once.
@@ -1073,6 +1281,226 @@ class AdmetricaHook(BaseHook):
                 f"{_TOKEN_SCHEME!r} scheme in front of it."
             )
         return token
+
+    def _pace(self) -> None:
+        """Hold the export to ``request_delay`` seconds between requests.
+
+        AdMetrica publishes neither a quota nor a rate, so the pace is what
+        keeps a day of a large advertiser — dozens of requests in a row — from
+        looking like a burst to whatever limiter stands in front of the API.
+
+        The pause separates the requests the export makes, not the attempts a
+        single one costs: a repeat already waits out its rung of the ladder, and
+        a second pause on top of it would only lengthen a failure.
+        """
+        if self._request_made and self.request_delay > 0:
+            time.sleep(self.request_delay)
+        self._request_made = True
+
+    def _request_page(self, endpoint: str, params: dict, event_fields: dict) -> dict:
+        """GET one page from *endpoint*, retrying what a repeat can fix.
+
+        The one place a request is made, and it knows nothing of the loops above
+        it: a campaign, a day and a page reach it as parameters to send and as
+        *event_fields* for the diagnostics to name the request by.  The endpoint
+        arrives as the label an event carries rather than as an address, so that
+        the request and the event describing it can never name two different
+        endpoints — :data:`_ENDPOINT_URLS` holds both halves.
+
+        A 429 or a 5xx and a request the network did not carry are repeated
+        along :data:`_BACKOFF_DELAYS`, and the wait is the server's own
+        ``Retry-After`` wherever it named one.  A 401 fails at once: the token is
+        long-lived and nothing here refreshes it, so the attempt after it would
+        be refused the same way.  A 400 or any other 4xx fails at once too, with
+        the server's words for it read out of the body — the request itself is
+        what is being refused, and a repeat brings back the same answer.
+
+        An HTTP-200 body is asked one question: is the rows value the list of
+        objects it promises.  Only a body that answers yes — the empty list of a
+        campaign with no impressions on a day included — comes back to the
+        caller; every other one fails the attempt naming the ``payload_kind``
+        that describes it, so a zero the provider could not read is never handed
+        on as a zero the API reported.
+
+        Every attempt that did not bring a page back leaves one line in the task
+        log, the last one included, so that a minute of waiting reads as a
+        chronicle rather than as a silence.  The line carries parsed fields only.
+
+        Every attempt emits exactly one diagnostic event when a sink is
+        configured: how the attempt went, the request as it went out with the
+        token masked, and — for anything :func:`_event_level` rates above
+        ``info`` — the raw body, bounded and with the token cut out.  Emission
+        never affects control flow: it lives in ``finally`` and every failure of
+        its own is swallowed there.
+        """
+        url = _ENDPOINT_URLS[endpoint]
+        token = self._get_token()
+        # Spelled out here so that this dict names every header the provider
+        # chooses and the event's copy of it names them all too; the connection
+        # headers `requests` adds are outside it.
+        headers = {
+            "Authorization": f"{_TOKEN_SCHEME} {token}",
+            "Accept": "application/json",
+        }
+        max_attempts = len(_BACKOFF_DELAYS) + 1
+        self._pace()
+
+        for attempt in range(max_attempts):
+            event = _new_event(
+                endpoint=endpoint,
+                params=params,
+                headers=headers,
+                token=token,
+                attempt=attempt + 1,
+                max_attempts=max_attempts,
+                **event_fields,
+            )
+            # Set where a pause follows, and read at the foot of the loop as the
+            # one answer to "does anything follow this attempt".
+            retry_delay: float | None = None
+            last_attempt = attempt == max_attempts - 1
+            # Per attempt, so that a network failure reports the absence of a
+            # response instead of the body the previous attempt received.
+            resp: requests.Response | None = None
+            try:
+                started = time.monotonic()
+                try:
+                    resp = requests.get(
+                        url, params=params, headers=headers, timeout=_REQUEST_TIMEOUT
+                    )
+                except requests.RequestException as e:
+                    _stamp_duration(event, started)
+                    event["outcome"] = "network_error"
+                    _record_exception(event, e)
+                    if last_attempt:
+                        raise AirflowException(
+                            f"Request to {url} failed after {max_attempts} attempts: "
+                            f"{_exception_text(e, token)}"
+                        ) from e
+                    retry_delay = _BACKOFF_DELAYS[attempt]
+                else:
+                    _stamp_duration(event, started)
+                    event["http_status"] = resp.status_code
+
+                    # One chain, not a run of separate `if`s: the retryable
+                    # branch has a path that neither returns nor raises — it
+                    # names a pause and leaves for `time.sleep` at the foot of
+                    # the loop.
+                    if resp.status_code == 200:
+                        try:
+                            data = resp.json()
+                        except ValueError as e:  # JSONDecodeError subclasses ValueError
+                            event["outcome"] = "invalid_json"
+                            event["exception_message"] = _decoder_position(e)
+                            _record_exception(event, e)
+                            position = event["exception_message"]
+                            detail = f" ({position})" if position else ""
+                            raise AirflowException(
+                                f"AdMetrica {endpoint} returned an HTTP 200 body "
+                                f"that is not JSON{detail}"
+                            ) from e
+
+                        if _classify_payload(event, data):
+                            return data
+
+                        # No list of rows was recognised, so there is no page to
+                        # hand on.  Ending the attempt here is what keeps a zero
+                        # from an unreadable answer apart from the zero of a
+                        # campaign that had no impressions.
+                        error = _find_error(data)
+                        if error is not None:
+                            event["error_code"], event["error_message"] = _summarize_error(
+                                error, token
+                            )
+                        raise AirflowException(
+                            _with_error(
+                                f"AdMetrica {endpoint} returned HTTP 200 with "
+                                f"{_describe_unreadable_body(event)}",
+                                event,
+                            )
+                        )
+
+                    elif resp.status_code == 401:
+                        event["outcome"] = "auth_error"
+                        _stamp_response_error(event, resp, token)
+                        raise AirflowException(
+                            _with_error(
+                                f"AdMetrica {endpoint} returned 401 Unauthorized: the OAuth "
+                                f"token in connection {self.admetrica_conn_id!r} was refused, "
+                                f"and nothing here refreshes it",
+                                event,
+                            )
+                        )
+
+                    elif resp.status_code in _RETRY_STATUSES:
+                        event["outcome"] = "retryable_error"
+                        if resp.status_code == 429:
+                            _record_rate_limit(event, resp)
+                        _stamp_response_error(event, resp, token)
+                        if last_attempt:
+                            raise AirflowException(
+                                _with_error(
+                                    f"AdMetrica {endpoint} returned {resp.status_code} for "
+                                    f"{url} on attempt {max_attempts} of {max_attempts}",
+                                    event,
+                                )
+                            )
+                        retry_delay = _retry_delay(resp, _BACKOFF_DELAYS[attempt])
+
+                    else:
+                        event["outcome"] = "http_error"
+                        _stamp_response_error(event, resp, token)
+                        raise AirflowException(
+                            _with_error(
+                                f"AdMetrica {endpoint} returned {resp.status_code} for {url}",
+                                event,
+                            )
+                        )
+            except BaseException as e:
+                # Safety net: record what escaped, then let the original
+                # exception through untouched — type, message and traceback are
+                # the caller's contract.  `BaseException` so that an interrupted
+                # attempt is classified too: the push in `finally` runs for those
+                # as well, and `outcome` must never reach Loki as the
+                # placeholder "unknown".
+                _record_exception(event, e)
+                if event["outcome"] == _OUTCOME_UNKNOWN:
+                    event["outcome"] = "unexpected_error"
+                raise
+            finally:
+                # An interruption on its way out means the task is being
+                # stopped, with the alarm or signal behind it firing once:
+                # pushing here would hold the stop for the length of a push, so
+                # the attempt a stop cut short goes unreported, deliberately —
+                # the reason for it is in the Airflow task log.
+                in_flight = sys.exc_info()[1]
+                if in_flight is None or isinstance(in_flight, Exception):
+                    try:
+                        if event["outcome"] != "success":
+                            # The task log gets the chronicle of the page: one
+                            # line per attempt that did not bring one back,
+                            # whether a pause follows it or the exception in
+                            # flight ends the export.
+                            _log_attempt(event, retry_delay)
+                        if self._loki is not None:
+                            _emit_event(self._loki, event, resp, token)
+                    except Exception as diag_error:
+                        # Defense in depth: a raise here would replace the
+                        # exception in flight, so everything reporting does —
+                        # reading the body and wording the line included — is
+                        # covered.  The type, not the text: an unexpected
+                        # failure can carry the environment's proxy URL,
+                        # credentials included.
+                        log.debug(
+                            "Diagnostics raised %s; the event is dropped",
+                            type(diag_error).__name__,
+                        )
+
+            # Reached only where an attempt named a pause: a non-final retryable
+            # status, or a request the network did not carry with attempts left.
+            # The event is already pushed, so a Loki outage never delays its
+            # visibility.
+            time.sleep(retry_delay)
 
     @property
     def advertiser_id(self) -> int:
