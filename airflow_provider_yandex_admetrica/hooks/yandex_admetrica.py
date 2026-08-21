@@ -55,6 +55,26 @@ _DEFAULT_REQUEST_DELAY = 0.2
 #: enough to hold in memory and to retry cheaply.
 _DEFAULT_LIMIT = 10000
 
+#: Rows one page of the campaign list asks for.  The endpoint names neither a
+#: default nor a ceiling, so both ``limit`` and ``offset`` go out spelled; a
+#: thousand holds the list of an advertiser in one answer and still asks for a
+#: page small enough to repeat cheaply.
+_CAMPAIGNS_LIMIT = 1000
+
+#: The fields a campaign dictionary record keeps, in the order they are written.
+#: What the answer carries beside them — spend, impressions, days left,
+#: conversions — measures the campaign at the moment of the request rather than
+#: describing it, and a measure belongs to the statistics tables.
+_CAMPAIGN_FIELDS = (
+    "campaign_id",
+    "name",
+    "status",
+    "date_start",
+    "date_end",
+    "advertiser_id",
+    "advertiser_name",
+)
+
 #: Seconds a single request is given before it counts as one the network did
 #: not carry.  A day of a large advertiser is dozens of requests, so an answer
 #: that never comes must cost a bounded amount rather than hold the task until
@@ -1204,6 +1224,33 @@ def _token_from_password(password: object) -> str | None:
     return token or None
 
 
+def _declared_total(value: object) -> int | None:
+    """Return the row count an answer declares, or ``None`` when none is readable.
+
+    The count is what the pagination is checked against, so only a whole number
+    counts as one: a flag, a string or a missing field say that the answer named
+    no total, and the caller reports an unverified list rather than comparing
+    against a value it invented.
+    """
+    if isinstance(value, bool) or not isinstance(value, int):
+        return None
+    return value
+
+
+def _campaign_record(row: dict) -> dict:
+    """Return one dictionary record: the named fields, in a fixed order.
+
+    Values are handed on as the API worded them — an identifier stays a number,
+    a date stays the string it arrived as — because the dictionary describes the
+    campaign the API knows and any rewording here would be a second source of
+    truth about it.
+
+    A field the answer left out is present and empty, so every record of a file
+    carries the same keys and a table schema written once holds them all.
+    """
+    return {field: row.get(field) for field in _CAMPAIGN_FIELDS}
+
+
 class AdmetricaHook(BaseHook):
     """Hook for the AdMetrica report API, scoped to one advertiser.
 
@@ -1518,3 +1565,77 @@ class AdmetricaHook(BaseHook):
                 f'{{"advertiser_id": 17004}}.'
             )
         return config.advertiser_id
+
+    def get_campaigns(self) -> list[dict]:
+        """Return the advertiser's campaigns, one record per campaign.
+
+        Every status is asked for: no ``status`` goes out with the request,
+        because an archived campaign ran in the past and its statistics are as
+        real as an active one's — a filter here would silently shorten every
+        re-export of an earlier period.
+
+        Pagination walks the list with ``limit`` and ``offset`` spelled out, the
+        offset counting the rows already skipped and therefore starting at zero.
+        It ends on the declared total or on a page shorter than the one asked
+        for, and the count collected is checked against the total afterwards:
+        a page cut short before the total is closed means whole campaigns were
+        lost, and with them every row of statistics they would have contributed,
+        so the day fails instead of arriving short.  An answer that declares no
+        readable total leaves that check nothing to compare against and says so
+        in the log.
+
+        The list is fetched once and kept for the hook's lifetime: the
+        statistics and the dictionary of one run are two readers of one answer.
+
+        ``snapshot_date`` is not here.  The field belongs to the operator, which
+        writes it into every record, names the file with the same date and
+        reports it as the date of the result, so path, column and partition can
+        never disagree.
+        """
+        if self._campaigns is not None:
+            return self._campaigns
+
+        advertiser_id = self.advertiser_id
+        campaigns: list[dict] = []
+        total: int | None = None
+        offset = 0
+        while True:
+            page = self._request_page(
+                "campaigns",
+                {
+                    "advertiser_id": advertiser_id,
+                    "limit": _CAMPAIGNS_LIMIT,
+                    "offset": offset,
+                },
+                {"advertiser_id": advertiser_id, "offset": offset},
+            )
+            # A list of dicts under the endpoint's rows key is the only body the
+            # request path hands back at all; every other shape has already
+            # failed the attempt there.
+            rows = page["campaigns"]
+            campaigns.extend(_campaign_record(row) for row in rows)
+            if total is None:
+                total = _declared_total(page.get("total"))
+            if len(rows) < _CAMPAIGNS_LIMIT:
+                break
+            offset += len(rows)
+            if total is not None and len(campaigns) >= total:
+                break
+
+        if total is None:
+            log.warning(
+                "AdMetrica declared no readable campaign total for advertiser %s; "
+                "%d campaigns were collected and their completeness is unverified.",
+                advertiser_id,
+                len(campaigns),
+            )
+        elif len(campaigns) != total:
+            raise AirflowException(
+                f"AdMetrica returned {len(campaigns)} campaigns for advertiser "
+                f"{advertiser_id} while declaring {total}. A campaign missing from "
+                f"the list takes all of its statistics with it, so the export stops "
+                f"here rather than writing a day that is short."
+            )
+
+        self._campaigns = campaigns
+        return campaigns
