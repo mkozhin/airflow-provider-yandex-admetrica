@@ -495,15 +495,15 @@ API отдаёт только текущее состояние справочн
 - Create: `airflow_provider_yandex_admetrica/operators/stats.py`
 - Create: `tests/test_operator.py`
 
-- [ ] создать `YandexAdmetricaStatsOperator(BaseOperator)` с параметрами `admetrica_conn_id`, `date`, `dimensions`, `metrics`, `filters`, `accuracy="full"`, `include_undefined=True`, `limit`, `request_delay`, `timezone`, `lang`, `extra_params`, `base_dir`, `collect_dictionaries=True`, `loki_conn_id=None`
-- [ ] задать `template_fields` (включая `date`, `admetrica_conn_id`, `loki_conn_id`) и `ui_color`
-- [ ] реализовать `_build_path` — локальные пути с `safe_run_id`, санитизация по правилу `re.sub(r"[^\w-]", "_", ...)`
-- [ ] реализовать `_write` — JSONL, по объекту на строку, `ensure_ascii=False`
-- [ ] реализовать `_build_loki_client` — диагностика включается только при заданном `loki_conn_id`
-- [ ] реализовать `execute`: сбор статистики за день, запись файла, возврат списка `{kind: "stats", date, path, advertiser_id}`; при нуле строк файл не создаётся и в результат ничего не добавляется
-- [ ] включить `advertiser_id` в каждую возвращаемую запись: DAG строит по нему пути S3 и имена таблиц, а взять его больше неоткуда — параметров рекламодателя у DAG нет, `conn.extra` читается только внутри хука, и хардкод константы в DAG дал бы второй источник правды, расходящийся с коннекшеном молча
-- [ ] написать тесты: путь формируется верно, JSONL пишется построчно, порядок ключей в записи детерминирован, строки с разным набором полей группировки пишутся без потерь, день без строк не создаёт файла, `advertiser_id` присутствует в каждой возвращаемой записи и совпадает с тем, что в коннекшене, параметры оператора доходят до хука, диагностика не конструируется при пустом `loki_conn_id`
-- [ ] запустить тесты — обязаны пройти до перехода к задаче 12
+- [x] создать `YandexAdmetricaStatsOperator(BaseOperator)` с параметрами `admetrica_conn_id`, `date`, `dimensions`, `metrics`, `filters`, `accuracy="full"`, `include_undefined=True`, `limit`, `request_delay`, `timezone`, `lang`, `extra_params`, `base_dir`, `collect_dictionaries=True`, `loki_conn_id=None`
+- [x] задать `template_fields` (включая `date`, `admetrica_conn_id`, `loki_conn_id`) и `ui_color`
+- [x] реализовать `_build_path` — локальные пути с `safe_run_id`, санитизация по правилу `re.sub(r"[^\w-]", "_", ...)`
+- [x] реализовать `_write` — JSONL, по объекту на строку, `ensure_ascii=False`
+- [x] реализовать `_build_loki_client` — диагностика включается только при заданном `loki_conn_id`
+- [x] реализовать `execute`: сбор статистики за день, запись файла, возврат списка `{kind: "stats", date, path, advertiser_id}`; при нуле строк файл не создаётся и в результат ничего не добавляется
+- [x] включить `advertiser_id` в каждую возвращаемую запись: DAG строит по нему пути S3 и имена таблиц, а взять его больше неоткуда — параметров рекламодателя у DAG нет, `conn.extra` читается только внутри хука, и хардкод константы в DAG дал бы второй источник правды, расходящийся с коннекшеном молча
+- [x] написать тесты: путь формируется верно, JSONL пишется построчно, порядок ключей в записи детерминирован, строки с разным набором полей группировки пишутся без потерь, день без строк не создаёт файла, `advertiser_id` присутствует в каждой возвращаемой записи и совпадает с тем, что в коннекшене, параметры оператора доходят до хука, диагностика не конструируется при пустом `loki_conn_id`
+- [x] запустить тесты — обязаны пройти до перехода к задаче 12
 
 ### Task 12: Оператор — выгрузка словаря кампаний
 
