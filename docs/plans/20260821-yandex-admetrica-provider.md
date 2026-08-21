@@ -385,13 +385,13 @@ API отдаёт только текущее состояние справочн
 - Modify: `airflow_provider_yandex_admetrica/hooks/yandex_admetrica.py`
 - Create: `tests/test_connection.py`
 
-- [ ] объявить класс `AdmetricaHook(BaseHook)` с атрибутами `conn_name_attr = "admetrica_conn_id"`, `default_conn_name = "yandex_admetrica_default"`, `conn_type = "http"`, `hook_name = "Yandex AdMetrica"`
-- [ ] реализовать `__init__(self, *, admetrica_conn_id=default_conn_name, loki: LokiClient | None = None, request_delay=..., limit=...)` с ленивыми полями для соединения и списка кампаний
-- [ ] реализовать датакласс `AdvertiserConfig` с полем `advertiser_id: int`
-- [ ] реализовать `parse_connection(extra: dict) -> AdvertiserConfig | None` — единая точка знания о формате `extra`; best-effort, не бросает исключений, логирует WARNING на битое значение
-- [ ] реализовать резолюцию учётных данных: токен из `conn.password` без префикса `OAuth `, `advertiser_id` из `extra`; отсутствие любого из них — `AirflowException` с внятным текстом
-- [ ] написать тесты: корректный extra, `advertiser_id` строкой, отсутствующий `advertiser_id`, нечисловое значение, пустой extra, пустой пароль, пароль с ошибочно сохранённым префиксом `OAuth `, значения атрибутов класса
-- [ ] запустить тесты — обязаны пройти до перехода к задаче 6
+- [x] объявить класс `AdmetricaHook(BaseHook)` с атрибутами `conn_name_attr = "admetrica_conn_id"`, `default_conn_name = "yandex_admetrica_default"`, `conn_type = "http"`, `hook_name = "Yandex AdMetrica"`
+- [x] реализовать `__init__(self, *, admetrica_conn_id=default_conn_name, loki: LokiClient | None = None, request_delay=..., limit=...)` с ленивыми полями для соединения и списка кампаний
+- [x] реализовать датакласс `AdvertiserConfig` с полем `advertiser_id: int`
+- [x] реализовать `parse_connection(extra: dict) -> AdvertiserConfig | None` — единая точка знания о формате `extra`; best-effort, не бросает исключений, логирует WARNING на битое значение
+- [x] реализовать резолюцию учётных данных: токен из `conn.password` без префикса `OAuth `, `advertiser_id` из `extra`; отсутствие любого из них — `AirflowException` с внятным текстом
+- [x] написать тесты: корректный extra, `advertiser_id` строкой, отсутствующий `advertiser_id`, нечисловое значение, пустой extra, пустой пароль, пароль с ошибочно сохранённым префиксом `OAuth `, значения атрибутов класса
+- [x] запустить тесты — обязаны пройти до перехода к задаче 6
 
 ### Task 6: HTTP-слой с ретраями
 

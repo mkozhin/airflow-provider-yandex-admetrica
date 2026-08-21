@@ -6,9 +6,18 @@ import json
 import logging
 import re
 import time
+from dataclasses import dataclass
 from datetime import datetime, timezone
+from typing import TYPE_CHECKING
 
 import requests
+from airflow.exceptions import AirflowException
+from airflow.hooks.base import BaseHook
+
+if TYPE_CHECKING:
+    from airflow.models import Connection
+
+    from airflow_provider_yandex_admetrica.hooks.loki import LokiClient
 
 log = logging.getLogger(__name__)
 
@@ -32,6 +41,17 @@ _ENDPOINT_URLS = {
 #: differently, and this is the only place that difference is written down:
 #: a body is read for rows through the endpoint label the event already carries.
 _ROWS_KEYS = {"campaigns": "campaigns", "stat": "data"}
+
+#: Seconds of quiet between two requests.  AdMetrica publishes neither a quota
+#: nor a rate, so the pace is a conservative guess a task may raise or lower
+#: through the operator once a real advertiser has been measured.
+_DEFAULT_REQUEST_DELAY = 0.2
+
+#: Rows one statistics page asks for.  The endpoint allows up to 100 000 and
+#: falls back to 100 when asked for nothing; a tenth of the ceiling keeps a day
+#: of a large advertiser inside a few pages while leaving a single answer small
+#: enough to hold in memory and to retry cheaply.
+_DEFAULT_LIMIT = 10000
 
 #: Outcome a diagnostic event carries until the attempt determines its own.
 #: It never reaches Loki: the request path replaces it before the push.
@@ -881,3 +901,192 @@ def _emit_event(loki: object, event: dict, resp: object, token: object) -> None:
     if event["level"] != "info":
         event["response_body"] = _bounded_body(resp, token)
     loki.push(event)
+
+
+@dataclass
+class AdvertiserConfig:
+    """The advertiser one connection stands for.
+
+    A connection carries a single advertiser, so its whole configuration is this
+    one number: the ``advertiser_id`` every request names and every written
+    record repeats.
+    """
+
+    advertiser_id: int
+
+
+def _as_advertiser_id(value: object) -> int | None:
+    """Return the advertiser id *value* names, or ``None``.
+
+    An id written as text is an ordinary way to write it: ``extra`` is JSON
+    typed by hand in the Airflow UI, where quoting a number is as natural as
+    leaving it bare, so both forms name the same advertiser.
+
+    A flag is not a number here even though Python counts one as an ``int``, a
+    fractional value names no advertiser, and neither does a number at or below
+    zero: ids the API issues start above it.
+    """
+    if type(value) is bool:
+        return None
+    if type(value) is int:
+        return value if value > 0 else None
+    if type(value) is str:
+        try:
+            parsed = int(value.strip())
+        except ValueError:
+            return None
+        return parsed if parsed > 0 else None
+    return None
+
+
+def parse_connection(extra: dict) -> AdvertiserConfig | None:
+    """Read ``connection.extra`` into an :class:`AdvertiserConfig`, or ``None``.
+
+    The single point of knowledge about the shape of ``extra``, which is
+    ``{"advertiser_id": 17004}``.  Everything else the connection holds is the
+    connection's own business: the token lives in ``password``, and no other
+    field is read.
+
+    Best-effort — it never raises.  ``None`` means the connection names no
+    usable advertiser, and the caller is the one that turns that into a failure
+    a task reads; a WARNING says which of the ways it came out that way.
+
+    The warnings name the type of an unusable value rather than the value:
+    ``extra`` is a free-form field, and a credential pasted into the wrong key
+    of it must not travel to the task log because the key was misspelled.
+    """
+    if not isinstance(extra, dict):
+        log.warning(
+            "Connection extra is not an object (got %s); it names no advertiser.",
+            type(extra).__name__,
+        )
+        return None
+    try:
+        raw = extra.get("advertiser_id")
+    except Exception:
+        log.warning("Connection extra could not be read for 'advertiser_id'.")
+        return None
+    if raw is None:
+        log.warning("Connection extra holds no 'advertiser_id'.")
+        return None
+    advertiser_id = _as_advertiser_id(raw)
+    if advertiser_id is None:
+        log.warning(
+            "Connection extra field 'advertiser_id' is not a positive whole number (got %s).",
+            type(raw).__name__,
+        )
+        return None
+    return AdvertiserConfig(advertiser_id=advertiser_id)
+
+
+def _token_from_password(password: object) -> str | None:
+    """Return the OAuth token a connection's password holds, or ``None``.
+
+    The password field holds the token itself.  A value written with the scheme
+    in front of it names the same token, and the scheme is dropped here so that
+    the outgoing header spells it exactly once: a doubled scheme is answered
+    with a 401, which reads as a dead token rather than as a connection filled
+    in one way instead of the other.
+
+    ``None`` means there is no token to be had — an empty field, a field of
+    spaces, or a field holding a scheme and nothing after it.
+    """
+    if type(password) is not str:
+        return None
+    value = password.strip()
+    head, _, rest = value.partition(" ")
+    token = rest.strip() if head.casefold() == _TOKEN_SCHEME.casefold() else value
+    return token or None
+
+
+class AdmetricaHook(BaseHook):
+    """Hook for the AdMetrica report API, scoped to one advertiser.
+
+    One connection is one advertiser: the OAuth token lives in the connection's
+    password and the ``advertiser_id`` in its extra, so the advertiser a task
+    works on is named in one place and read from it by everyone.
+
+    Diagnostics are opt-in.  Without a sink the hook still runs and still logs;
+    with one, every attempt at every endpoint leaves an event behind.
+    """
+
+    conn_name_attr = "admetrica_conn_id"
+    default_conn_name = "yandex_admetrica_default"
+    conn_type = "http"
+    hook_name = "Yandex AdMetrica"
+
+    def __init__(
+        self,
+        *,
+        admetrica_conn_id: str = default_conn_name,
+        loki: LokiClient | None = None,
+        request_delay: float = _DEFAULT_REQUEST_DELAY,
+        limit: int = _DEFAULT_LIMIT,
+    ) -> None:
+        super().__init__()
+        self.admetrica_conn_id = admetrica_conn_id
+        self.request_delay = request_delay
+        self.limit = limit
+        #: Diagnostics sink; ``None`` leaves every event unbuilt.
+        self._loki = loki
+        #: The connection, read on first use and kept for the hook's lifetime.
+        self._connection: Connection | None = None
+        #: The advertiser's campaigns, fetched on first use and kept: the
+        #: statistics and the dictionary of one run are served by one answer.
+        self._campaigns: list[dict] | None = None
+
+    def _get_connection(self) -> Connection:
+        """Return the connection, reading it from Airflow exactly once.
+
+        A day of one advertiser is dozens of requests, and each of them needs
+        the same token and the same advertiser id; reading them once means the
+        secrets backend is asked once, whatever the export costs.
+        """
+        if self._connection is None:
+            self._connection = self.get_connection(self.admetrica_conn_id)
+        return self._connection
+
+    def _get_extra(self) -> dict:
+        """Return the connection's extra as an object, empty when unreadable.
+
+        Text that is not JSON says the same thing as an extra without an
+        advertiser in it, and the caller answers both with the one message that
+        spells out the form the field takes.
+        """
+        try:
+            extra = self._get_connection().extra_dejson
+        except Exception:
+            log.warning(
+                "Connection %r has an extra that is not readable as JSON.",
+                self.admetrica_conn_id,
+            )
+            return {}
+        return extra if isinstance(extra, dict) else {}
+
+    def _get_token(self) -> str:
+        """Return the OAuth token, or fail with what to put where."""
+        token = _token_from_password(self._get_connection().password)
+        if token is None:
+            raise AirflowException(
+                f"Connection {self.admetrica_conn_id!r} holds no OAuth token. "
+                f"Put the token in the connection's password field, without the "
+                f"{_TOKEN_SCHEME!r} scheme in front of it."
+            )
+        return token
+
+    @property
+    def advertiser_id(self) -> int:
+        """The advertiser this hook's connection stands for.
+
+        The way out of the connection for a number the written records carry and
+        the paths in S3 are built from: a caller that needs the advertiser reads
+        it here instead of being configured with it a second time.
+        """
+        config = parse_connection(self._get_extra())
+        if config is None:
+            raise AirflowException(
+                f"Connection {self.admetrica_conn_id!r} names no advertiser. "
+                f"Its extra must hold a positive whole 'advertiser_id', as in "
+                f'{{"advertiser_id": 17004}}.'
+            )
+        return config.advertiser_id
