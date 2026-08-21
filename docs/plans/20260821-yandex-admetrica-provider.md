@@ -352,13 +352,13 @@ API отдаёт только текущее состояние справочн
 - Create: `airflow_provider_yandex_admetrica/hooks/yandex_admetrica.py`
 - Create: `tests/test_diagnostics.py`
 
-- [ ] перенести из avito функции ограничения текста: `_truncate`, `_one_line`, `_bounded_header`, константы `_TEXT_LIMIT`, `_HEADER_LIMIT`, `_BODY_LIMIT`, `_TRUNCATED_SUFFIX`, `_WHITESPACE_RUN_RE`
-- [ ] перенести маскирование токена: `_mask_token`, `_redact`, `_strip_token`, `_drop_cut_token`, константы `_TOKEN_REDACTED`, `_TOKEN_HEAD`, `_TOKEN_TAIL`, `_TOKEN_MIN_LENGTH`
-- [ ] перенести чтение тела ответа: `_bounded_body`, `_declared_charset`, `_decoder_position`, `_CHARSET_RE`, `_ASSUMED_ENCODING`, `_DECODER_MESSAGES`
-- [ ] адаптировать маскирование под AdMetrica: токен приходит в заголовке `Authorization: OAuth <token>` и не должен попадать ни в событие, ни в лог таски ни в каком виде
-- [ ] завести единую точку маскирования, через которую проходит каждый текст, покидающий процесс: заголовки запроса, тело ответа, сообщение об ошибке и текст исключения
-- [ ] написать тесты: обрезка по границе лимита, схлопывание пробелов и управляющих символов, маскирование короткого и длинного токена, вырезание токена из тела, тело в нечитаемой кодировке, тело без `charset`, замаскированный заголовок `Authorization`, токен, отражённый сервером внутри JSON-сообщения об ошибке
-- [ ] запустить тесты — обязаны пройти до перехода к задаче 4
+- [x] перенести из avito функции ограничения текста: `_truncate`, `_one_line`, `_bounded_header`, константы `_TEXT_LIMIT`, `_HEADER_LIMIT`, `_BODY_LIMIT`, `_TRUNCATED_SUFFIX`, `_WHITESPACE_RUN_RE`
+- [x] перенести маскирование токена: `_mask_token`, `_redact`, `_strip_token`, `_drop_cut_token`, константы `_TOKEN_REDACTED`, `_TOKEN_HEAD`, `_TOKEN_TAIL`, `_TOKEN_MIN_LENGTH`
+- [x] перенести чтение тела ответа: `_bounded_body`, `_declared_charset`, `_decoder_position`, `_CHARSET_RE`, `_ASSUMED_ENCODING`, `_DECODER_MESSAGES`
+- [x] адаптировать маскирование под AdMetrica: токен приходит в заголовке `Authorization: OAuth <token>` и не должен попадать ни в событие, ни в лог таски ни в каком виде
+- [x] завести единую точку маскирования, через которую проходит каждый текст, покидающий процесс: заголовки запроса, тело ответа, сообщение об ошибке и текст исключения
+- [x] написать тесты: обрезка по границе лимита, схлопывание пробелов и управляющих символов, маскирование короткого и длинного токена, вырезание токена из тела, тело в нечитаемой кодировке, тело без `charset`, замаскированный заголовок `Authorization`, токен, отражённый сервером внутри JSON-сообщения об ошибке
+- [x] запустить тесты — обязаны пройти до перехода к задаче 4
 
 ### Task 4: Схема диагностического события
 
