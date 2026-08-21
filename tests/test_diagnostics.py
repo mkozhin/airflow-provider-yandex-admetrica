@@ -11,7 +11,12 @@ from airflow_provider_yandex_admetrica.hooks.yandex_admetrica import (
     _AUTH_HEADER,
     _BODY_LIMIT,
     _DECODER_MESSAGE_OTHER,
+    _ENDPOINT_URLS,
     _HEADER_LIMIT,
+    _OUTCOME_UNKNOWN,
+    _PARAMS_LIMIT,
+    _PARAMS_TRUNCATED,
+    _SCHEMA_VERSION,
     _TEXT_LIMIT,
     _TOKEN_HEAD,
     _TOKEN_MIN_LENGTH,
@@ -21,15 +26,29 @@ from airflow_provider_yandex_admetrica.hooks.yandex_admetrica import (
     _TRUNCATED_SUFFIX,
     _bounded_body,
     _bounded_header,
+    _classify_payload,
     _declared_charset,
     _decoder_position,
+    _describe_error,
+    _describe_error_code,
+    _describe_unreadable_body,
     _drop_cut_token,
+    _emit_event,
+    _event_level,
+    _find_error,
     _mask_token,
+    _new_event,
     _one_line,
+    _record_exception,
+    _record_rate_limit,
     _redact,
+    _redact_params,
     _safe_text,
     _scrub,
+    _stamp_duration,
+    _stamp_response_error,
     _strip_token,
+    _summarize_error,
     _truncate,
 )
 
@@ -539,3 +558,635 @@ class TestDecoderPosition:
     def test_another_exception_is_left_to_its_type_alone(self):
         assert _decoder_position(ValueError("could not parse {\"token\": \"x\"}")) is None
         assert _decoder_position(RuntimeError("boom")) is None
+
+
+# ---------------------------------------------------------------------------
+# Helpers for the event schema
+# ---------------------------------------------------------------------------
+
+
+#: Every field a pushed event carries, whatever happened to the request.
+EVENT_KEYS = frozenset(
+    {
+        "schema_version",
+        "outcome",
+        "level",
+        "sent_at",
+        "endpoint",
+        "advertiser_id",
+        "campaign_id",
+        "date",
+        "offset",
+        "attempt",
+        "max_attempts",
+        "request_method",
+        "request_url",
+        "request_params",
+        "request_headers",
+        "http_status",
+        "duration_ms",
+        "rows_count",
+        "rows_shape_ok",
+        "payload_kind",
+        "total_rows",
+        "total_rows_rounded",
+        "sampled",
+        "sample_share",
+        "sample_size",
+        "sample_space",
+        "contains_sensitive_data",
+        "data_lag",
+        "error_code",
+        "error_message",
+        "exception_type",
+        "exception_message",
+        "rate_limit_limit",
+        "rate_limit_remaining",
+        "response_body",
+    }
+)
+
+
+def _event(**overrides) -> dict:
+    """A statistics-request event, with the fields a test cares about stamped on."""
+    event = _new_event(
+        endpoint="stat",
+        params={"ids": 123456, "date1": "2026-08-20"},
+        headers={_AUTH_HEADER: f"{_TOKEN_SCHEME} {TOKEN}"},
+        token=TOKEN,
+        advertiser_id=17004,
+        campaign_id=123456,
+        date="2026-08-20",
+        offset=1,
+        attempt=1,
+        max_attempts=4,
+    )
+    event.update(overrides)
+    return event
+
+
+class _Sink:
+    """A Loki stand-in that records what it was handed."""
+
+    def __init__(self, enabled: bool = True) -> None:
+        self.enabled = enabled
+        self.pushed: list[dict] = []
+
+    def push(self, event: dict) -> None:
+        self.pushed.append(dict(event))
+
+
+class _Answer:
+    """A response stand-in answering with a body of the test's choosing."""
+
+    def __init__(self, payload=None, *, content: bytes = b"", headers=None) -> None:
+        self._payload = payload
+        self.content = content
+        self.headers = headers if headers is not None else {}
+
+    def json(self):
+        if self._payload is None:
+            raise ValueError("no JSON object could be decoded")
+        return self._payload
+
+
+# ---------------------------------------------------------------------------
+# _redact_params
+# ---------------------------------------------------------------------------
+
+
+class TestRedactParams:
+    def test_scalars_travel_as_they_are(self):
+        params = {"ids": 123456, "limit": 10000, "pretty": True, "sort": None}
+        assert _redact_params(params, TOKEN) == params
+
+    def test_a_value_that_is_neither_text_nor_scalar_is_named_by_its_type(self):
+        assert _redact_params({"metrics": ["am:e:renders"]}, TOKEN) == {
+            "metrics": "<non-scalar param: list>"
+        }
+
+    def test_a_non_str_name_is_named_by_its_type(self):
+        assert _redact_params({7: "x"}, TOKEN) == {"<non-str param name: int>": "x"}
+
+    def test_a_parameter_carrying_the_token_travels_masked(self):
+        redacted = _redact_params({"oauth_token": TOKEN}, TOKEN)
+
+        assert TOKEN not in json.dumps(redacted)
+        assert redacted["oauth_token"] == _TOKEN_REDACTED
+
+    def test_a_value_is_flattened_onto_one_line(self):
+        assert _redact_params({"filters": "a\n b"}, TOKEN) == {"filters": "a b"}
+
+    def test_the_parameters_share_one_budget(self):
+        params = {f"p{i}": "x" * 1000 for i in range(20)}
+
+        redacted = _redact_params(params, TOKEN)
+
+        described = {k: v for k, v in redacted.items() if k != _PARAMS_TRUNCATED}
+        spent = sum(len(k) + len(v or "") for k, v in described.items())
+        assert spent <= _PARAMS_LIMIT
+        assert redacted[_PARAMS_TRUNCATED] == 20 - len(described)
+
+    def test_parameters_within_the_budget_are_all_described(self):
+        params = {f"p{i}": "x" * 10 for i in range(20)}
+
+        assert _redact_params(params, TOKEN) == params
+
+    def test_a_non_dict_is_no_parameters_at_all(self):
+        assert _redact_params("ids=1", TOKEN) is None
+        assert _redact_params(None, TOKEN) is None
+
+
+# ---------------------------------------------------------------------------
+# _new_event
+# ---------------------------------------------------------------------------
+
+
+class TestNewEvent:
+    def test_every_field_of_the_schema_is_present(self):
+        assert set(_event()) == EVENT_KEYS
+
+    def test_a_request_for_the_campaign_list_carries_the_same_keys(self):
+        event = _new_event(
+            endpoint="campaigns",
+            params={"advertiser_id": 17004, "limit": 100, "offset": 0},
+            headers={_AUTH_HEADER: f"{_TOKEN_SCHEME} {TOKEN}"},
+            token=TOKEN,
+            advertiser_id=17004,
+            attempt=1,
+            max_attempts=4,
+        )
+
+        assert set(event) == EVENT_KEYS
+        assert (event["campaign_id"], event["date"], event["offset"]) == (None, None, None)
+
+    def test_fields_the_attempt_has_yet_to_determine_start_empty(self):
+        event = _event()
+
+        undetermined = EVENT_KEYS - {
+            "schema_version",
+            "outcome",
+            "sent_at",
+            "endpoint",
+            "advertiser_id",
+            "campaign_id",
+            "date",
+            "offset",
+            "attempt",
+            "max_attempts",
+            "request_method",
+            "request_url",
+            "request_params",
+            "request_headers",
+        }
+        assert {event[key] for key in undetermined} == {None}
+
+    def test_the_outcome_starts_undetermined(self):
+        assert _event()["outcome"] == _OUTCOME_UNKNOWN
+
+    def test_the_schema_version_is_stamped(self):
+        assert _event()["schema_version"] == _SCHEMA_VERSION
+
+    @pytest.mark.parametrize("endpoint", ["stat", "campaigns"])
+    def test_the_url_follows_the_endpoint(self, endpoint):
+        event = _new_event(
+            endpoint=endpoint, params={}, headers={}, token=TOKEN, attempt=1, max_attempts=4
+        )
+
+        assert event["request_url"] == _ENDPOINT_URLS[endpoint]
+        assert event["request_method"] == "GET"
+
+    def test_the_authorization_header_reaches_the_event_masked(self):
+        event = _event()
+
+        assert TOKEN not in json.dumps(event["request_headers"])
+        assert event["request_headers"][_AUTH_HEADER].startswith(f"{_TOKEN_SCHEME} ")
+
+    def test_the_sent_at_stamp_is_an_utc_timestamp(self):
+        from datetime import datetime
+
+        stamp = datetime.fromisoformat(_event()["sent_at"])
+
+        assert stamp.utcoffset().total_seconds() == 0
+
+
+# ---------------------------------------------------------------------------
+# _summarize_rows / _classify_payload
+# ---------------------------------------------------------------------------
+
+
+class TestClassifyPayload:
+    def test_a_well_formed_report_reads(self):
+        event = _event()
+        rows = [{"dimensions": [{"name": "Главная"}], "metrics": [1]}]
+
+        assert _classify_payload(event, {"data": rows}) is True
+        assert event["rows_count"] == 1
+        assert event["rows_shape_ok"] is True
+        assert event["payload_kind"] == "dict"
+        assert event["outcome"] == "success"
+
+    def test_a_day_without_rows_reads(self):
+        event = _event()
+
+        assert _classify_payload(event, {"data": []}) is True
+        assert event["rows_count"] == 0
+        assert event["outcome"] == "success"
+
+    def test_the_campaign_list_reads_under_its_own_key(self):
+        event = _new_event(
+            endpoint="campaigns", params={}, headers={}, token=TOKEN, attempt=1, max_attempts=4
+        )
+
+        assert _classify_payload(event, {"campaigns": [{"campaign_id": 1}], "total": 1}) is True
+        assert event["rows_count"] == 1
+        assert event["outcome"] == "success"
+
+    def test_the_other_endpoints_key_is_not_read(self):
+        event = _event()
+
+        assert _classify_payload(event, {"campaigns": [{"campaign_id": 1}]}) is False
+        assert event["payload_kind"] == "rows_absent"
+
+    def test_an_absent_rows_key_stops_the_attempt(self):
+        event = _event()
+
+        assert _classify_payload(event, {"query": {}}) is False
+        assert event["payload_kind"] == "rows_absent"
+        assert event["rows_count"] is None
+        assert event["outcome"] == "empty_shape"
+
+    def test_a_rows_value_that_is_not_a_list_stops_the_attempt(self):
+        event = _event()
+
+        assert _classify_payload(event, {"data": {"row": 1}}) is False
+        assert event["payload_kind"] == "rows_non_list"
+        assert event["outcome"] == "empty_shape"
+
+    def test_an_empty_rows_value_of_another_type_is_an_empty_answer(self):
+        event = _event()
+
+        assert _classify_payload(event, {"data": None}) is False
+        assert event["payload_kind"] == "dict"
+        assert event["outcome"] == "empty_shape"
+
+    def test_a_list_holding_something_other_than_rows_stops_the_attempt(self):
+        event = _event()
+
+        assert _classify_payload(event, {"data": [{"metrics": [1]}, "row"]}) is False
+        assert event["rows_count"] == 2
+        assert event["rows_shape_ok"] is False
+        assert event["payload_kind"] == "dict"
+        assert event["outcome"] == "empty_shape"
+
+    def test_a_body_that_is_not_a_dict_is_unexpected(self):
+        event = _event()
+
+        assert _classify_payload(event, ["data"]) is False
+        assert event["payload_kind"] == "non_dict"
+        assert event["outcome"] == "unexpected_error"
+
+    def test_a_body_that_refuses_to_be_read_is_unexpected(self):
+        class Hostile(dict):
+            def __contains__(self, item):
+                raise RuntimeError("nope")
+
+        event = _event()
+
+        assert _classify_payload(event, Hostile()) is False
+        assert event["payload_kind"] == "non_dict"
+        assert event["outcome"] == "unexpected_error"
+
+
+# ---------------------------------------------------------------------------
+# _find_error / _summarize_error
+# ---------------------------------------------------------------------------
+
+
+class TestFindError:
+    def test_an_error_under_a_key_of_its_own(self):
+        assert _find_error({"error": {"code": 403, "message": "no"}}) == {
+            "code": 403,
+            "message": "no",
+        }
+
+    def test_the_plural_spelling_describes_its_first_element(self):
+        body = {"errors": [{"message": "first"}, {"message": "second"}]}
+
+        assert _find_error(body) == {"message": "first"}
+
+    def test_a_code_and_a_message_at_the_top_level(self):
+        body = {"code": 403, "message": "Forbidden"}
+
+        assert _find_error(body) is body
+
+    def test_a_message_without_a_code_is_not_a_refusal(self):
+        assert _find_error({"message": "Forbidden"}) is None
+
+    def test_a_zero_code_names_no_refusal(self):
+        assert _find_error({"code": 0, "message": "ok"}) is None
+
+    def test_a_successful_report_carries_no_error(self):
+        assert _find_error({"data": [], "total_rows": 0}) is None
+
+    def test_an_error_that_is_not_a_dict_is_still_an_error(self):
+        assert _find_error({"error": "Forbidden"}) == "Forbidden"
+
+    def test_a_body_that_is_not_a_dict_carries_no_error(self):
+        assert _find_error(["error"]) is None
+
+    def test_a_body_that_refuses_to_be_read_carries_no_error(self):
+        class Hostile(dict):
+            def get(self, key, default=None):
+                raise RuntimeError("nope")
+
+        assert _find_error(Hostile()) is None
+
+
+class TestSummarizeError:
+    def test_the_code_and_the_message_are_taken(self):
+        assert _summarize_error({"code": 403, "message": "Forbidden"}, TOKEN) == (403, "Forbidden")
+
+    def test_a_reflected_token_leaves_the_message_masked(self):
+        error = {"code": 401, "message": f"Invalid credentials: {_TOKEN_SCHEME} {TOKEN}"}
+
+        code, message = _summarize_error(error, TOKEN)
+
+        assert code == 401
+        assert TOKEN not in message
+        assert _TOKEN_REDACTED in message
+
+    def test_a_message_the_token_survives_does_not_travel(self):
+        error = {"code": 401, "message": " ".join(TOKEN)}
+
+        assert _summarize_error(error, TOKEN) == (401, None)
+
+    def test_a_message_is_flattened_and_bounded(self):
+        code, message = _summarize_error({"message": "a\n\nb" + "x" * _TEXT_LIMIT}, TOKEN)
+
+        assert code is None
+        assert len(message) == _TEXT_LIMIT
+        assert message.startswith("a b")
+
+    def test_a_code_spelled_as_text_is_left_unread(self):
+        assert _summarize_error({"code": "403", "message": "no"}, TOKEN) == (None, "no")
+
+    def test_a_flag_is_not_a_code(self):
+        assert _summarize_error({"code": True, "message": "no"}, TOKEN) == (None, "no")
+
+    def test_an_error_that_is_not_a_dict_is_named_by_its_type(self):
+        assert _summarize_error("Forbidden", TOKEN) == (None, "<non-dict error: str>")
+
+    def test_a_message_that_is_not_text_is_named_by_its_type(self):
+        assert _summarize_error({"code": 1, "message": {"ru": "no"}}, TOKEN) == (
+            1,
+            "<non-str message: dict>",
+        )
+
+    def test_an_error_without_a_message(self):
+        assert _summarize_error({"code": 500}, TOKEN) == (500, None)
+
+    def test_a_message_that_says_nothing_is_no_message(self):
+        assert _summarize_error({"code": 500, "message": "  \n "}, TOKEN) == (500, None)
+
+
+class TestDescribeError:
+    def test_a_code_is_printed_bare(self):
+        assert _describe_error_code(403) == "403"
+
+    def test_both_parts(self):
+        assert _describe_error(403, "Forbidden") == "code 403: Forbidden"
+
+    def test_a_code_alone(self):
+        assert _describe_error(403, None) == "code 403"
+
+    def test_a_message_alone(self):
+        assert _describe_error(None, "Forbidden") == "Forbidden"
+
+    def test_neither(self):
+        assert _describe_error(None, None) == "no code and no message"
+
+
+class TestDescribeUnreadableBody:
+    def test_the_kind_is_named(self):
+        event = _event(payload_kind="rows_absent", rows_count=None)
+
+        assert _describe_unreadable_body(event) == "no readable rows (payload_kind=rows_absent)"
+
+    def test_a_counted_list_says_how_many_it_held(self):
+        event = _event(payload_kind="dict", rows_count=2)
+
+        assert (
+            _describe_unreadable_body(event)
+            == "no readable rows (payload_kind=dict, rows_count=2)"
+        )
+
+
+class TestStampResponseError:
+    def test_a_refusal_reaches_the_event(self):
+        event = _event()
+
+        _stamp_response_error(event, _Answer({"error": {"code": 403, "message": "no"}}), TOKEN)
+
+        assert (event["error_code"], event["error_message"]) == (403, "no")
+
+    def test_a_reflected_token_reaches_the_event_masked(self):
+        event = _event()
+        body = {"error": {"code": 401, "message": f"header was {_TOKEN_SCHEME} {TOKEN}"}}
+
+        _stamp_response_error(event, _Answer(body), TOKEN)
+
+        assert TOKEN not in json.dumps(event)
+        assert _TOKEN_REDACTED in event["error_message"]
+
+    def test_an_answer_naming_no_error_leaves_the_pair_alone(self):
+        event = _event()
+
+        _stamp_response_error(event, _Answer({"data": []}), TOKEN)
+
+        assert (event["error_code"], event["error_message"]) == (None, None)
+
+    def test_a_body_that_will_not_parse_leaves_the_pair_alone(self):
+        event = _event()
+
+        _stamp_response_error(event, _Answer(None), TOKEN)
+
+        assert (event["error_code"], event["error_message"]) == (None, None)
+
+
+# ---------------------------------------------------------------------------
+# _stamp_duration / _record_exception / _record_rate_limit
+# ---------------------------------------------------------------------------
+
+
+class TestStampDuration:
+    def test_the_duration_is_recorded_in_milliseconds(self, monkeypatch):
+        import time as time_module
+
+        event = _event()
+        monkeypatch.setattr(time_module, "monotonic", lambda: 12.5)
+
+        _stamp_duration(event, 10.0)
+
+        assert event["duration_ms"] == 2500
+
+
+class TestRecordException:
+    def test_the_type_is_recorded(self):
+        event = _event()
+
+        _record_exception(event, ValueError("boom"))
+
+        assert event["exception_type"] == "ValueError"
+
+    def test_the_text_never_travels(self):
+        event = _event()
+
+        _record_exception(event, RuntimeError(f"proxy https://user:{TOKEN}@proxy"))
+
+        assert TOKEN not in json.dumps(event)
+        assert event["exception_message"] is None
+
+    def test_the_first_type_recorded_is_the_one_kept(self):
+        event = _event()
+
+        _record_exception(event, ValueError("first"))
+        _record_exception(event, RuntimeError("second"))
+
+        assert event["exception_type"] == "ValueError"
+
+
+class TestRecordRateLimit:
+    def test_the_headers_are_copied_bounded(self):
+        event = _event()
+        resp = _Answer(headers={"X-RateLimit-Limit": "9" * 100, "X-RateLimit-Remaining": "0"})
+
+        _record_rate_limit(event, resp)
+
+        assert len(event["rate_limit_limit"]) == _HEADER_LIMIT
+        assert event["rate_limit_remaining"] == "0"
+
+    def test_an_answer_naming_neither_leaves_both_empty(self):
+        event = _event()
+
+        _record_rate_limit(event, _Answer(headers={}))
+
+        assert (event["rate_limit_limit"], event["rate_limit_remaining"]) == (None, None)
+
+    def test_a_response_that_refuses_to_be_read_is_not_an_error(self):
+        event = _event()
+
+        _record_rate_limit(event, object())
+
+        assert (event["rate_limit_limit"], event["rate_limit_remaining"]) == (None, None)
+
+
+# ---------------------------------------------------------------------------
+# _event_level
+# ---------------------------------------------------------------------------
+
+
+class TestEventLevel:
+    @pytest.mark.parametrize(
+        ("event", "expected"),
+        [
+            (_event(outcome="success", rows_count=100), "info"),
+            (_event(outcome="success", rows_count=0), "info"),
+            (_event(outcome="retryable_error", attempt=1, max_attempts=4), "warn"),
+            (_event(outcome="retryable_error", attempt=4, max_attempts=4), "error"),
+            (_event(outcome="auth_error", attempt=1, max_attempts=4), "error"),
+            (_event(outcome="api_error", attempt=1, max_attempts=4), "error"),
+            (_event(outcome="network_error", attempt=1, max_attempts=4), "warn"),
+            (_event(outcome="network_error", attempt=4, max_attempts=4), "error"),
+            (_event(outcome="invalid_json"), "error"),
+            (_event(outcome="empty_shape"), "error"),
+            (_event(outcome="unexpected_error"), "error"),
+        ],
+        ids=[
+            "success_with_rows",
+            "success_without_rows",
+            "retryable_with_an_attempt_left",
+            "retryable_on_the_last_attempt",
+            "auth_error",
+            "api_error",
+            "network_with_an_attempt_left",
+            "network_on_the_last_attempt",
+            "invalid_json",
+            "empty_shape",
+            "unexpected_error",
+        ],
+    )
+    def test_the_level_table(self, event, expected):
+        assert _event_level(event) == expected
+
+
+# ---------------------------------------------------------------------------
+# _emit_event
+# ---------------------------------------------------------------------------
+
+
+class TestEmitEvent:
+    def test_a_readable_answer_keeps_its_body_inside_the_process(self):
+        sink = _Sink()
+        event = _event(outcome="success", rows_count=1)
+
+        _emit_event(sink, event, _Answer(content=b'{"data": []}'), TOKEN)
+
+        assert sink.pushed[0]["level"] == "info"
+        assert sink.pushed[0]["response_body"] is None
+
+    @pytest.mark.parametrize(
+        "event",
+        [_event(outcome="retryable_error"), _event(outcome="empty_shape")],
+        ids=["warn", "error"],
+    )
+    def test_everything_else_travels_with_its_body(self, event):
+        sink = _Sink()
+
+        _emit_event(sink, event, _Answer(content=b"upstream refused"), TOKEN)
+
+        assert sink.pushed[0]["level"] != "info"
+        assert sink.pushed[0]["response_body"] == "upstream refused"
+
+    def test_a_body_echoing_the_token_travels_masked(self):
+        sink = _Sink()
+        body = f'{{"message": "{_TOKEN_SCHEME} {TOKEN}"}}'.encode()
+
+        _emit_event(sink, _event(outcome="empty_shape"), _Answer(content=body), TOKEN)
+
+        assert TOKEN not in json.dumps(sink.pushed[0])
+        assert _TOKEN_REDACTED in sink.pushed[0]["response_body"]
+
+    @pytest.mark.parametrize(
+        "outcome",
+        ["success", "retryable_error", "auth_error", "unexpected_error"],
+        ids=["info", "warn", "error_auth", "error_body"],
+    )
+    def test_the_request_headers_never_carry_the_token(self, outcome):
+        sink = _Sink()
+        event = _event(outcome=outcome)
+
+        _emit_event(sink, event, _Answer(content=TOKEN.encode()), TOKEN)
+
+        assert TOKEN not in json.dumps(sink.pushed[0])
+
+    def test_a_sink_whose_breaker_tripped_is_handed_nothing(self):
+        sink = _Sink(enabled=False)
+        event = _event(outcome="empty_shape")
+
+        _emit_event(sink, event, _Answer(content=b"body"), TOKEN)
+
+        assert sink.pushed == []
+        assert event["level"] is None
+        assert event["response_body"] is None
+
+    def test_a_sink_that_offers_push_alone_counts_as_ready(self):
+        pushed = []
+
+        class Bare:
+            def push(self, event):
+                pushed.append(event)
+
+        _emit_event(Bare(), _event(outcome="success"), _Answer(), TOKEN)
+
+        assert len(pushed) == 1

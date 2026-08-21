@@ -16,6 +16,13 @@ from airflow_provider_yandex_admetrica.hooks.loki import (
     _SERVICE,
     _TargetError,
 )
+from airflow_provider_yandex_admetrica.hooks.yandex_admetrica import (
+    _BODY_LIMIT,
+    _HEADER_LIMIT,
+    _PARAMS_LIMIT,
+    _TEXT_LIMIT,
+    _new_event,
+)
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -473,6 +480,152 @@ class TestFailureHandling:
 
         mock_post.assert_not_called()
         assert len(_warnings(caplog)) == 1
+
+
+# ---------------------------------------------------------------------------
+# The size of the line a push carries
+# ---------------------------------------------------------------------------
+
+
+#: Loki's default `limits_config.max_line_size`, counted in bytes.
+_MAX_LINE_BYTES = 256 * 1024
+
+#: A token of the shape the hook masks, kept clear of the filler the fields are
+#: written in so that redaction never shortens the fixture behind the
+#: measurement's back.
+_TOKEN = "y0__xD" + "s" * 50 + "q9Az"
+
+
+def _pushed_line(mock_post: MagicMock) -> str:
+    """Return the log line the client sent, exactly as it went over the wire."""
+    payload = mock_post.call_args.kwargs["json"]
+    return payload["streams"][0]["values"][0][1]
+
+
+def _full_event(response_body: str, filler: str) -> dict:
+    """The largest event a request can build, answered by *response_body*.
+
+    Every bounded field sits at its budget and every optional one is filled,
+    each free-text one with the character the measurement is being made in, so
+    the result covers the event a bad day produces rather than a typical one.
+    The request parameters are the widest the statistics endpoint accepts: the
+    documented limits are 20 metrics, 10 dimensions and a filter of 10 000
+    characters, and every one of them is written in the same filler.
+
+    The schema and the budgets come from the hook module, and the measurement
+    belongs here: how long a line the client may hand to Loki is a property of
+    the client, so the fixture is built from the widest event the hook can
+    produce.
+    """
+    event = _new_event(
+        endpoint="stat",
+        params={
+            "ids": 123456,
+            "date1": "2026-08-20",
+            "date2": "2026-08-20",
+            "metrics": ",".join(f"am:e:{filler * 20}{i}" for i in range(20)),
+            "dimensions": ",".join(f"am:e:{filler * 20}{i}" for i in range(10)),
+            "sort": ",".join(f"am:e:{filler * 20}{i}" for i in range(10)),
+            "limit": 10000,
+            "offset": 40001,
+            "accuracy": "full",
+            "include_undefined": "true",
+            "filters": filler * 10000,
+            "timezone": "+03:00",
+            "lang": "ru",
+        },
+        headers={"Authorization": f"OAuth {_TOKEN}", "Accept": "application/json"},
+        token=_TOKEN,
+        advertiser_id=17004,
+        campaign_id=123456,
+        date="2026-08-20",
+        offset=40001,
+        attempt=4,
+        max_attempts=4,
+    )
+    event.update(
+        outcome="unexpected_error",
+        level="error",
+        http_status=500,
+        duration_ms=61234,
+        rows_count=10000,
+        rows_shape_ok=False,
+        payload_kind="rows_non_list",
+        total_rows=1234567,
+        total_rows_rounded=True,
+        sampled=True,
+        sample_share=0.1234567890123,
+        sample_size=1234567,
+        sample_space=12345678,
+        contains_sensitive_data=True,
+        data_lag=86400,
+        error_code=403,
+        error_message=filler * _TEXT_LIMIT,
+        exception_type="AirflowException",
+        exception_message=filler * _TEXT_LIMIT,
+        rate_limit_limit=filler * _HEADER_LIMIT,
+        rate_limit_remaining=filler * _HEADER_LIMIT,
+        response_body=response_body,
+    )
+    return event
+
+
+class TestPushedLineFitsTheLokiLimit:
+    """A full event has to fit the line Loki accepts, or the run loses diagnostics.
+
+    The first refusal disables the client for the rest of the task, so one
+    oversized answer would silence every event after it.  Measured on the line
+    the client really sent, in bytes: the limit counts bytes, and the escaping
+    that inflates them happens inside the push.
+    """
+
+    @pytest.mark.parametrize(
+        "filler",
+        ["\x00", "\U0001f600", '"', "\\", "ю", "x"],
+        ids=["control", "emoji", "quote", "backslash", "cyrillic", "ascii"],
+    )
+    def test_a_worst_case_answer_stays_within_the_line_limit(self, filler):
+        body = filler * _BODY_LIMIT
+        client = LokiClient(
+            conn_id="loki_test",
+            context={
+                "dag_id": "osnova_admetrica",
+                "task_id": "collect",
+                "dag_run_id": "scheduled__2026-08-21T00:00:00+00:00",
+                "try_number": 3,
+                "map_index": 12,
+            },
+        )
+
+        with patch("airflow.hooks.base.BaseHook.get_connection", return_value=_conn()):
+            with patch("requests.post", return_value=_mock_response(204)) as mock_post:
+                client.push(_full_event(body, filler))
+
+        line = _pushed_line(mock_post)
+        assert json.loads(line)["response_body"] == body
+        assert len(line.encode("utf-8")) <= _MAX_LINE_BYTES
+
+    def test_the_widest_answer_and_the_widest_parameters_together_fit(self):
+        """A body costs the most in control characters, a parameter in emoji.
+
+        Neither field is written in what costs the other the most, so the two
+        worst cases fall on one line only when they are put there on purpose.
+        """
+        client = LokiClient(conn_id="loki_test")
+
+        with patch("airflow.hooks.base.BaseHook.get_connection", return_value=_conn()):
+            with patch("requests.post", return_value=_mock_response(204)) as mock_post:
+                client.push(_full_event("\x00" * _BODY_LIMIT, "\U0001f600"))
+
+        line = _pushed_line(mock_post)
+        assert len(line.encode("utf-8")) <= _MAX_LINE_BYTES
+
+    def test_the_parameters_of_that_event_really_sit_at_their_budget(self):
+        """The measurement is only worth as much as the fixture's own size."""
+        params = _full_event("", "x")["request_params"]
+
+        spent = sum(len(k) + len(v) for k, v in params.items() if isinstance(v, str))
+        assert spent > _PARAMS_LIMIT // 2
 
 
 # ---------------------------------------------------------------------------
