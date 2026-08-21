@@ -63,6 +63,62 @@ _DEFAULT_LIMIT = 10000
 #: page small enough to repeat cheaply.
 _CAMPAIGNS_LIMIT = 1000
 
+#: The row the statistics endpoint counts its offset from.  The two endpoints
+#: count differently — the campaign list skips rows and therefore starts at
+#: zero, while ``/v1/stat/data`` numbers them and starts at one — so a page
+#: asked for at offset 0 there is the same page as the one at offset 1, and a
+#: walk that counted from zero would return the first row twice.
+_STAT_OFFSET_BASE = 1
+
+#: Documented ceilings of one report request.  Checking them here turns a
+#: refusal that arrives as an opaque 400 after a request has been paid for into
+#: a message naming the list that is too long and by how much.
+_MAX_METRICS = 20
+_MAX_DIMENSIONS = 10
+
+#: Request parameters the hook owns, which ``extra_params`` may therefore not
+#: carry.  Each of them is either the question being asked or an answer to how
+#: it is asked, and a silent override of one would be invisible in the data:
+#: another ``date1`` would fetch another day while the records still carry the
+#: operator's date, and ``accuracy`` or ``include_undefined`` would drop the
+#: defaults that stand against drifting and truncated numbers — with the
+#: completeness check still passing, because ``total_rows`` agrees with the
+#: truncated selection.  The last five have parameters of their own on the
+#: operator, so nothing needs this route to reach them.
+_RESERVED_PARAMS = frozenset(
+    {
+        "ids",
+        "date1",
+        "date2",
+        "metrics",
+        "dimensions",
+        "limit",
+        "offset",
+        "sort",
+        "accuracy",
+        "include_undefined",
+        "filters",
+        "timezone",
+        "lang",
+    }
+)
+
+#: What a report says about the page it just returned, beyond the rows: how many
+#: rows there are in total and whether that number is rounded, whether the
+#: answer was sampled and on what share, whether rows were withheld, and how far
+#: behind the data is.  Every one of them is a caveat about the numbers, so all
+#: of them travel with the event describing the request that brought them.
+_REPORT_META_FIELDS = (
+    "total_rows",
+    "total_rows_rounded",
+    "sampled",
+    "sample_share",
+    "sample_size",
+    "sample_space",
+    "contains_sensitive_data",
+    "data_lag",
+)
+
 #: The fields a campaign dictionary record keeps, in the order they are written.
 #: What the answer carries beside them — spend, impressions, days left,
 #: conversions — measures the campaign at the moment of the request rather than
@@ -992,6 +1048,46 @@ def _stamp_response_error(event: dict, resp: object, token: object) -> None:
         pass
 
 
+def _meta_value(value: object, token: object) -> object:
+    """Return one report caveat in a form an event may carry.
+
+    Numbers and flags travel as they arrived, because a dashboard reads them as
+    numbers.  Text goes out through the gate every text goes out by, and a value
+    of any other kind is described by its type rather than converted: converting
+    it would run code the answer chose and put whatever it returns into the
+    event.
+    """
+    if isinstance(value, (bool, int, float)) or value is None:
+        return value
+    if type(value) is str:
+        return _safe_text(value, token)
+    return f"<{type(value).__name__}>"
+
+
+def _stamp_report_meta(event: dict, data: object, token: object) -> None:
+    """Copy what the answer says about its own page onto *event*.
+
+    A caveat the answer carries — a rounded total, a sampled selection, rows
+    withheld, data still catching up — describes the request that brought it,
+    so it belongs to the event describing that request and is read there
+    alongside the status and the duration.  A field the answer left out stays
+    empty, so an event says "not declared" rather than inventing a value.
+
+    Only the answer decides which of the fields are present, so this serves both
+    endpoints: the campaign list declares none of them and passes through
+    untouched.  Never raises — it runs on the successful path of an attempt that
+    has a page to hand back.
+    """
+    try:
+        if not isinstance(data, dict):
+            return
+        for field in _REPORT_META_FIELDS:
+            if field in data:
+                event[field] = _meta_value(data[field], token)
+    except Exception:
+        return
+
+
 def _stamp_duration(event: dict, started: float) -> None:
     """Record how long the request took, in milliseconds since *started*."""
     event["duration_ms"] = round((time.monotonic() - started) * 1000)
@@ -1452,6 +1548,107 @@ def _map_row(
     }
 
 
+def _row_key(raw_row: object) -> tuple:
+    """Return the identity of one report row: what its groupings matched.
+
+    The report is aggregated by the groupings that were asked for, so inside one
+    answer the combination of their values names the row and no two rows carry
+    the same one.  That makes the key the one thing a page can be checked
+    against: a row seen twice while walking a campaign says the pages overlap,
+    and pages that overlap are pages that also skip.
+
+    The projection is spelled out rather than left to the objects themselves,
+    which are dicts and cannot be put in a set.  Each grouping contributes its
+    ``id`` where the answer carried one and its ``name`` otherwise, tagged with
+    which of the two it is: two placements sharing a name and differing in ``id``
+    are two rows, and reading the name alone would call the second one a
+    duplicate and fail a day that is perfectly whole.
+    """
+    key = []
+    for value in _row_values(raw_row, "dimensions"):
+        if isinstance(value, dict) and "id" in value:
+            key.append(("id", str(value["id"])))
+        elif isinstance(value, dict):
+            key.append(("name", str(value.get("name"))))
+        else:
+            key.append(("raw", str(value)))
+    return tuple(key)
+
+
+def _check_report_limits(dimensions: Sequence[str], metrics: Sequence[str]) -> None:
+    """Fail on a request the API documents as too large, before it is sent.
+
+    The ceilings are the documented ones, and the refusal names which list is
+    over and by how much — an unchecked request comes back as a 400 whose body
+    says considerably less, after the wait for it has been paid.
+    """
+    if len(metrics) > _MAX_METRICS:
+        raise ValueError(
+            f"AdMetrica accepts at most {_MAX_METRICS} metrics per request; "
+            f"{len(metrics)} were given."
+        )
+    if len(dimensions) > _MAX_DIMENSIONS:
+        raise ValueError(
+            f"AdMetrica accepts at most {_MAX_DIMENSIONS} dimensions per request; "
+            f"{len(dimensions)} were given."
+        )
+
+
+def _check_extra_params(extra_params: dict | None) -> None:
+    """Fail on an ``extra_params`` key the hook itself owns.
+
+    :data:`_RESERVED_PARAMS` says why each name is refused; the refusal is here,
+    before the first request, so that a report configured this way never runs at
+    all rather than running and writing plausible numbers about something other
+    than what was asked for.
+    """
+    if not extra_params:
+        return
+    taken = sorted(set(extra_params) & _RESERVED_PARAMS)
+    if taken:
+        raise ValueError(
+            f"extra_params may not carry {', '.join(taken)}: the hook builds "
+            f"{', '.join(sorted(_RESERVED_PARAMS))} itself, and each of them has a "
+            f"parameter of its own where the caller is meant to set it."
+        )
+
+
+def _log_report_caveats(page: dict, date: str, campaign_id: object) -> None:
+    """Say in the task log what the answer said about its own numbers.
+
+    Sampling and withheld rows are warnings because the numbers written are then
+    not the whole truth about the day, and nothing downstream can tell that from
+    the rows alone.  A lag is information: the day is whole as far as the API
+    has it, and how far behind it is says whether the day is worth exporting
+    again later.
+    """
+    if page.get("sampled"):
+        log.warning(
+            "AdMetrica sampled the report for campaign %s on %s (sample_share=%s, "
+            "sample_size=%s of %s); the numbers are an estimate.",
+            campaign_id,
+            date,
+            page.get("sample_share"),
+            page.get("sample_size"),
+            page.get("sample_space"),
+        )
+    if page.get("contains_sensitive_data"):
+        log.warning(
+            "AdMetrica withheld part of the rows for campaign %s on %s as sensitive; "
+            "the day is short by whatever they held.",
+            campaign_id,
+            date,
+        )
+    data_lag = page.get("data_lag")
+    if data_lag:
+        log.info(
+            "AdMetrica reports a data lag of %s for campaign %s on %s.",
+            data_lag,
+            campaign_id,
+            date,
+        )
+
+
 class AdmetricaHook(BaseHook):
     """Hook for the AdMetrica report API, scoped to one advertiser.
 
@@ -1649,6 +1846,7 @@ class AdmetricaHook(BaseHook):
                             ) from e
 
                         if _classify_payload(event, data):
+                            _stamp_report_meta(event, data, token)
                             return data
 
                         # No list of rows was recognised, so there is no page to
@@ -1840,3 +2038,281 @@ class AdmetricaHook(BaseHook):
 
         self._campaigns = campaigns
         return campaigns
+
+    def get_stats(
+        self,
+        date: str,
+        dimensions: Sequence[str],
+        metrics: Sequence[str],
+        *,
+        filters: str | None = None,
+        accuracy: str | None = "full",
+        include_undefined: bool = True,
+        timezone: str | None = None,
+        lang: str | None = None,
+        extra_params: dict | None = None,
+    ) -> list[dict]:
+        """Return one day of statistics for every campaign of the advertiser.
+
+        A day is the unit because the report has no date in it: ``/v1/stat/data``
+        is asked for ``date1=date2=<day>`` and the day is stamped onto every
+        record here.  Asking a day at a time also keeps each selection small,
+        which is what makes sampling unlikely enough for ``accuracy="full"`` to
+        be answered in full.
+
+        A campaign is a request because the API offers no grouping by campaign
+        and sums the campaigns named in ``ids`` together: one request per
+        campaign is the only way the split survives at all.  The list of
+        campaigns comes from :meth:`get_campaigns`, so one run asks the
+        management API once however many days it exports.
+
+        ``sort`` goes out naming every grouping that was asked for.  The report
+        is aggregated by them, so their combination orders the rows completely
+        and repeatably from one page to the next; sorting by a metric would not,
+        since a long tail of placements shares ``renders=1`` and the order
+        within that tail is the API's to choose — and rows would move between
+        pages while the walk was reading them.
+
+        The documented ceilings and the parameters this hook owns are checked
+        before the first request, so a report configured wrongly costs nothing
+        and says what is wrong.
+
+        Raises :class:`ValueError` on a request the API documents as too large
+        or on an ``extra_params`` key the hook owns, and
+        :class:`~airflow.exceptions.AirflowException` on a day that came back
+        incomplete.
+        """
+        dimensions = list(dimensions)
+        metrics = list(metrics)
+        _check_report_limits(dimensions, metrics)
+        _check_extra_params(extra_params)
+
+        advertiser_id = self.advertiser_id
+        base_params = self._report_params(
+            date=date,
+            dimensions=dimensions,
+            metrics=metrics,
+            filters=filters,
+            accuracy=accuracy,
+            include_undefined=include_undefined,
+            timezone=timezone,
+            lang=lang,
+            extra_params=extra_params,
+        )
+
+        records: list[dict] = []
+        for campaign in self.get_campaigns():
+            records.extend(
+                self._collect_campaign(
+                    date=date,
+                    advertiser_id=advertiser_id,
+                    campaign_id=campaign["campaign_id"],
+                    base_params=base_params,
+                    dimensions=dimensions,
+                    metrics=metrics,
+                    extra_params=extra_params,
+                )
+            )
+        return records
+
+    def _report_params(
+        self,
+        *,
+        date: str,
+        dimensions: Sequence[str],
+        metrics: Sequence[str],
+        filters: str | None,
+        accuracy: str | None,
+        include_undefined: bool | None,
+        timezone: str | None,
+        lang: str | None,
+        extra_params: dict | None,
+    ) -> dict:
+        """Build the part of the query that is the same for every campaign.
+
+        Everything the report is defined by lives here and is built once; what
+        varies between requests — the campaign and the page — is added at the
+        call site, so nothing about the report can differ from one campaign to
+        the next.
+
+        A parameter left unset is left out of the query, which is how the API's
+        own default is asked for.  ``include_undefined`` is spelled in the
+        lowercase the API writes flags in rather than in Python's capitalised
+        form.
+
+        Merging is one-directional: ``extra_params`` adds names the query does
+        not already carry and overrides none.  What it may not carry at all was
+        refused before this ran.
+        """
+        params: dict = {
+            "metrics": ",".join(metrics),
+            "date1": date,
+            "date2": date,
+            "limit": self.limit,
+        }
+        if dimensions:
+            params["dimensions"] = ",".join(dimensions)
+            params["sort"] = ",".join(dimensions)
+        if accuracy is not None:
+            params["accuracy"] = accuracy
+        if include_undefined is not None:
+            params["include_undefined"] = "true" if include_undefined else "false"
+        if filters is not None:
+            params["filters"] = filters
+        if timezone is not None:
+            params["timezone"] = timezone
+        if lang is not None:
+            params["lang"] = lang
+        for name, value in (extra_params or {}).items():
+            params.setdefault(name, value)
+        return params
+
+    def _collect_campaign(
+        self,
+        *,
+        date: str,
+        advertiser_id: int,
+        campaign_id: object,
+        base_params: dict,
+        dimensions: Sequence[str],
+        metrics: Sequence[str],
+        extra_params: dict | None,
+    ) -> list[dict]:
+        """Walk one campaign's report for one day and return its records.
+
+        The offset counts rows from one, which is this endpoint's own numbering:
+        a walk starting at zero would ask for the first row twice.
+
+        Where the walk stops depends on ``total_rows_rounded``.  With the flag
+        clear the declared total is a number to stop on, alongside a page
+        shorter than the one asked for.  With it set only the short page stops
+        the walk, because a rounded total is unusable as a stopping condition:
+        10 437 rows declared as 10 000 against ``limit=10000`` would fill the
+        first page exactly, match the total, and end the export with the tail
+        left behind.  The flag is remembered once seen, so a total declared
+        exactly on an earlier page cannot re-arm a check the answer has since
+        disowned.
+
+        Rows are checked against each other by the identity of their groupings,
+        and the set of what has been seen lives here — one campaign, one set.
+        The combination is unique inside one report and repeats between reports
+        as a matter of course, since one placement runs in several campaigns of
+        the same advertiser; a set shared across campaigns would fail an export
+        of perfectly ordinary data.  A repeat inside one campaign fails the day:
+        pages that overlap are pages that also skip, and counting rows cannot
+        tell the two apart.  With no groupings asked for the report is a single
+        row, there is no pagination and nothing to check.
+        """
+        records: list[dict] = []
+        seen: set[tuple] = set()
+        total: int | None = None
+        rounded = False
+        offset = _STAT_OFFSET_BASE
+
+        while True:
+            page = self._request_page(
+                "stat",
+                {"ids": campaign_id, **base_params, "offset": offset},
+                {
+                    "advertiser_id": advertiser_id,
+                    "campaign_id": campaign_id,
+                    "date": date,
+                    "offset": offset,
+                },
+            )
+            # A list of dicts under the endpoint's rows key is the only body the
+            # request path hands back at all; every other shape has already
+            # failed the attempt there.
+            rows = page["data"]
+            _log_report_caveats(page, date, campaign_id)
+            if total is None:
+                total = _declared_total(page.get("total_rows"))
+            rounded = rounded or bool(page.get("total_rows_rounded"))
+
+            for raw_row in rows:
+                if dimensions:
+                    key = _row_key(raw_row)
+                    if key in seen:
+                        raise AirflowException(
+                            f"AdMetrica returned a row for campaign {campaign_id} on "
+                            f"{date} that an earlier page of the same campaign already "
+                            f"carried ({key}). Pages that repeat a row are pages that "
+                            f"skip another one, so the day stops here rather than "
+                            f"being written with a hole in it."
+                        )
+                    seen.add(key)
+                records.append(
+                    _map_row(
+                        raw_row,
+                        date,
+                        advertiser_id,
+                        campaign_id,
+                        dimensions,
+                        metrics,
+                        extra_params,
+                    )
+                )
+
+            if len(rows) < self.limit:
+                break
+            offset += len(rows)
+            if not rounded and total is not None and len(records) >= total:
+                break
+
+        self._check_row_total(
+            collected=len(records),
+            total=total,
+            rounded=rounded,
+            date=date,
+            campaign_id=campaign_id,
+        )
+        return records
+
+    @staticmethod
+    def _check_row_total(
+        *,
+        collected: int,
+        total: int | None,
+        rounded: bool,
+        date: str,
+        campaign_id: object,
+    ) -> None:
+        """Compare what was collected against what the report declared.
+
+        An exact total that does not match means pages went missing, and rows
+        lost this way are lost silently: the file is written, the day looks
+        exported, and what is not in it is discovered weeks later when the
+        period can no longer be re-requested.  So the day fails instead.
+
+        A rounded total cannot be matched exactly by definition, so the same
+        difference is a warning: something to read when the numbers look wrong,
+        not a reason to fail a day that is probably whole.  An answer declaring
+        no readable total leaves the check nothing to compare against and says
+        so, so that an unverified day is at least visibly unverified.
+        """
+        if total is None:
+            log.warning(
+                "AdMetrica declared no readable total_rows for campaign %s on %s; "
+                "%d rows were collected and their completeness is unverified.",
+                campaign_id,
+                date,
+                collected,
+            )
+            return
+        if collected == total:
+            return
+        summary = (
+            f"AdMetrica returned {collected} rows for campaign {campaign_id} on "
+            f"{date} while declaring {total}"
+        )
+        if rounded:
+            log.warning(
+                "%s. total_rows_rounded is set, so the declared number is an "
+                "approximation and the collected rows are the ones written.",
+                summary,
+            )
+            return
+        raise AirflowException(
+            f"{summary}. Rows lost between pages are lost silently, so the day "
+            f"stops here rather than being written short."
+        )
