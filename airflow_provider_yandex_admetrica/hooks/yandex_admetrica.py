@@ -2039,6 +2039,53 @@ class AdmetricaHook(BaseHook):
         self._campaigns = campaigns
         return campaigns
 
+    def _maskable_token(self) -> str | None:
+        """Return the token already read, or ``None`` while none has been.
+
+        What the masking gate looks for, taken from the connection this hook
+        holds rather than by reading one: it answers while a failure is being
+        described, and a failure that arrives before the connection was read
+        arrived before anything could carry the token, so there is nothing to
+        search the text for.  Never raises.
+        """
+        connection = self._connection
+        if connection is None:
+            return None
+        try:
+            return _token_from_password(connection.password)
+        except Exception:
+            return None
+
+    def test_connection(self) -> tuple[bool, str]:
+        """Answer the Test Connection button: does this connection work.
+
+        The check is the campaign list, because it exercises at once everything
+        a task depends on — the token is accepted, the advertiser is real and
+        the account may read the API — and it costs one request to an endpoint
+        that returns no statistics.
+
+        Both halves of the answer belong to the button, so nothing leaves here
+        as an exception, and the text of a failure passes through the same gate
+        every text leaves this module by: a server, a proxy or a wrapped network
+        failure can word an error with the credential inside it, and the button
+        shows its text to whoever pressed it.
+        """
+        try:
+            # First, so that a connection Airflow cannot find is reported as
+            # itself: everything after this reads the connection through a
+            # best-effort path that would describe its absence as an extra
+            # missing an advertiser.
+            self._get_connection()
+            advertiser_id = self.advertiser_id
+            campaigns = self.get_campaigns()
+        except Exception as exc:
+            return False, _exception_text(exc, self._maskable_token())
+        return (
+            True,
+            f"Connected to AdMetrica as advertiser {advertiser_id}: "
+            f"{len(campaigns)} campaigns are readable.",
+        )
+
     def get_stats(
         self,
         date: str,
