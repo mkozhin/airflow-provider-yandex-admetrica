@@ -166,7 +166,7 @@ This key is a public contract: it is what an analyst writes in `JSON_VALUE(dimen
 
 Key order is fixed — the service fields, then the groupings in the order they were requested, then the metrics in theirs — so files written from the same request are byte-comparable and a re-export is reviewable as a diff.
 
-A row carrying another number of values than were asked for fails the day. The answer names none of its values, so position is all that ties a number to its metric, and a row of another length cannot be read at all: some keys would be left empty or some numbers dropped, while the row counts towards `total_rows` exactly like a whole one — so the completeness check would pass and the file would look whole. An empty value is written through as it arrived. A metric typed `percents` or `currency` — `am:e:ctr`, `am:e:cpm`, the `video*Percent` family — is empty wherever its denominator or its cost is, so a report asking for those alone answers in rows of empty numbers; an empty **grouping** value is what `include_undefined=True` asks for. Each reaches the file as JSON `null`, which BigQuery reads as NULL.
+A row carrying another number of values than were asked for fails the day. The answer names none of its values, so position is all that ties a number to its metric, and a row of another length cannot be read at all: some keys would be left empty or some numbers dropped, while the row counts towards `total_rows` exactly like a whole one — so the completeness check would pass and the file would look whole. An empty value is written through as it arrived. A metric that divides or prices — `am:e:ctr`, `am:e:cpm`, `am:e:cpc`, `am:e:cpa<goal_id>`, the `video*Percent` family, the `am:e:ecommerce<currency>Revenue` family — is empty wherever its denominator or its cost is, so a report asking for those alone answers in rows of empty numbers; an empty **grouping** value is what `include_undefined=True` asks for. Each reaches the file as JSON `null`, which BigQuery reads as NULL.
 
 ### Campaign dictionary
 
@@ -209,11 +209,15 @@ Addressing the partition with a `table$YYYYMMDD` decorator lets `WRITE_TRUNCATE`
 Locally, the run id isolates two runs exporting the same day from each other:
 
 ```
-{base_dir}/{safe_run_id}/{advertiser_id}/stats/{date}.json
-{base_dir}/{safe_run_id}/{advertiser_id}/dict/campaigns/{snapshot_date}.json
+{base_dir}/{dag_segment}/{run_segment}/{advertiser_id}/stats/{date}.json
+{base_dir}/{dag_segment}/{run_segment}/{advertiser_id}/dict/campaigns/{snapshot_date}.json
 ```
 
-`safe_run_id` is the run id with every character outside `[\w-]` — letters, digits, underscore and hyphen — replaced by an underscore, so a run id carrying a timestamp with colons and a plus sign still names a directory on every filesystem. The day is sanitised the same way, so nothing rendered into `date` can address a file outside `base_dir`.
+`dag_segment` and `run_segment` name the DAG and the run: the identifier with every character outside `[\w-]` — letters, digits, underscore and hyphen — replaced by an underscore, so a run id carrying a timestamp with colons and a plus sign still names a directory on every filesystem, followed by a hyphen and the first eight characters of its SHA-1. The digest is what keeps two identifiers apart after the substitution has made them look alike, as `manual:a` and `manual/a` do.
+
+It takes the DAG as well as the run because Airflow holds a run id unique inside its DAG and nothing wider. One connection names one advertiser, so several advertisers are served by several DAGs, and two of them on the same schedule are handed the same `scheduled__<logical_date>`: on a shared `base_dir` a run directory named by the run alone would be one directory they both collect into, and the example DAG's `cleanup` deletes the whole of it.
+
+The day is sanitised by the substitution alone, so nothing rendered into `date` can address a file outside `base_dir`.
 
 In S3 the run id is absent and the day is overwritten — no history is kept:
 
@@ -257,6 +261,7 @@ Bringing history to the new shape is a manual operation — re-export the period
 | Campaigns collected disagree with the declared `total` | `AirflowException`: a campaign missing from the list takes all of its statistics with it |
 | A page of the campaign list declaring no whole-number `total`, or two pages declaring different totals | `AirflowException`, for the reason the same answers fail a campaign-day |
 | A campaign whose `campaign_id` is not a positive whole number | `AirflowException` naming the campaign. Statistics are asked for one campaign at a time and named by that id, so such a campaign is one whose rows no request can ask for — and a day written without them would look complete |
+| The campaign list repeating a `campaign_id` | `AirflowException` naming the campaign. A list that repeats a campaign is a list the offset is not moving through, so the pages after it are pages of a walk that has stopped advancing |
 | A walk that keeps answering with full pages | `AirflowException` after the walk's page budget. The budget is ten million rows for one campaign-day and a million campaigns for one advertiser's list, divided by the rows a page of that walk asks for: the statistics walk asks for `limit`, so at `limit=10000` it is allowed 1000 pages and at `limit=100` it is allowed 100 000, while the campaign list asks for a fixed 1000 and is allowed 1000 pages. A page small enough that the ceiling would take more than 100 000 requests to reach runs out of requests instead |
 | `sampled` | WARNING carrying `sample_share`, `sample_size` and `sample_space` |
 | `contains_sensitive_data` | WARNING: part of the rows was withheld by the API |
