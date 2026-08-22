@@ -749,8 +749,11 @@ def _new_event(
     through :func:`_redact_params`.  The raw header value therefore never enters
     an event at all, whatever the request does with it afterwards.
 
-    ``campaign_id``, ``date`` and ``offset`` belong to the statistics endpoint;
-    a request for the campaign list leaves them empty.
+    ``campaign_id`` and ``date`` belong to the statistics endpoint; a request
+    for the campaign list leaves them empty.  ``offset`` is filled in by both,
+    with the base each endpoint counts from: the campaign list counts rows
+    already skipped and starts at 0, the statistics endpoint counts rows and
+    starts at 1.
     """
     return {
         "schema_version": _SCHEMA_VERSION,
@@ -1002,10 +1005,11 @@ def _describe_unreadable_body(event: dict) -> str:
 def _describe_target(event: dict) -> str:
     """Name the request an attempt was made for, in the terms the event holds.
 
-    The endpoint always, and each of the three locators the statistics endpoint
-    fills in — the campaign, the day, the page — whenever the event carries it.
-    A request for the campaign list names only what it has, so a line never
-    claims a day or a campaign that no request was scoped to.
+    The endpoint always, and each of the three locators — the campaign, the day,
+    the page — whenever the event carries it.  The page belongs to both
+    endpoints; the campaign and the day are the statistics endpoint's own, so a
+    line about the campaign list names only what it has and never claims a day
+    or a campaign that no request was scoped to.
 
     Reads the event's own keys, so it runs on an event this module assembled.
     """
@@ -1481,7 +1485,27 @@ def _describe_campaign(row: dict, token: object) -> str:
     return f"{described}; the campaign is named {name!r}" if name else described
 
 
-def _resolve_placeholders(text: str, extra_params: dict | None) -> str:
+def _quoted_parameter(parameter: str, token: object) -> str:
+    """Return a parameter name fit for a task log: quoted, or named by length.
+
+    The name is the caller's own text and a credential is among the things a
+    caller can write into it, so it leaves through :func:`_scrub` like every
+    other text this module writes out.  A name the token survived is described
+    by its length instead of quoted — the WARNING loses the key it was naming
+    and keeps its shape, which is the trade every channel here makes.
+
+    Bounded like free text, because a name is as long as whoever wrote it made
+    it and the line is read from a log.
+    """
+    clean = _scrub(_one_line(parameter), token)
+    if clean is None:
+        return f"of {len(parameter)} character(s), which cannot be quoted here"
+    return repr(_truncate(clean))
+
+
+def _resolve_placeholders(
+    text: str, extra_params: dict | None, token: object = None
+) -> str:
     """Return *text* with every ``<parameter>`` replaced by its actual value.
 
     A parameterised name reaches the API in two spellings — the value written
@@ -1494,6 +1518,12 @@ def _resolve_placeholders(text: str, extra_params: dict | None) -> str:
     reads as wrong wherever it lands, which is the point: dropping it instead
     would merge every goal of the account into one column, and the merge would
     only be visible as numbers that are too large.
+
+    Such a placeholder is also the one piece of the caller's own text this module
+    writes out in full, because the WARNING is only actionable if it names the
+    key to add to ``extra_params``.  *token* is what makes that safe: the name
+    goes out through :func:`_quoted_parameter`, the same gate the caller's text
+    passes through on every other channel.
     """
     if "<" not in text:
         return text
@@ -1504,20 +1534,22 @@ def _resolve_placeholders(text: str, extra_params: dict | None) -> str:
         if parameter in params:
             return str(params[parameter])
         log.warning(
-            "A name of %d character(s) in this request names the parameter %r, "
+            "A name of %d character(s) in this request names the parameter %s, "
             "which the request does not carry; the record key keeps the "
-            "parameter's name in place of its value. The name is given by its "
-            "length rather than quoted: it is the caller's own text and this "
-            "line is read from a task log.",
+            "parameter's name in place of its value. The name around it is given "
+            "by its length rather than quoted: it is the caller's own text and "
+            "this line is read from a task log.",
             len(text),
-            parameter,
+            _quoted_parameter(parameter, token),
         )
         return parameter
 
     return _PLACEHOLDER_RE.sub(substitute, text)
 
 
-def _normalize_name(name: object, extra_params: dict | None = None) -> str:
+def _normalize_name(
+    name: object, extra_params: dict | None = None, token: object = None
+) -> str:
     """Return the record key a grouping or a metric is written under.
 
     One rule serves both, because both are named the same way by the API:
@@ -1541,7 +1573,7 @@ def _normalize_name(name: object, extra_params: dict | None = None) -> str:
     text = str(name)
     if text.startswith(_NAME_PREFIX):
         text = text[len(_NAME_PREFIX) :]
-    text = _resolve_placeholders(text, extra_params)
+    text = _resolve_placeholders(text, extra_params, token)
     text = _WORD_SPLIT_RE.sub(r"\1_\2", _ACRONYM_SPLIT_RE.sub(r"\1_\2", text))
     return _UNDERSCORE_RUN_RE.sub("_", _NON_KEY_CHARS_RE.sub("_", text.lower())).strip("_")
 
@@ -1566,6 +1598,7 @@ def _named_values(
     kind: str,
     date: str,
     campaign_id: object,
+    token: object = None,
 ) -> dict:
     """Pair requested *names* with the *values* the answer returned, by position.
 
@@ -1579,21 +1612,26 @@ def _named_values(
     campaign, the day and the two counts.
 
     An empty value is written through as it arrived, on both halves.  A metric
-    typed ``percents`` or ``currency`` — ``am:e:ctr``, ``am:e:cpm``, the
-    ``video*Percent`` family — comes back empty wherever its denominator or its
-    cost is, so a report asking for those alone answers in rows of empty
-    numbers; a grouping the API has no value for is what ``include_undefined``
-    asks to be sent.  Each is a documented answer, reaches the record as
-    ``None`` and is written as JSON ``null``, which BigQuery reads as NULL.
+    that divides or prices — ``am:e:ctr``, ``am:e:cpm``, ``am:e:cpc``,
+    ``am:e:cpa<goal_id>``, the ``video*Percent`` family, the
+    ``am:e:ecommerce<currency>Revenue`` family — comes back empty wherever its
+    denominator or its cost is, so a report asking for those alone answers in
+    rows of empty numbers; a grouping the API has no value for is what
+    ``include_undefined`` asks to be sent.  Each is a documented answer, reaches
+    the record as ``None`` and is written as JSON ``null``, which BigQuery reads
+    as NULL.
 
     Two requested names can normalise to one record key — the two spellings of
     a parameterised name do, and ``am:e:goal12345Reaches`` beside
     ``am:e:goal<goal_id>Reaches`` with ``goal_id=12345`` is the case that
     happens.  The record holds one value under the key, the later of the two,
     and a WARNING names the two by their position in the request and the key by
-    its length.  The requested names themselves never reach the log: they are
+    its length.  The requested names themselves do not reach that line: they are
     the caller's own text, a credential is among the things a caller can write
-    there, and this function has no token to hold such text against.
+    there, and a position says as much about which name to fix.
+
+    *token* is what the one name this path does write out is held against — the
+    unanswered placeholder :func:`_resolve_placeholders` reports.
     """
     if len(values) != len(names):
         raise _MaskedError(
@@ -1609,7 +1647,7 @@ def _named_values(
     record: dict = {}
     first_position: dict[str, int] = {}
     for position, name in enumerate(names):
-        key = _normalize_name(name, extra_params)
+        key = _normalize_name(name, extra_params, token)
         if key in first_position:
             log.warning(
                 "The %s at position %d of this request writes the record key that "
@@ -1637,6 +1675,7 @@ def _map_row(
     dimensions: Sequence[str],
     metrics: Sequence[str],
     extra_params: dict | None = None,
+    token: object = None,
 ) -> dict:
     """Return one record of statistics built from one row of a report.
 
@@ -1681,6 +1720,7 @@ def _map_row(
             "dimension",
             date,
             campaign_id,
+            token,
         ),
         "metrics": _named_values(
             metrics,
@@ -1689,6 +1729,7 @@ def _map_row(
             "metric",
             date,
             campaign_id,
+            token,
         ),
     }
 
@@ -1955,9 +1996,16 @@ class AdmetricaHook(BaseHook):
         Text that is not JSON says the same thing as an extra without an
         advertiser in it, and the caller answers both with the one message that
         spells out the form the field takes.
+
+        The connection is looked up outside that leniency, so a connection
+        Airflow does not have fails as itself.  The two are different mistakes
+        with different fixes — a typo in ``admetrica_conn_id`` or a secrets
+        backend that would not answer, against an extra to correct — and reading
+        the extra of a connection nobody found is not a thing to describe.
         """
+        conn = self._get_connection()
         try:
-            extra = self._get_connection().extra_dejson
+            extra = conn.extra_dejson
         except Exception:
             log.warning(
                 "Connection %r has an extra that is not readable as JSON.",
@@ -2421,11 +2469,6 @@ class AdmetricaHook(BaseHook):
         written to be read by a person.
         """
         try:
-            # First, so that a connection Airflow cannot find is reported as
-            # itself: everything after this reads the connection through a
-            # best-effort path that would describe its absence as an extra
-            # missing an advertiser.
-            self._get_connection()
             advertiser_id = self.advertiser_id
             campaigns = self.get_campaigns()
         except Exception as exc:
@@ -2705,6 +2748,7 @@ class AdmetricaHook(BaseHook):
                         dimensions,
                         metrics,
                         extra_params,
+                        self._maskable_token(),
                     )
                 )
 

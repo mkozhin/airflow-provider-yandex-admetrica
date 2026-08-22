@@ -3,10 +3,11 @@
 from __future__ import annotations
 
 import json
+import logging
 from unittest.mock import MagicMock
 
 import pytest
-from airflow.exceptions import AirflowException
+from airflow.exceptions import AirflowException, AirflowNotFoundException
 from airflow.models import Connection
 
 from airflow_provider_yandex_admetrica.hooks.yandex_admetrica import (
@@ -138,6 +139,21 @@ class TestAdvertiserId:
             _hook(extra={}).advertiser_id
         assert "'admetrica'" in str(exc.value)
         assert "advertiser_id" in str(exc.value)
+
+    def test_a_connection_airflow_does_not_have_fails_as_itself(self, caplog):
+        """A typo in the id and an extra to correct are different mistakes.
+
+        Describing the first as the second sends the reader to edit the extra of
+        a connection nobody found.
+        """
+        hook = AdmetricaHook(admetrica_conn_id="nope")
+        hook.get_connection = MagicMock(
+            side_effect=AirflowNotFoundException("The conn_id `nope` isn't defined")
+        )
+        with caplog.at_level(logging.WARNING):
+            with pytest.raises(AirflowNotFoundException):
+                hook.advertiser_id
+        assert "not readable as JSON" not in caplog.text
 
 
 class TestToken:

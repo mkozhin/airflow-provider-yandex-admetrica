@@ -372,6 +372,16 @@ class TestTheNamesTheCallerAsksBy:
         assert "goal_id" in caplog.text
         assert SECRET_MIDDLE not in _everything_that_left(sink, "", caplog)
 
+    def test_a_placeholder_holding_the_token_is_reported_without_it(self, caplog):
+        """The parameter's own name is written out, so it passes the gate too."""
+        sink = _Sink()
+        hook = _hook(sink)
+        hook._campaigns = [{"campaign_id": 123456}]
+        records = self._day(hook, DIMENSIONS, [f"am:e:goal<{TOKEN}>Reaches"], [1], caplog)
+
+        assert len(records) == 1
+        assert SECRET_MIDDLE not in _everything_that_left(sink, "", caplog)
+
 
 class TestWhatTheCallerConfigures:
     """A refusal written before the first request names the caller's own value."""
