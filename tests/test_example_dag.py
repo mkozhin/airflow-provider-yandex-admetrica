@@ -263,12 +263,23 @@ class TestKeys:
     def test_run_id_absent_from_the_s3_key(self, dag_module):
         assert "run" not in dag_module.s3_key(_record())
 
-    def test_gcs_object_isolates_the_run(self, dag_module):
+    def test_gcs_object_isolates_the_dag_and_the_run(self, dag_module):
         obj = dag_module.gcs_object(_record(), "manual__2026-08-21T00:00:00+00:00")
         assert obj == (
-            f"{dag_module.GCS_PREFIX}/manual__2026-08-21T00_00_00_00_00"
+            f"{dag_module.GCS_PREFIX}/admetrica_to_bq_and_s3-415827a2"
+            "/manual__2026-08-21T00_00_00_00_00-f3d888b4"
             "/17004/stats/2026-08-20.json"
         )
+
+    def test_two_dags_sharing_the_bucket_do_not_share_a_gcs_object(
+        self, dag_module, monkeypatch
+    ):
+        # A run id is unique inside its DAG and nothing wider, and the bucket is
+        # shared, so the DAG has to be in the key for the two to stay apart.
+        run_id = "scheduled__2026-08-21T00:00:00+00:00"
+        mine = dag_module.gcs_object(_record(), run_id)
+        monkeypatch.setattr(dag_module, "DAG_ID", "admetrica_other_advertiser")
+        assert dag_module.gcs_object(_record(), run_id) != mine
 
     def test_partition_decorator_addresses_the_day(self, dag_module):
         table = dag_module.bq_table(_record(date="2026-08-20"), "stats")
@@ -443,7 +454,7 @@ class TestCleanup:
     """The task deletes this run's directory and leaves every other one alone."""
 
     def _run_dir(self, dag_module, tmp_path, run_id: str):
-        run_dir = tmp_path / dag_module.safe_id(run_id)
+        run_dir = tmp_path / dag_module.id_segment(dag_module.DAG_ID) / dag_module.id_segment(run_id)
         (run_dir / "17004" / "stats").mkdir(parents=True)
         (run_dir / "17004" / "stats" / "2026-08-20.json").write_text("{}", encoding="utf-8")
         return run_dir

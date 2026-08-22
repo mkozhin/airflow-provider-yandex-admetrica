@@ -51,10 +51,12 @@ day, dictionary → cleanup
 
 ## Раскладка
 
-Локально файлы прогона лежат под `{BASE_DIR}/{safe_run_id}/{advertiser_id}/…` и
-удаляются задачей `cleanup`.
+Локально файлы прогона лежат под `{BASE_DIR}/{dag_id}-{digest}/{run_id}-{digest}/{advertiser_id}/…`
+и удаляются задачей `cleanup`. DAG в пути потому, что `run_id` уникален только внутри
+своего DAG, а рекламодателей обслуживают несколько DAG'ов на общем `BASE_DIR`. Тем же
+парным адресом живут промежуточные объекты в GCS.
 
-В S3 `run_id` в ключ не входит, день перетирается:
+В S3 ни DAG, ни прогон в ключ не входят, день перетирается:
 
 ```
 {S3_PREFIX}/{advertiser_id}/stats/_year=2026/_month=08/_day=20/_date=20260820/2026-08-20.json
@@ -98,7 +100,6 @@ Clear нужного map index группы `day` вместе с задачам
 """
 
 import os
-import re
 import shutil
 from collections.abc import Iterable
 from datetime import date, timedelta
@@ -116,9 +117,14 @@ from airflow_provider_yandex_admetrica.operators.stats import (
     DICT_CAMPAIGNS_PARTS,
     STATS_PARTS,
     YandexAdmetricaStatsOperator,
+    id_segment,
 )
 
 # ── Конфигурация ──────────────────────────────────────────────────────────────
+
+# Имя DAG. Оператор кладёт файлы прогона под него, поэтому DAG и его таски
+# адресуют один и тот же каталог, а переименование остаётся одной правкой.
+DAG_ID            = "admetrica_to_bq_and_s3"
 
 ADMETRICA_CONN_ID = "yandex_admetrica_default"
 LOKI_CONN_ID      = "loki_default"
@@ -190,9 +196,16 @@ KEY_PARTS = {"stats": STATS_PARTS, "dict": DICT_CAMPAIGNS_PARTS}
 # ── Чистые функции, которыми пользуются таски ─────────────────────────────────
 
 
-def safe_id(run_id: str) -> str:
-    """Вернуть `run_id`, пригодный для имени каталога."""
-    return re.sub(r"[^\w-]", "_", run_id or "")
+def run_dir(run_id: str) -> str:
+    """Вернуть каталог прогона, в который собирает файлы оператор.
+
+    Собирается тем же `id_segment`, что и в операторе, поэтому уборка и загрузка
+    адресуют ровно тот каталог, куда велась запись. Пара из DAG и прогона:
+    `run_id` уникален в пределах своего DAG, а рекламодателей обслуживают
+    несколько DAG'ов, и на общем `BASE_DIR` одного `run_id` для имени каталога
+    не хватает.
+    """
+    return os.path.join(BASE_DIR, id_segment(DAG_ID), id_segment(run_id))
 
 
 def build_dates(date_from: str, date_to: str) -> list[str]:
@@ -240,11 +253,15 @@ def dictionary_record(mapped_results: Iterable[list[dict]] | None) -> dict | Non
 def gcs_object(record: dict, run_id: str) -> str:
     """Вернуть промежуточный объект GCS для записи.
 
-    `run_id` в ключ входит: объект живёт до конца прогона и удаляется правилом
-    жизненного цикла бакета, поэтому два прогона не должны делить один ключ.
+    DAG и прогон входят в ключ: объект живёт до конца прогона и удаляется
+    правилом жизненного цикла бакета, поэтому два прогона не должны делить один
+    ключ — а бакет общий, и `run_id` одинаков у DAG'ов на общем расписании.
     """
     parts = "/".join(KEY_PARTS[record["kind"]])
-    return f"{GCS_PREFIX}/{safe_id(run_id)}/{record['advertiser_id']}/{parts}/{record['date']}.json"
+    return (
+        f"{GCS_PREFIX}/{id_segment(DAG_ID)}/{id_segment(run_id)}"
+        f"/{record['advertiser_id']}/{parts}/{record['date']}.json"
+    )
 
 
 def s3_key(record: dict) -> str:
@@ -307,7 +324,7 @@ DEFAULT_ARGS = {
 
 
 @dag(
-    dag_id="admetrica_to_bq_and_s3",
+    dag_id=DAG_ID,
     doc_md=__doc__,
     schedule=None,
     start_date=None,
@@ -456,10 +473,10 @@ def admetrica_to_bq_and_s3():
 
     @task(trigger_rule="none_failed")
     def cleanup(**context) -> None:
-        run_dir = os.path.join(BASE_DIR, safe_id(context["run_id"]))
-        if not os.path.isdir(run_dir):
+        directory = run_dir(context["run_id"])
+        if not os.path.isdir(directory):
             return
-        shutil.rmtree(run_dir)
+        shutil.rmtree(directory)
 
     dates = get_dates()
     bucket_ready = ensure_gcs_bucket()

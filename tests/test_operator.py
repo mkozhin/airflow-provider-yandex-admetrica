@@ -10,7 +10,7 @@ from unittest.mock import MagicMock, patch
 
 import pytest
 from airflow.exceptions import AirflowException
-from airflow.models import Connection
+from airflow.models import DAG, Connection
 
 from airflow_provider_yandex_admetrica.hooks.yandex_admetrica import (
     _CAMPAIGN_FIELDS,
@@ -31,7 +31,15 @@ DATE = "2026-08-20"
 
 RUN_ID = "manual__2026-08-21T00:00:00+00:00"
 
-SAFE_RUN_ID = "manual__2026-08-21T00_00_00_00_00"
+#: The run directory segment for :data:`RUN_ID`, spelled out rather than built
+#: by the function under test: it is the layout the DAG's own cleanup and its
+#: uploads address, so a change to it is a change every reader has to be told
+#: about.
+RUN_SEGMENT = "manual__2026-08-21T00_00_00_00_00-f3d888b4"
+
+#: The DAG directory segment of an operator declared outside a DAG, which is
+#: what ``dag_id`` answers for one.
+DAG_SEGMENT = "adhoc_airflow-4aa313a5"
 
 #: The day the export runs, which is the day after the one it reports on.
 SNAPSHOT_DATE = "2026-08-21"
@@ -156,7 +164,12 @@ class TestPath:
         with _Run([_row()]):
             result = op.execute(_context())
         assert result[0]["path"] == os.path.join(
-            str(tmp_path), SAFE_RUN_ID, str(ADVERTISER_ID), "stats", f"{DATE}.json"
+            str(tmp_path),
+            DAG_SEGMENT,
+            RUN_SEGMENT,
+            str(ADVERTISER_ID),
+            "stats",
+            f"{DATE}.json",
         )
 
     def test_sanitizes_the_run_id(self, tmp_path):
@@ -171,6 +184,30 @@ class TestPath:
         first = op._build_path("run_a", ADVERTISER_ID, ("stats",), DATE)
         second = op._build_path("run_b", ADVERTISER_ID, ("stats",), DATE)
         assert first != second
+
+    def test_two_dags_sharing_a_base_dir_do_not_share_a_run_directory(self, tmp_path):
+        # Airflow holds a run id unique inside its DAG and nothing wider, so two
+        # DAGs on one schedule are handed the same one. They serve different
+        # advertisers, and the cleanup of either owns the whole run directory.
+        with DAG("advertiser_a", start_date=RUN_START):
+            first = _operator(base_dir=str(tmp_path))
+        with DAG("advertiser_b", start_date=RUN_START):
+            second = _operator(base_dir=str(tmp_path))
+        run_id = "scheduled__2026-08-21T00:00:00+00:00"
+        first_path = first._build_path(run_id, ADVERTISER_ID, ("stats",), DATE)
+        second_path = second._build_path(run_id, ADVERTISER_ID, ("stats",), DATE)
+        assert first_path != second_path
+        assert os.path.commonpath([first_path, second_path]) == str(tmp_path)
+
+    def test_run_ids_that_sanitise_alike_stay_apart(self, tmp_path):
+        # The substitution that makes a directory name of a run id maps several
+        # run ids onto one name; the digest beside it is what tells them apart.
+        op = _operator(base_dir=str(tmp_path))
+        first = op._build_path("manual:a", ADVERTISER_ID, ("stats",), DATE)
+        second = op._build_path("manual/a", ADVERTISER_ID, ("stats",), DATE)
+        assert first != second
+        assert "manual_a-" in first
+        assert "manual_a-" in second
 
 
 class TestWrittenFile:
@@ -386,7 +423,8 @@ class TestCampaignDictionary:
         (record,) = [r for r in result if r["kind"] == "dict"]
         assert record["path"] == os.path.join(
             str(tmp_path),
-            SAFE_RUN_ID,
+            DAG_SEGMENT,
+            RUN_SEGMENT,
             str(ADVERTISER_ID),
             "dict",
             "campaigns",
@@ -457,7 +495,8 @@ class TestCampaignDictionary:
         with _Run([_row()]) as run:
             result = op.execute(_context())
         assert [r["kind"] for r in result] == ["stats"]
-        assert not list((tmp_path / SAFE_RUN_ID / str(ADVERTISER_ID)).glob("dict/**/*"))
+        advertiser_dir = tmp_path / DAG_SEGMENT / RUN_SEGMENT / str(ADVERTISER_ID)
+        assert not list(advertiser_dir.glob("dict/**/*"))
         run.get_campaigns.assert_not_called()
 
     def test_an_advertiser_without_campaigns_writes_nothing(self, tmp_path):
@@ -465,7 +504,8 @@ class TestCampaignDictionary:
         with _Run([_row()], campaigns=[]):
             result = op.execute(_context())
         assert [r["kind"] for r in result] == ["stats"]
-        assert not list((tmp_path / SAFE_RUN_ID / str(ADVERTISER_ID)).glob("dict/**/*"))
+        advertiser_dir = tmp_path / DAG_SEGMENT / RUN_SEGMENT / str(ADVERTISER_ID)
+        assert not list(advertiser_dir.glob("dict/**/*"))
 
     def test_a_second_run_of_the_same_day_rewrites_one_file(self, tmp_path):
         op = _operator(base_dir=str(tmp_path))
@@ -474,7 +514,8 @@ class TestCampaignDictionary:
         with _Run([_row()]):
             second = op.execute(_context())
         assert first == second
-        assert len(list((tmp_path / SAFE_RUN_ID).rglob("dict/campaigns/*.json"))) == 1
+        run_dir = tmp_path / DAG_SEGMENT / RUN_SEGMENT
+        assert len(list(run_dir.rglob("dict/campaigns/*.json"))) == 1
 
     def test_the_advertiser_travels_with_the_dictionary(self, tmp_path):
         op = _operator(base_dir=str(tmp_path))

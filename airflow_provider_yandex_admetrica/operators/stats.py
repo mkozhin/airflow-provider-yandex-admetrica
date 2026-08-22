@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import re
@@ -36,6 +37,26 @@ DICT_CAMPAIGNS_PARTS = ("dict", "campaigns")
 #: else becomes an underscore, so a run id carrying a timestamp with colons and
 #: a plus sign still names a directory on every filesystem.
 _UNSAFE_SEGMENT_RE = re.compile(r"[^\w-]")
+
+#: Characters of the digest that follows an identifier in a path segment.
+_DIGEST_LENGTH = 8
+
+
+def id_segment(identifier: str) -> str:
+    """Return the directory segment naming *identifier*, one segment per value.
+
+    The readable half is the identifier with every character a directory name
+    may not hold replaced by an underscore; the digest half is the first
+    :data:`_DIGEST_LENGTH` characters of the SHA-1 of the identifier as it
+    arrived.  The readable half is what a person looks for when opening the
+    directory during an export, and the digest is what keeps two identifiers
+    apart once the substitution has made them look alike — a run triggered as
+    ``manual:a`` and one triggered as ``manual/a`` read the same after it, and
+    only the digest tells the two exports apart.
+    """
+    safe = _UNSAFE_SEGMENT_RE.sub("_", identifier)
+    digest = hashlib.sha1(identifier.encode("utf-8")).hexdigest()[:_DIGEST_LENGTH]
+    return f"{safe}-{digest}"
 
 
 class ExportRecord(TypedDict):
@@ -121,22 +142,33 @@ class YandexAdmetricaStatsOperator(BaseOperator):
     ) -> str:
         """Return the local file for *date* under *parts* of this advertiser.
 
-        The run id sits in the path so two runs exporting the same day never
-        write the same file; it stays local, since the S3 key addresses a day
-        of an advertiser and nothing else.
+        The DAG and the run sit in the path so two exports of the same day never
+        write the same file; both stay local, since the S3 key addresses a day
+        of an advertiser and nothing else.  It takes the two of them: Airflow
+        holds a run id unique within its DAG and nothing wider, while one
+        connection names one advertiser, so serving several advertisers means
+        several DAGs — and they share ``base_dir`` unless each is given its own.
+        Two of them on the same schedule are handed the same
+        ``scheduled__<logical_date>``, and a run directory named by that alone
+        would be one directory two DAGs collect into and either one deletes.
 
-        Both the run id and the day are sanitised the same way, because both
-        arrive from outside: the run id is Airflow's, and the day is a template
-        field a DAG parameter fills in.  Every character outside the letters,
-        digits, underscore and hyphen a directory name is allowed to hold
-        becomes an underscore, so a segment can name nothing but a directory of
-        its own — a day written as ``../../etc`` addresses a file under the base
-        directory, spelled oddly, rather than a file anywhere on the worker.
+        Both segments are built by :func:`id_segment`, which carries a digest of
+        the identifier past the substitution that makes a directory name of it.
+
+        The day is a template field a DAG parameter fills in, so every character
+        outside the letters, digits, underscore and hyphen a directory name is
+        allowed to hold becomes an underscore: a day written as ``../../etc``
+        addresses a file under the base directory, spelled oddly, rather than a
+        file anywhere on the worker.
         """
-        safe_run_id = _UNSAFE_SEGMENT_RE.sub("_", run_id)
         safe_date = _UNSAFE_SEGMENT_RE.sub("_", date)
         return os.path.join(
-            self.base_dir, safe_run_id, str(advertiser_id), *parts, f"{safe_date}.json"
+            self.base_dir,
+            id_segment(self.dag_id),
+            id_segment(run_id),
+            str(advertiser_id),
+            *parts,
+            f"{safe_date}.json",
         )
 
     def _write(self, records: Sequence[dict], path: str) -> None:
