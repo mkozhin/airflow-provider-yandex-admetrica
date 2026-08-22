@@ -41,6 +41,19 @@ _UNSAFE_SEGMENT_RE = re.compile(r"[^\w-]")
 #: Characters of the digest that follows an identifier in a path segment.
 _DIGEST_LENGTH = 8
 
+#: Bytes one directory name may take.  ``NAME_MAX`` is 255 on ext4, XFS, APFS
+#: and every other filesystem an Airflow worker is likely to write to, and it
+#: counts bytes rather than characters.
+_SEGMENT_BYTES = 255
+
+
+def _fit_bytes(text: str, limit: int) -> str:
+    """Return *text* cut to *limit* bytes of UTF-8, never mid-character."""
+    encoded = text.encode("utf-8")
+    if len(encoded) <= limit:
+        return text
+    return encoded[:limit].decode("utf-8", "ignore")
+
 
 def id_segment(identifier: str) -> str:
     """Return the directory segment naming *identifier*, one segment per value.
@@ -53,10 +66,18 @@ def id_segment(identifier: str) -> str:
     apart once the substitution has made them look alike — a run triggered as
     ``manual:a`` and one triggered as ``manual/a`` read the same after it, and
     only the digest tells the two exports apart.
+
+    The readable half is cut to whatever :data:`_SEGMENT_BYTES` leaves after the
+    digest, so the segment names a directory on every filesystem.  Airflow holds
+    a ``dag_id`` and a ``run_id`` of up to 250 characters, and a character
+    outside ASCII takes more than one byte, so both reach past the limit on
+    their own.  Cutting costs nothing: the digest is taken from the whole
+    identifier, so two that share a prefix long enough to survive the cut are
+    still told apart by it.
     """
     safe = _UNSAFE_SEGMENT_RE.sub("_", identifier)
     digest = hashlib.sha1(identifier.encode("utf-8")).hexdigest()[:_DIGEST_LENGTH]
-    return f"{safe}-{digest}"
+    return f"{_fit_bytes(safe, _SEGMENT_BYTES - _DIGEST_LENGTH - 1)}-{digest}"
 
 
 class ExportRecord(TypedDict):

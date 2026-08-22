@@ -199,6 +199,31 @@ class TestPath:
         assert first_path != second_path
         assert os.path.commonpath([first_path, second_path]) == str(tmp_path)
 
+    @pytest.mark.parametrize(
+        "identifier",
+        ["a" * 250, "я" * 250, "manual__" + "b" * 242],
+        ids=["ascii", "cyrillic", "prefixed"],
+    )
+    def test_the_longest_identifier_airflow_accepts_still_names_a_directory(
+        self, tmp_path, identifier
+    ):
+        # Airflow holds a dag_id and a run_id of up to 250 characters, and a
+        # directory name is bounded in bytes rather than characters.
+        op = _operator(base_dir=str(tmp_path))
+        path = op._build_path(identifier, ADVERTISER_ID, ("stats",), DATE)
+        for segment in os.path.relpath(path, str(tmp_path)).split(os.sep):
+            assert len(segment.encode("utf-8")) <= 255
+        op._write([_row()], path)
+        assert os.path.isfile(path)
+
+    def test_long_run_ids_sharing_their_start_stay_apart(self, tmp_path):
+        # The cut takes the tail that would have told them apart, so what does
+        # it instead is the digest, which is taken from the whole identifier.
+        op = _operator(base_dir=str(tmp_path))
+        first = op._build_path("c" * 250 + "first", ADVERTISER_ID, ("stats",), DATE)
+        second = op._build_path("c" * 250 + "second", ADVERTISER_ID, ("stats",), DATE)
+        assert first != second
+
     def test_run_ids_that_sanitise_alike_stay_apart(self, tmp_path):
         # The substitution that makes a directory name of a run id maps several
         # run ids onto one name; the digest beside it is what tells them apart.
