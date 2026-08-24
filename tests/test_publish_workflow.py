@@ -17,6 +17,14 @@ ROOT = Path(__file__).resolve().parent.parent
 WORKFLOW = ROOT / ".github" / "workflows" / "publish.yml"
 PYPROJECT = ROOT / "pyproject.toml"
 
+#: What this file checks belongs to the repository rather than to the package,
+#: so the workflow it reads is not part of the distribution.  Run from an
+#: unpacked sdist there is nothing here to check, and saying so is the answer.
+pytestmark = pytest.mark.skipif(
+    not WORKFLOW.exists(),
+    reason="the publish workflow ships with the repository, not with the package",
+)
+
 
 def _workflow() -> dict:
     return yaml.safe_load(WORKFLOW.read_text(encoding="utf-8"))
