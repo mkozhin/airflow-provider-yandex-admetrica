@@ -11,6 +11,7 @@ from airflow.exceptions import AirflowException
 from airflow_provider_yandex_admetrica.hooks.yandex_admetrica import (
     _map_row,
     _normalize_name,
+    _record_keys,
 )
 
 _HOOK_LOGGER = "airflow_provider_yandex_admetrica.hooks.yandex_admetrica"
@@ -21,15 +22,18 @@ DATE = "2026-08-20"
 
 
 def _record(raw_row, dimensions, metrics, extra_params=None) -> dict:
-    """The record one row becomes for the fixed advertiser, campaign and day."""
+    """The record one row becomes for the fixed advertiser, campaign and day.
+
+    The two steps an export takes: the request's names become record keys once,
+    and then every row of the answer is laid out under them.
+    """
     return _map_row(
         raw_row,
         DATE,
         ADVERTISER_ID,
         CAMPAIGN_ID,
-        dimensions,
-        metrics,
-        extra_params,
+        _record_keys(dimensions, extra_params, "dimension"),
+        _record_keys(metrics, extra_params, "metric"),
     )
 
 

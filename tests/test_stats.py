@@ -894,3 +894,35 @@ class TestCampaignsWithoutAnId:
         campaigns = [{**_campaign(7), "campaign_id": raw}]
         _, mock_get = _collect(_hook(), campaigns, [_page([], 0)])
         assert _stat_params(mock_get)[0]["ids"] == 7
+
+
+class TestWhatTheRequestIsWarnedAboutOnce:
+    """A caveat about the request is written once, not once per row it reaches."""
+
+    def _rows(self, count: int, metrics: tuple = (1,)) -> list[dict]:
+        return [
+            _row(_placement(f"P{n}", n), {"name": "mobile"}, metrics=metrics)
+            for n in range(count)
+        ]
+
+    def test_an_unanswered_placeholder_is_one_warning_for_the_whole_day(self, caplog):
+        """The names and the parameters are the request's, identical for every row."""
+        rows = self._rows(5)
+        pages = [_page(rows, total=5), _page(rows, total=5)]
+        with caplog.at_level(logging.WARNING, logger=_HOOK_LOGGER):
+            with patch("requests.get", side_effect=_api([_campaign(1), _campaign(2)], pages)):
+                _hook().get_stats(DATE, DIMENSIONS, ["am:e:goal<goal_id>Reaches"])
+
+        assert len([line for line in _said(caplog) if "does not carry" in line]) == 1
+
+    def test_two_names_writing_one_key_are_one_warning_for_the_whole_day(self, caplog):
+        rows = self._rows(5, metrics=(1, 2))
+        pages = [_page(rows, total=5), _page(rows, total=5)]
+        metrics = ["am:e:goal12345Reaches", "am:e:goal<goal_id>Reaches"]
+        with caplog.at_level(logging.WARNING, logger=_HOOK_LOGGER):
+            with patch("requests.get", side_effect=_api([_campaign(1), _campaign(2)], pages)):
+                _hook().get_stats(
+                    DATE, DIMENSIONS, metrics, extra_params={"goal_id": 12345}
+                )
+
+        assert len([line for line in _said(caplog) if "already writes" in line]) == 1

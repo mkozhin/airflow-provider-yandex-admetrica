@@ -1591,16 +1591,65 @@ def _row_values(raw_row: object, key: str) -> list:
     return values if isinstance(values, list) else []
 
 
-def _named_values(
+def _record_keys(
     names: Sequence[str],
-    values: list,
     extra_params: dict | None,
+    kind: str,
+    token: object = None,
+) -> list[str]:
+    """Return the record key each requested name is written under, in request order.
+
+    Called once for a request, not once for a row.  The names and the parameters
+    are the request's own configuration, identical for every row of every
+    campaign of the day, so both of the warnings below describe the request and
+    say the same thing about the ten-thousandth row as about the first.  Read
+    per row they would fill a task log with one line per row while the export
+    itself succeeds, and the regular expressions behind
+    :func:`_normalize_name` would run over every name of every row.
+
+    Two requested names can normalise to one record key — the two spellings of
+    a parameterised name do, and ``am:e:goal12345Reaches`` beside
+    ``am:e:goal<goal_id>Reaches`` with ``goal_id=12345`` is the case that
+    happens.  The key appears twice in the answer, the record holds the later
+    value under it, and a WARNING names the two by their position in the request
+    and the key by its length.  The requested names themselves do not reach that
+    line: they are the caller's own text, a credential is among the things a
+    caller can write there, and a position says as much about which name to fix.
+
+    *token* is what the one name this path does write out is held against — the
+    unanswered placeholder :func:`_resolve_placeholders` reports.
+    """
+    keys: list[str] = []
+    first_position: dict[str, int] = {}
+    for position, name in enumerate(names):
+        key = _normalize_name(name, extra_params, token)
+        if key in first_position:
+            log.warning(
+                "The %s at position %d of this request writes the record key that "
+                "the %s at position %d already writes, a key of %d character(s); "
+                "the record holds the later value under it. The two are named by "
+                "their position rather than quoted: a requested name is the "
+                "caller's own text and this line is read from a task log.",
+                kind,
+                position + 1,
+                kind,
+                first_position[key] + 1,
+                len(key),
+            )
+        else:
+            first_position[key] = position
+        keys.append(key)
+    return keys
+
+
+def _named_values(
+    keys: Sequence[str],
+    values: list,
     kind: str,
     date: str,
     campaign_id: object,
-    token: object = None,
 ) -> dict:
-    """Pair requested *names* with the *values* the answer returned, by position.
+    """Pair the record *keys* with the *values* the answer returned, by position.
 
     The answer carries values in the order they were asked for and names none of
     them, so position is the only thing tying a number to the metric it
@@ -1621,50 +1670,21 @@ def _named_values(
     the record as ``None`` and is written as JSON ``null``, which BigQuery reads
     as NULL.
 
-    Two requested names can normalise to one record key — the two spellings of
-    a parameterised name do, and ``am:e:goal12345Reaches`` beside
-    ``am:e:goal<goal_id>Reaches`` with ``goal_id=12345`` is the case that
-    happens.  The record holds one value under the key, the later of the two,
-    and a WARNING names the two by their position in the request and the key by
-    its length.  The requested names themselves do not reach that line: they are
-    the caller's own text, a credential is among the things a caller can write
-    there, and a position says as much about which name to fix.
-
-    *token* is what the one name this path does write out is held against — the
-    unanswered placeholder :func:`_resolve_placeholders` reports.
+    Two of the keys can be the same one, which :func:`_record_keys` has already
+    warned about; the record holds the later value under it.
     """
-    if len(values) != len(names):
+    if len(values) != len(keys):
         raise _MaskedError(
             f"AdMetrica answered with {len(values)} {kind} value(s) in a row of "
             f"campaign {campaign_id} on {date}, where the request asks for "
-            f"{len(names)}. "
+            f"{len(keys)}. "
             f"The answer names none of them, so position is all that ties a value "
             f"to the name it was asked for by, and a row of another length is a "
             f"row whose values cannot be told apart — while it counts towards "
             f"total_rows whatever is read out of it. The day stops here rather "
             f"than being written with values missing from a row."
         )
-    record: dict = {}
-    first_position: dict[str, int] = {}
-    for position, name in enumerate(names):
-        key = _normalize_name(name, extra_params, token)
-        if key in first_position:
-            log.warning(
-                "The %s at position %d of this request writes the record key that "
-                "the %s at position %d already writes, a key of %d character(s); "
-                "the record holds the later value under it. The two are named by "
-                "their position rather than quoted: a requested name is the "
-                "caller's own text and this line is read from a task log.",
-                kind,
-                position + 1,
-                kind,
-                first_position[key] + 1,
-                len(key),
-            )
-        else:
-            first_position[key] = position
-        record[key] = values[position]
-    return record
+    return {key: values[position] for position, key in enumerate(keys)}
 
 
 def _map_row(
@@ -1672,10 +1692,8 @@ def _map_row(
     date: str,
     advertiser_id: int,
     campaign_id: int,
-    dimensions: Sequence[str],
-    metrics: Sequence[str],
-    extra_params: dict | None = None,
-    token: object = None,
+    dimension_keys: Sequence[str],
+    metric_keys: Sequence[str],
 ) -> dict:
     """Return one record of statistics built from one row of a report.
 
@@ -1699,7 +1717,8 @@ def _map_row(
     grouping that brings an ``id`` beside its ``name`` keeps it, one that brings
     only a ``name`` stays that way, and a field neither this provider nor its
     documentation has seen is carried through untouched.  Under ``metrics`` are
-    the numbers, under the keys their names normalise to.  Nesting is what makes
+    the numbers, under the keys :func:`_record_keys` made of their names once
+    for the whole request.  Nesting is what makes
     a new field in the answer a change to a JSON value rather than to a table
     schema, and what lets two rows of the same day carry different fields
     without either being padded out to match the other.
@@ -1714,22 +1733,18 @@ def _map_row(
         "advertiser_id": advertiser_id,
         "campaign_id": campaign_id,
         "dimensions": _named_values(
-            dimensions,
+            dimension_keys,
             _row_values(raw_row, "dimensions"),
-            extra_params,
             "dimension",
             date,
             campaign_id,
-            token,
         ),
         "metrics": _named_values(
-            metrics,
+            metric_keys,
             _row_values(raw_row, "metrics"),
-            extra_params,
             "metric",
             date,
             campaign_id,
-            token,
         ),
     }
 
@@ -2541,6 +2556,18 @@ class AdmetricaHook(BaseHook):
             extra_params=extra_params,
         )
 
+        # Once for the request, not once for a row: the names and the parameters
+        # are the same for every row of every campaign of the day, and so is
+        # everything `_record_keys` has to say about them.
+        #
+        # The token is read here rather than taken from what a request has
+        # already read, because this runs before the first one: a requested name
+        # is the caller's own text, `_record_keys` writes one such name to the
+        # task log, and the value it is held against has to be the live one.
+        token = self._get_token()
+        dimension_keys = _record_keys(dimensions, extra_params, "dimension", token)
+        metric_keys = _record_keys(metrics, extra_params, "metric", token)
+
         records: list[dict] = []
         for campaign in self.get_campaigns():
             # A positive whole number for every campaign of the list, because
@@ -2555,9 +2582,8 @@ class AdmetricaHook(BaseHook):
                     advertiser_id=advertiser_id,
                     campaign_id=campaign_id,
                     base_params=base_params,
-                    dimensions=dimensions,
-                    metrics=metrics,
-                    extra_params=extra_params,
+                    dimension_keys=dimension_keys,
+                    metric_keys=metric_keys,
                 )
             )
         return records
@@ -2621,9 +2647,8 @@ class AdmetricaHook(BaseHook):
         advertiser_id: int,
         campaign_id: object,
         base_params: dict,
-        dimensions: Sequence[str],
-        metrics: Sequence[str],
-        extra_params: dict | None,
+        dimension_keys: Sequence[str],
+        metric_keys: Sequence[str],
     ) -> list[dict]:
         """Walk one campaign's report for one day and return its records.
 
@@ -2727,7 +2752,7 @@ class AdmetricaHook(BaseHook):
                 )
 
             for raw_row in rows:
-                if dimensions:
+                if dimension_keys:
                     key = _row_key(raw_row)
                     if key in seen:
                         raise _MaskedError(
@@ -2745,10 +2770,8 @@ class AdmetricaHook(BaseHook):
                         date,
                         advertiser_id,
                         campaign_id,
-                        dimensions,
-                        metrics,
-                        extra_params,
-                        self._maskable_token(),
+                        dimension_keys,
+                        metric_keys,
                     )
                 )
 
