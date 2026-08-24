@@ -17,3 +17,6 @@ build/
 # Generated version file (setuptools-scm)
 airflow_provider_yandex_admetrica/_version.py
 /.claude/
+
+# Архив прогонов revmux: история ревью, а не конфигурация
+/.revmux/tasks/

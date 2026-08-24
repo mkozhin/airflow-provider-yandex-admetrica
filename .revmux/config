@@ -1,0 +1,34 @@
+# revmux runtime knobs. Everything that shapes a review — rosters, models, effort, lens text — lives in
+# the prompt tree instead, so nothing here changes what a review looks for.
+#
+# Precedence is the command line, then ./.revmux/config, then ~/.config/revmux/config, then the built-in
+# value shown after each key. Layers merge per key: setting one here leaves the rest alone.
+
+# how long an agent may go without output before it is killed and retried
+# Раскрыт: хук провайдера — файл в 2800 строк, и агент читает его дольше двух минут молча.
+idle-timeout = 6m
+
+# how long one attempt may run; a retried agent gets this budget again
+# Раскрыт под тот же файл: полный состав по всей ветке идёт дольше двадцати минут.
+hard-timeout = 45m
+
+# how long to wait for the first agent to start before releasing the rest
+# stagger-delay = 30s
+
+# how many agents run at once
+# max-parallel = 4
+
+# cap on the number of verifier groups
+# verify-groups = 6
+
+# key verifier groups by directory or by the agent that raised the finding: dir | source
+# verify-group-by = dir
+
+# root directory holding task directories
+# tasks-dir = ./.revmux/tasks
+
+# close the terminal UI this long after the report arrives; 0 never closes it
+# auto-exit = 0s
+
+# profile naming the roster to run
+# profile = comprehensive
