@@ -506,6 +506,55 @@ class TestAttemptLines:
         )
         assert line.endswith("HTTP 503. Retrying in 1 s")
 
+    def test_a_refusal_a_repeat_can_fix_counts_the_attempt_it_spent(self, caplog):
+        hook = _hook()
+        with caplog.at_level(logging.DEBUG, logger=_HOOK_LOGGER):
+            with patch("requests.get", return_value=_refused("query_error")):
+                with patch("time.sleep"):
+                    with pytest.raises(AirflowException):
+                        _call(hook)
+        lines = _lines(caplog)
+        assert len(lines) == len(_QUERY_ERROR_DELAYS) + 1
+        for number, line in enumerate(lines, start=1):
+            assert f"attempt {number}/4 failed" in line
+            assert "not retryable" not in line
+
+    def test_a_refusal_no_repeat_can_fix_promises_no_attempts(self, caplog):
+        hook = _hook()
+        with caplog.at_level(logging.DEBUG, logger=_HOOK_LOGGER):
+            with patch("requests.get", return_value=_refused("invalid_parameter")):
+                with pytest.raises(AirflowException):
+                    _call(hook)
+        (line,) = _lines(caplog)
+        assert line.startswith(
+            "AdMetrica stat campaign_id=123456 date=2026-08-20 offset=1: "
+            "failed, not retryable — "
+        )
+        assert "attempt" not in line
+        assert "Retrying in" not in line
+        assert "HTTP 400, invalid_parameter" in line
+
+    @pytest.mark.parametrize("status", sorted(_AUTH_STATUSES))
+    def test_a_refused_token_promises_no_attempts_either(self, status, caplog):
+        hook = _hook()
+        with caplog.at_level(logging.DEBUG, logger=_HOOK_LOGGER):
+            with patch("requests.get", return_value=_response(status)):
+                with pytest.raises(AirflowException):
+                    _call(hook)
+        (line,) = _lines(caplog)
+        assert "failed, not retryable" in line
+        assert "attempt" not in line
+
+    def test_an_unreadable_answer_promises_no_attempts_either(self, caplog):
+        hook = _hook()
+        with caplog.at_level(logging.DEBUG, logger=_HOOK_LOGGER):
+            with patch("requests.get", return_value=_response(200, {"nothing": "readable"})):
+                with pytest.raises(AirflowException):
+                    _call(hook)
+        (line,) = _lines(caplog)
+        assert "failed, not retryable" in line
+        assert "attempt" not in line
+
     def test_a_campaign_list_line_claims_no_day_and_no_campaign(self, caplog):
         hook = _hook()
         answers = [_response(503), _response(200, {"campaigns": []})]

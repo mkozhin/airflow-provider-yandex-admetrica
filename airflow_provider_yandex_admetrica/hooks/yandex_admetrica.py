@@ -1093,15 +1093,22 @@ def _log_attempt(event: dict, retry_delay: float | None) -> None:
     Every outcome but ``success`` gets a line, the last attempt included: the
     attempt after which the task fails is the one whose reason is wanted most,
     and a chronicle that stopped one line short of it would answer the question
-    "what was tried, and why did it end" everywhere except there.  The final line
-    differs by what it lacks — ``Retrying in N s`` appears only where a pause
-    really follows, so a reader and a test tell the two apart by the same word.
+    "what was tried, and why did it end" everywhere except there.
+
+    The line takes one of two forms, by whether the ladder applies to the
+    outcome at all.  An outcome in :data:`_RETRIED_OUTCOMES` spends a step of
+    the attempt budget, so its line counts it — ``attempt N/M failed`` — and
+    the last of those differs by what it lacks: ``Retrying in N s`` appears
+    only where a pause really follows, so a reader and a test tell the two
+    apart by the same word.  Every other outcome ends the export where it
+    stands, and its line says so — ``failed, not retryable`` — because a
+    fraction there would promise attempts the request will never be given.
     """
-    line = (
-        f"{_describe_target(event)}: "
-        f"attempt {event['attempt']}/{event['max_attempts']} failed — "
-        f"{_attempt_reason(event)}"
-    )
+    if event["outcome"] in _RETRIED_OUTCOMES:
+        verdict = f"attempt {event['attempt']}/{event['max_attempts']} failed"
+    else:
+        verdict = "failed, not retryable"
+    line = f"{_describe_target(event)}: {verdict} — {_attempt_reason(event)}"
     if retry_delay is not None:
         line = f"{line}. Retrying in {retry_delay} s"
     log.warning("%s", line)
