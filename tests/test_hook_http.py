@@ -175,7 +175,6 @@ class TestSuccessfulAnswer:
                 _call(hook)
         assert _lines(caplog) == []
         assert _info_lines(caplog) == []
-        assert _info_lines(caplog) == []
 
 
 # ---------------------------------------------------------------------------
@@ -765,7 +764,6 @@ class TestTheLineSayingTheRepeatWorked:
                         _call(hook)
         assert _info_lines(caplog) == []
         assert len(_lines(caplog)) == len(_BACKOFF_DELAYS) + 1
-
 
 
 # ---------------------------------------------------------------------------

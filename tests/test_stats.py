@@ -515,8 +515,8 @@ class TestPagination:
         (message,) = [
             r.getMessage() for r in caplog.records if "under the walk" in r.getMessage()
         ]
-        assert "4" in message and "3" in message
-        assert "offset 3" in message
+        assert "declared 4 rows" in message
+        assert "and 3 on the page at offset 3" in message
 
     def test_a_changed_rounded_total_is_named_once_for_the_whole_walk(self, caplog):
         """The totals may drift on; the first change is the whole of what it says."""

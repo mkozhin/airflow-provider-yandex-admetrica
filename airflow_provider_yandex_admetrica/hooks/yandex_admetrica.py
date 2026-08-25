@@ -2234,9 +2234,10 @@ class AdmetricaHook(BaseHook):
         token masked, and — for anything :func:`_event_level` rates above
         ``info`` — the raw body, bounded and with the token cut out.  Emission
         never affects control flow: it lives in ``finally`` and every failure of
-        its own is swallowed there.  The push goes ahead of the task-log line
-        and under a net of its own, so an event still reaches the sink where
-        wording the line is the thing that failed.
+        its own is swallowed there.  The task-log line is written first, and
+        each half stands under a net of its own, so neither can cost the other
+        and the attempt is named in the task log even where a stop of the task
+        itself travels out of the push.
         """
         url = _ENDPOINT_URLS[endpoint]
         token = self._get_token()
