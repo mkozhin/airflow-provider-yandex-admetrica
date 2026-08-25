@@ -108,6 +108,11 @@ class YandexAdmetricaStatsOperator(BaseOperator):
     A day with no rows writes no file and adds nothing to the result, so a
     previously exported copy of that day stays where it is.
 
+    ``include_undefined`` goes out as the flag the API spells it in: ``True``
+    keeps the rows whose first grouping has no value, ``False`` asks the API to
+    drop them.  ``None`` leaves the parameter out of the request altogether, so
+    whatever the API defaults to decides.
+
     Beside the statistics the task exports the dictionary of campaigns, unless
     ``collect_dictionaries`` turns it off.  The dictionary is a snapshot of the
     day the export runs rather than of the day it reports on, because the
@@ -126,7 +131,7 @@ class YandexAdmetricaStatsOperator(BaseOperator):
         metrics: Sequence[str],
         filters: str | None = None,
         accuracy: str | None = "full",
-        include_undefined: bool = True,
+        include_undefined: bool | None = True,
         limit: int = DEFAULT_LIMIT,
         request_delay: float = DEFAULT_REQUEST_DELAY,
         timezone: str | None = None,

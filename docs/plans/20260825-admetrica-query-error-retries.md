@@ -320,12 +320,12 @@ AdMetrica stat campaign_id=75098 date=2026-08-23 offset=1: recovered on attempt 
 - Modify: `tests/test_operator.py`
 - Modify: `tests/test_stats.py`
 
-- [ ] заменить `include_undefined: bool = True` в `get_stats` (`hooks/yandex_admetrica.py:2505`) на `bool | None = True`: оператор передаёт значение туда напрямую, поэтому правка только в операторе оставила бы публичный вход хука запрещающим то, что код принимает
-- [ ] заменить `include_undefined: bool = True` (`operators/stats.py:129`) на `bool | None = True`: хук уже принимает `bool | None` и при `None` не отправляет параметр вовсе (`hooks/yandex_admetrica.py:2631`), так что аннотация запрещает то, что код делает
-- [ ] описать это в докстринге оператора: `None` означает «не отправлять параметр», то есть взять умолчание API
-- [ ] тест: `include_undefined=None` не кладёт параметр в запрос
-- [ ] тест: `True` и `False` уходят как `"true"` и `"false"`
-- [ ] прогнать тесты — зелено перед шагом 8
+- [x] заменить `include_undefined: bool = True` в `get_stats` (`hooks/yandex_admetrica.py:2505`) на `bool | None = True`: оператор передаёт значение туда напрямую, поэтому правка только в операторе оставила бы публичный вход хука запрещающим то, что код принимает
+- [x] заменить `include_undefined: bool = True` (`operators/stats.py:129`) на `bool | None = True`: хук уже принимает `bool | None` и при `None` не отправляет параметр вовсе (`hooks/yandex_admetrica.py:2631`), так что аннотация запрещает то, что код делает
+- [x] описать это в докстринге оператора: `None` означает «не отправлять параметр», то есть взять умолчание API
+- [x] тест: `include_undefined=None` не кладёт параметр в запрос
+- [x] тест: `True` и `False` уходят как `"true"` и `"false"`
+- [x] прогнать тесты — зелено перед шагом 8
 
 ### Task 8: Докстринг про `sort` — отделить факт от страховки
 

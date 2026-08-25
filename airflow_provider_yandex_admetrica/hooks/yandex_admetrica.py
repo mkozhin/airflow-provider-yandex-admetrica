@@ -2625,7 +2625,7 @@ class AdmetricaHook(BaseHook):
         *,
         filters: str | None = None,
         accuracy: str | None = "full",
-        include_undefined: bool = True,
+        include_undefined: bool | None = True,
         timezone: str | None = None,
         lang: str | None = None,
         extra_params: dict | None = None,

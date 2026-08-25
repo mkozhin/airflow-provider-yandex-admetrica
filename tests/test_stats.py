@@ -239,6 +239,25 @@ class TestRequest:
         assert sent["accuracy"] == "0.1"
         assert sent["include_undefined"] == "false"
 
+    @pytest.mark.parametrize(("value", "sent"), [(True, "true"), (False, "false")])
+    def test_include_undefined_goes_out_in_the_apis_spelling(self, value, sent):
+        _, mock_get = _collect(
+            _hook(),
+            [_campaign(1)],
+            [_page([], total=0)],
+            include_undefined=value,
+        )
+        assert _stat_params(mock_get)[0]["include_undefined"] == sent
+
+    def test_include_undefined_of_none_is_left_out_of_the_query(self):
+        _, mock_get = _collect(
+            _hook(),
+            [_campaign(1)],
+            [_page([], total=0)],
+            include_undefined=None,
+        )
+        assert "include_undefined" not in _stat_params(mock_get)[0]
+
     def test_filters_timezone_and_lang_go_out(self):
         _, mock_get = _collect(
             _hook(),
