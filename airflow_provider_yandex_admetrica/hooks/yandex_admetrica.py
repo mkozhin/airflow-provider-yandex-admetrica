@@ -258,10 +258,13 @@ _QUERY_ERROR_DELAYS = [5, 15, 45]
 _RETRYABLE_ERROR_TYPES = frozenset({"query_error"})
 
 #: The header a server names its own wait in, and the longest such wait this
-#: provider honours.  The header outranks the ladder — a server that says when
-#: to come back knows its window better than a rung chosen in advance — but only
-#: up to the cap: a wait of hours would hold a task slot for the whole of it,
-#: and failing the day costs less than that.
+#: provider honours.  The header outranks a rung of :data:`_BACKOFF_DELAYS` — a
+#: server that says when to come back knows its window better than a rung chosen
+#: in advance — but only up to the cap: a wait of hours would hold a task slot
+#: for the whole of it, and failing the day costs less than that.  A repeat
+#: along :data:`_QUERY_ERROR_DELAYS` takes its wait from that ladder alone: the
+#: header names a window the server is keeping, while such a refusal is the
+#: endpoint running long.
 _RETRY_AFTER_HEADER = "Retry-After"
 _RETRY_AFTER_MAX = 300
 
