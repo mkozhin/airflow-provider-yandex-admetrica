@@ -374,8 +374,8 @@ AdMetrica stat campaign_id=75098 date=2026-08-23 offset=1: recovered on attempt 
 
 ### Task 11: [Финал] Документация и закрытие плана
 
-- [ ] обновить `CHANGELOG.md`: раздел под следующую версию с перечнем изменений поведения и `schema_version` 1 → 2
-- [ ] перенести этот план в `docs/plans/completed/`
+- [x] обновить `CHANGELOG.md`: раздел под следующую версию с перечнем изменений поведения и `schema_version` 1 → 2
+- [x] перенести этот план в `docs/plans/completed/` (перенос делает харнесс после всех фаз)
 
 ## Post-Completion
 
