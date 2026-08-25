@@ -2644,12 +2644,25 @@ class AdmetricaHook(BaseHook):
         campaigns comes from :meth:`get_campaigns`, so one task instance asks
         the management API once however many campaigns it walks.
 
-        ``sort`` goes out naming every grouping that was asked for.  The report
-        is aggregated by them, so their combination orders the rows completely
-        and repeatably from one page to the next; sorting by a metric would not,
-        since a long tail of placements shares ``renders=1`` and the order
-        within that tail is the API's to choose — and rows would move between
-        pages while the walk was reading them.
+        ``sort`` goes out naming every grouping that was asked for.  The API
+        documents nothing about the order rows come back in, so a walk that
+        asked for no order would be leaning on an unwritten one holding still
+        from page to page: naming the groupings is this hook's own insurance,
+        not a consequence of anything the API promises.  The report is
+        aggregated by them, so their combination is a total order over the rows
+        — the one order that can be asked for with no tie left inside it, where
+        sorting by a metric leaves a long tail of placements sharing
+        ``renders=1`` for the API to arrange as it likes.
+
+        The insurance is backed by two checks rather than taken on faith.  Pages
+        that move under the walk repeat one row and skip another, and both marks
+        are looked for: a grouping combination seen twice inside one campaign
+        fails the day, and the collected rows are counted against the declared
+        ``total_rows`` at the end.  An order that turned out unstable is
+        therefore a day that stops, not a file quietly written short.  The gap
+        is a rounded total: under ``total_rows_rounded`` the count mismatch
+        softens to a warning, since an approximation is free to differ, and a
+        shortfall under that flag is left to the repeat detector alone.
 
         The day, the documented ceilings and the parameters this hook owns are
         checked before the first request, so a report configured wrongly costs
