@@ -34,6 +34,12 @@ TOKEN = "y0__xDf" + "MIDDLE-OF-THE-SECRET" + "q9Az"
 
 _HOOK_LOGGER = "airflow_provider_yandex_admetrica.hooks.yandex_admetrica"
 
+#: The two helpers that word the chronicle of a page, where a test stands in
+#: for one of them; the module they live in is the one the logger is named
+#: after.
+_LOG_ATTEMPT = f"{_HOOK_LOGGER}._log_attempt"
+_LOG_RECOVERY = f"{_HOOK_LOGGER}._log_recovery"
+
 #: The locators a statistics request names itself by; every test that reaches
 #: the request path passes them, so the lines and the events carry a full target.
 STAT_FIELDS = {
@@ -610,6 +616,17 @@ class TestAttemptLines:
             assert line.endswith(f"or sampling. Retrying in {delay} s")
         assert "Retrying in" not in lines[-1]
 
+    def test_a_message_that_trails_off_keeps_every_period_it_wrote(self, caplog):
+        """One period separates the wait from the reason; the rest are the server's."""
+        hook = _hook()
+        refused = _refused("query_error", "Report still running...")
+        with caplog.at_level(logging.DEBUG, logger=_HOOK_LOGGER):
+            with patch("requests.get", side_effect=[refused, _ok()]):
+                with patch("time.sleep"):
+                    _call(hook)
+        (line,) = _lines(caplog)
+        assert line.endswith("Report still running... Retrying in 5 s")
+
     def test_a_refusal_no_repeat_can_fix_promises_no_attempts(self, caplog):
         hook = _hook()
         with caplog.at_level(logging.DEBUG, logger=_HOOK_LOGGER):
@@ -724,24 +741,18 @@ class TestTheLineSayingTheRepeatWorked:
     def test_a_line_that_cannot_be_worded_still_hands_the_page_on(self):
         """Reporting sits inside the net that keeps it out of the export's way."""
         hook = _hook()
-        target = (
-            "airflow_provider_yandex_admetrica.hooks.yandex_admetrica._log_recovery"
-        )
         with patch("requests.get", side_effect=[_response(503), _ok()]):
             with patch("time.sleep"):
-                with patch(target, side_effect=RuntimeError("no words")):
+                with patch(_LOG_RECOVERY, side_effect=RuntimeError("no words")):
                     assert _call(hook) == {"data": []}
 
     def test_a_line_that_cannot_be_worded_still_leaves_the_event_behind(self):
         """The event carries the attempt in fields, so it outlives the wording."""
         sink = _Sink()
         hook = _hook(loki=sink)
-        target = (
-            "airflow_provider_yandex_admetrica.hooks.yandex_admetrica._log_recovery"
-        )
         with patch("requests.get", side_effect=[_response(503), _ok()]):
             with patch("time.sleep"):
-                with patch(target, side_effect=RuntimeError("no words")):
+                with patch(_LOG_RECOVERY, side_effect=RuntimeError("no words")):
                     assert _call(hook) == {"data": []}
         assert [event["outcome"] for event in sink.pushed] == [
             "retryable_error",
@@ -871,12 +882,9 @@ class TestDiagnostics:
         """Wording the chronicle and pushing the event stand under separate nets."""
         sink = _Sink()
         hook = _hook(loki=sink)
-        target = (
-            "airflow_provider_yandex_admetrica.hooks.yandex_admetrica._log_attempt"
-        )
         with patch("requests.get", return_value=_response(503)):
             with patch("time.sleep"):
-                with patch(target, side_effect=RuntimeError("no words")):
+                with patch(_LOG_ATTEMPT, side_effect=RuntimeError("no words")):
                     with pytest.raises(AirflowException):
                         _call(hook)
         assert len(sink.pushed) == len(_BACKOFF_DELAYS) + 1

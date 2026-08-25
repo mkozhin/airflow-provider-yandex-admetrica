@@ -221,6 +221,13 @@ _RETRY_STATUSES = frozenset({429, *range(500, 600)})
 #: where it stands.
 _AUTH_STATUSES = frozenset({401, 403})
 
+#: The one status whose body decides what happens next.  A 400 is the API's
+#: answer to everything it objects to in a request — a name it does not know, a
+#: value it cannot use, a report that ran long — so the status alone settles
+#: nothing there and ``error_type`` is read to tell those apart.  Every other
+#: status this module branches on says all it has to say in the status line.
+_TYPED_REFUSAL_STATUS = 400
+
 #: The pause before each repeat of a rate limit, a server-side failure or a
 #: request the network did not carry, in seconds.  A request gets one attempt
 #: plus one rung per pause, and the rung is picked by the number of the attempt
@@ -233,12 +240,15 @@ _AUTH_STATUSES = frozenset({401, 403})
 _BACKOFF_DELAYS = [1, 2, 4]
 
 #: The pause before each repeat of a refusal the API states in the body of a
-#: 400, in seconds.  The span of the ladder is a minute because the condition
-#: behind such a refusal drifts on the scale of minutes: a request refused now
-#: is answered once the window it fell into has passed.  It holds as many rungs
-#: as :data:`_BACKOFF_DELAYS` so that both ladders answer for the same attempt
-#: budget: the budget is one attempt plus a rung, and a ladder shorter than its
-#: neighbour would shorten it for every kind of refusal at once.
+#: 400, in seconds.  Every kind of refusal named in
+#: :data:`_RETRYABLE_ERROR_TYPES` is repeated along it: that set is what selects
+#: this ladder, and a kind joining it walks these same rungs.  The span of the
+#: ladder is a minute because the condition behind such a refusal drifts on the
+#: scale of minutes: a request refused now is answered once the window it fell
+#: into has passed.  It holds as many rungs as :data:`_BACKOFF_DELAYS` so that
+#: both ladders answer for the same attempt budget: the budget is one attempt
+#: plus a rung, and a ladder shorter than its neighbour would shorten it for
+#: every kind of refusal at once.
 _QUERY_ERROR_DELAYS = [5, 15, 45]
 
 #: The values of ``error_type`` a repeat can fix.  The check is membership of
@@ -949,6 +959,21 @@ def _find_error(data: object) -> object | None:
         return None
 
 
+def _raw_error_type(error: object) -> object:
+    """Return the value a refusal names its kind with, as the body wrote it.
+
+    One reading of where the kind lives, so that the part an event carries and
+    the part a policy is read from come out of the same key of the same object.
+    The two travel apart afterwards — one through the masking gate into
+    ``error_type``, one straight into the branch weighing a repeat — and a
+    second traversal of the body could name a different place.  A refusal that
+    is not a mapping names no kind.
+
+    Never raises: the lookup runs on a real ``dict`` or not at all.
+    """
+    return error.get("error_type") if isinstance(error, dict) else None
+
+
 def _safe_field(raw: object, token: object, label: str) -> str | None:
     """Return one text part of a refusal in the form an event may carry it.
 
@@ -995,7 +1020,7 @@ def _summarize_error(error: object, token: object) -> tuple[int | None, str | No
     code = raw_code if type(raw_code) is int else None  # `type(...) is int` excludes bool
     return (
         code,
-        _safe_field(error.get("error_type"), token, "error_type"),
+        _safe_field(_raw_error_type(error), token, "error_type"),
         _safe_field(error.get("message"), token, "message"),
     )
 
@@ -1047,7 +1072,7 @@ def _with_error(message: str, event: dict) -> str:
     Every exception this module raises for an answer it read is worded this way,
     so a reader comparing two failures sees the same two halves in both: what the
     provider was doing and what the status was, then the server's own words for
-    it.  An answer that named neither a code nor a message is left as it is
+    it.  An answer that named no code, no kind and no message is left as it is
     rather than followed by an empty phrase.
 
     Reads the event's own keys, so it runs on an event this module assembled.
@@ -1149,7 +1174,8 @@ def _log_attempt(event: dict, retry_delay: float | None) -> None:
         verdict = "failed, not retryable"
     line = f"{_describe_target(event)}: {verdict} — {_attempt_reason(event)}"
     if retry_delay is not None:
-        line = f"{line.rstrip('.')}. Retrying in {retry_delay} s"
+        reason = line[:-1] if line.endswith(".") else line
+        line = f"{reason}. Retrying in {retry_delay} s"
     log.warning("%s", line)
 
 
@@ -1167,12 +1193,11 @@ def _log_recovery(event: dict) -> None:
 
     Reads the event's own keys, so it runs on an event this module assembled.
     """
-    log.info(
-        "%s: recovered on attempt %s/%s",
-        _describe_target(event),
-        event["attempt"],
-        event["max_attempts"],
+    line = (
+        f"{_describe_target(event)}: recovered on attempt "
+        f"{event['attempt']}/{event['max_attempts']}"
     )
+    log.info("%s", line)
 
 
 def _stamp_response_error(event: dict, resp: object, token: object) -> str | None:
@@ -1214,9 +1239,8 @@ def _stamp_response_error(event: dict, resp: object, token: object) -> str | Non
                 event["error_type"],
                 event["error_message"],
             ) = _summarize_error(error, token)
-            if isinstance(error, dict):
-                raw_type = error.get("error_type")
-                kind = raw_type if type(raw_type) is str else None
+            raw_type = _raw_error_type(error)
+            kind = raw_type if type(raw_type) is str else None
     except Exception:
         pass
     return kind
@@ -1361,13 +1385,14 @@ def _record_exception(event: dict, exc: BaseException) -> None:
     human reading the task log, and it carries the server's own ``message``,
     which the server is free to quote a token back into, or — for a network
     failure — the environment's proxy URL, credentials included.  The event
-    describes the same failure through fields it builds itself: ``error_code``
-    and ``error_message`` from the refusal the body carries, ``response_body``
-    from a bounded slice of the answer with the token cut out, and the type alone
-    for a network failure, where there is no response at all.  The one outcome
-    whose text is safe by construction — a JSON document that would not parse —
-    fills ``exception_message`` from :func:`_decoder_position`, which is built
-    from the exception's own coordinates and quotes nothing.
+    describes the same failure through fields it builds itself: ``error_code``,
+    ``error_type`` and ``error_message`` from the refusal the body carries,
+    ``response_body`` from a bounded slice of the answer with the token cut out,
+    and the type alone for a network failure, where there is no response at all.
+    The one outcome whose text is safe by construction — a JSON document that
+    would not parse — fills ``exception_message`` from
+    :func:`_decoder_position`, which is built from the exception's own
+    coordinates and quotes nothing.
 
     The first type recorded is the one kept: an attempt that failed and then
     failed again while being described is told by the failure that started it.
@@ -2329,7 +2354,7 @@ class AdmetricaHook(BaseHook):
 
                         if _classify_payload(event, data):
                             _stamp_report_meta(event, data, token)
-                            recovered = event["attempt"] > 1
+                            recovered = attempt > 0
                             return data
 
                         # No list of rows was recognised, so there is no page to
@@ -2382,7 +2407,10 @@ class AdmetricaHook(BaseHook):
                         # would judge it, or the body says the request is sound
                         # and the moment was not.
                         by_status = status in _RETRY_STATUSES
-                        by_type = status == 400 and error_type in _RETRYABLE_ERROR_TYPES
+                        by_type = (
+                            status == _TYPED_REFUSAL_STATUS
+                            and error_type in _RETRYABLE_ERROR_TYPES
+                        )
                         if not (by_status or by_type):
                             event["outcome"] = "http_error"
                             raise _MaskedError(

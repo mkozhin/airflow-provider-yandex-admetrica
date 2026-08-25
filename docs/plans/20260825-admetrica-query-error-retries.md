@@ -153,31 +153,43 @@ API есть и другие значения — `invalid_token` в фикст�
 _BACKOFF_DELAYS      = [1, 2, 4]     # 429, 5xx, отказ сети
 _QUERY_ERROR_DELAYS  = [5, 15, 45]   # HTTP 400 с error_type query_error
 _AUTH_STATUSES       = frozenset({401, 403})
+_TYPED_REFUSAL_STATUS = 400          # статус, решение по которому читается из тела
 _RETRYABLE_ERROR_TYPES = frozenset({"query_error"})
 ```
 
 **Инвариант, который обязан быть под тестом:** обе лестницы одной длины.
-`max_attempts` считается как `len(_BACKOFF_DELAYS) + 1`, и лестница другой длины
-рассогласовала бы номер попытки с индексом ступени.
+`max_attempts` считается как `1 + min(len(_BACKOFF_DELAYS), len(_QUERY_ERROR_DELAYS))`
+— бюджет равен тому, на что хватает каждой лестницы модуля, — и лестница другой
+длины рассогласовала бы номер попытки с индексом ступени.
 
 **Порядок в ветке `else` у `_request_page`.** Тело читается до решения, а решение
 принимается по **возвращённому значению**, не по полю события. Это записанное
-правило шва (`CONTEXT.md:80–82`): «чтение события обратно сделало бы схему
-диагностики частью поведения выгрузки, и правка набора полей правила бы то, что
-провайдер делает». Поэтому `_stamp_response_error` возвращает тройку, которую
-проставил, и развилка читает её:
+правило шва (`CONTEXT.md`, `AdmetricaHook._request_page`): «чтение события
+обратно сделало бы схему диагностики частью поведения выгрузки, и правка набора
+полей правила бы то, что провайдер делает». `_stamp_response_error` возвращает род отказа —
+`error_type` таким, каким его написало тело, — а в событие кладёт копию,
+прошедшую шлюз маскирования: политика читается по слову API, поэтому усечение
+или вымарывание текста на выходе решение не двигает. Развилка читает
+возвращённое значение:
 
 ```python
 else:
-    _code, error_type, _message = _stamp_response_error(event, resp, token)
-    if resp.status_code == 400 and error_type in _RETRYABLE_ERROR_TYPES:
-        event["outcome"] = "retryable_error"
-        if last_attempt:
-            raise _MaskedError(...)
-        retry_delay = _QUERY_ERROR_DELAYS[attempt]
-    else:
+    error_type = _stamp_response_error(event, resp, token)
+    status = resp.status_code
+    # 401 и 403 — отдельная ветка выше: повтору там места нет
+    by_status = status in _RETRY_STATUSES
+    by_type = status == _TYPED_REFUSAL_STATUS and error_type in _RETRYABLE_ERROR_TYPES
+    if not (by_status or by_type):
         event["outcome"] = "http_error"
         raise _MaskedError(...)
+    event["outcome"] = "retryable_error"
+    if last_attempt:
+        raise _MaskedError(...)
+    if by_status:
+        asked = _retry_after(resp)          # заголовок сервера выигрывает у ступени
+        retry_delay = _BACKOFF_DELAYS[attempt] if asked is None else asked
+    else:
+        retry_delay = _QUERY_ERROR_DELAYS[attempt]
 ```
 
 **Строка лога.** Дробь `attempt N/M` осмысленна только там, где лестница
