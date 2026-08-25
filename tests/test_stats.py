@@ -19,6 +19,7 @@ from airflow_provider_yandex_admetrica.hooks.yandex_admetrica import (
     _MAX_METRICS,
     _MAX_PAGES,
     _MAX_ROWS,
+    _QUERY_ERROR_DELAYS,
     _RESERVED_PARAMS,
     _STAT_OFFSET_BASE,
     AdmetricaHook,
@@ -105,19 +106,38 @@ def _campaign(campaign_id: int) -> dict:
     }
 
 
-def _api(campaigns: list[dict], pages: list[dict]):
+def _refused() -> MagicMock:
+    """A 400 in the shape the reporting endpoint states a passing complaint in."""
+    message = "Query is too complicated. Please reduce the date interval or sampling."
+    body = {
+        "errors": [{"error_type": "query_error", "message": message}],
+        "code": 400,
+        "message": message,
+    }
+    resp = MagicMock()
+    resp.status_code = 400
+    resp.json.return_value = body
+    resp.content = json.dumps(body, ensure_ascii=False).encode()
+    resp.headers = {}
+    return resp
+
+
+def _api(campaigns: list[dict], pages: list[dict | MagicMock]):
     """A ``requests.get`` stand-in answering both endpoints.
 
     The campaign list is answered from *campaigns* however often it is asked
     for; every statistics request takes the next of *pages*, so a test spells
-    out the walk it expects and a request too many fails loudly.
+    out the walk it expects and a request too many fails loudly.  An entry that
+    is a response of its own goes out as it is, which is how a test hands the
+    walk an answer other than a well-formed page.
     """
     remaining = list(pages)
 
     def get(url, **kwargs):
         if url == _ENDPOINT_URLS["campaigns"]:
             return _response({"campaigns": campaigns, "total": len(campaigns)})
-        return _response(remaining.pop(0))
+        answer = remaining.pop(0)
+        return answer if isinstance(answer, MagicMock) else _response(answer)
 
     return get
 
@@ -497,6 +517,34 @@ class TestPagination:
         ]
         _, mock_get = _collect(_hook(limit=2), [_campaign(1), _campaign(2)], pages)
         assert [p["offset"] for p in _stat_params(mock_get)] == [1, 3, 1, 3]
+
+
+# ---------------------------------------------------------------------------
+# A refusal the moment caused
+# ---------------------------------------------------------------------------
+
+
+class TestOneCampaignRefused:
+    def test_a_campaign_refused_once_is_asked_again_and_the_day_comes_back_whole(self):
+        """The repeat lives inside one request, so the day costs a pause, not a rerun."""
+        rows = [_row(_placement("A", 1), {"name": "mobile"})]
+        pages = [_page(rows, total=1), _refused(), _page(rows, total=1)]
+        campaigns = [_campaign(1), _campaign(2)]
+        with patch("time.sleep") as sleep:
+            records, mock_get = _collect(_hook(), campaigns, pages)
+        assert [r["campaign_id"] for r in records] == [1, 2]
+        assert [p["ids"] for p in _stat_params(mock_get)] == [1, 2, 2]
+        assert [call.args[0] for call in sleep.call_args_list] == [_QUERY_ERROR_DELAYS[0]]
+
+    def test_a_campaign_refused_to_the_end_fails_the_day(self):
+        """Four refusals in a row are the answer the day cannot be made out of."""
+        pages = [_refused() for _ in range(len(_QUERY_ERROR_DELAYS) + 1)]
+        with patch("time.sleep"):
+            with patch("requests.get", side_effect=_api([_campaign(1)], pages)) as mock_get:
+                with pytest.raises(AirflowException, match="returned 400"):
+                    _hook().get_stats(DATE, DIMENSIONS, METRICS)
+        assert len(_stat_params(mock_get)) == len(_QUERY_ERROR_DELAYS) + 1
+
 
 
 # ---------------------------------------------------------------------------
