@@ -215,6 +215,12 @@ _REQUEST_TIMEOUT = 30
 #: the request never reached the logic that would refuse it on its merits.
 _RETRY_STATUSES = frozenset({429, *range(500, 600)})
 
+#: Statuses that name the token rather than the request.  Both say the same
+#: thing about a long-lived credential nothing here refreshes — the API answers
+#: a token it will not accept with either of them — so both end the attempt
+#: where it stands.
+_AUTH_STATUSES = frozenset({401, 403})
+
 #: The pause before each repeat of a rate limit, a server-side failure or a
 #: request the network did not carry, in seconds.  The length of the ladder is
 #: also the number of repeats, so a request gets one attempt plus one rung per
@@ -2124,9 +2130,10 @@ class AdmetricaHook(BaseHook):
         ``error_type`` listed in :data:`_RETRYABLE_ERROR_TYPES` is repeated too,
         along the minute-wide :data:`_QUERY_ERROR_DELAYS`: such a refusal says
         the request is sound and the moment was not, so the repeat waits out the
-        window instead of the seconds a rate limit is answered in.  A 401 fails
-        at once: the token is long-lived and nothing here refreshes it, so the
-        attempt after it would be refused the same way.  Every other 4xx fails
+        window instead of the seconds a rate limit is answered in.  A status in
+        :data:`_AUTH_STATUSES` fails at once: the token is long-lived and
+        nothing here refreshes it, so the attempt after it would be refused the
+        same way.  Every other 4xx fails
         at once as well, with the server's words for it read out of the body —
         the request itself is what is being refused, and a repeat brings back
         the same answer.
@@ -2253,12 +2260,12 @@ class AdmetricaHook(BaseHook):
                             )
                         )
 
-                    elif resp.status_code == 401:
+                    elif resp.status_code in _AUTH_STATUSES:
                         event["outcome"] = "auth_error"
                         _stamp_response_error(event, resp, token)
                         raise _MaskedError(
                             _with_error(
-                                f"AdMetrica {endpoint} returned 401 Unauthorized: the OAuth "
+                                f"AdMetrica {endpoint} returned {resp.status_code}: the OAuth "
                                 f"token in connection {self.admetrica_conn_id!r} was refused, "
                                 f"and nothing here refreshes it",
                                 event,

@@ -14,6 +14,7 @@ from airflow.exceptions import AirflowException, AirflowTaskTimeout
 from airflow.models import Connection
 
 from airflow_provider_yandex_admetrica.hooks.yandex_admetrica import (
+    _AUTH_STATUSES,
     _BACKOFF_DELAYS,
     _ENDPOINT_URLS,
     _OUTCOME_UNKNOWN,
@@ -358,16 +359,33 @@ class TestRetryAfter:
 
 
 class TestRefusals:
-    def test_a_401_fails_at_once(self):
+    @pytest.mark.parametrize("status", sorted(_AUTH_STATUSES))
+    def test_a_refused_token_fails_at_once(self, status):
         hook = _hook()
-        with patch("requests.get", return_value=_response(401)) as get:
+        with patch("requests.get", return_value=_response(status)) as get:
             with patch("time.sleep") as sleep:
-                with pytest.raises(AirflowException, match="401 Unauthorized") as excinfo:
+                with pytest.raises(AirflowException) as excinfo:
                     _call(hook)
         assert get.call_count == 1
         sleep.assert_not_called()
+        assert f"returned {status}" in str(excinfo.value)
         assert "nothing here refreshes it" in str(excinfo.value)
         assert "'admetrica'" in str(excinfo.value)
+
+    @pytest.mark.parametrize("status", sorted(_AUTH_STATUSES))
+    def test_a_refused_token_is_told_apart_from_a_refused_request(self, status):
+        sink = _Sink()
+        hook = _hook(loki=sink)
+        body = {"errors": [{"error_type": "invalid_token", "message": "token is invalid"}]}
+        with patch("requests.get", return_value=_response(status, body)) as get:
+            with pytest.raises(AirflowException) as excinfo:
+                _call(hook)
+        assert get.call_count == 1
+        (event,) = sink.pushed
+        assert event["outcome"] == "auth_error"
+        assert event["http_status"] == status
+        assert event["error_type"] == "invalid_token"
+        assert "token is invalid" in str(excinfo.value)
 
     def test_a_400_fails_at_once_and_carries_the_servers_words(self):
         hook = _hook()
@@ -379,7 +397,7 @@ class TestRefusals:
         assert "returned 400" in str(excinfo.value)
         assert "code 400: dimension am:e:nope is unknown" in str(excinfo.value)
 
-    @pytest.mark.parametrize("status", [403, 404, 409, 422])
+    @pytest.mark.parametrize("status", [404, 409, 422])
     def test_every_other_4xx_fails_at_once_too(self, status):
         hook = _hook()
         with patch("requests.get", return_value=_response(status)) as get:
