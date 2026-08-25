@@ -41,7 +41,7 @@ class _MaskedError(AirflowException):
 
 #: Version of the diagnostic event's field set.  A reader of a stored event
 #: knows by this number which fields it may expect.
-_SCHEMA_VERSION = 1
+_SCHEMA_VERSION = 2
 
 #: Host every request goes to.
 _API_HOST = "https://api.media.metrika.yandex.net"
@@ -787,6 +787,7 @@ def _new_event(
         "contains_sensitive_data": None,
         "data_lag": None,
         "error_code": None,
+        "error_type": None,
         "error_message": None,
         "exception_type": None,
         "exception_message": None,
@@ -888,7 +889,7 @@ def _find_error(data: object) -> object | None:
     * ``{"error": {…}}`` — a refusal under a key of its own.
     * ``{"errors": [{…}, …]}`` — the plural spelling the Yandex API family
       writes; the first element is the one described, since the event carries
-      one code and one message.
+      one refusal.
     * ``{"code": …, "message": …}`` — the pair written at the top level.  Both
       parts are required and ``code`` has to say something, so an answer that
       merely carries a ``message`` stays an answer rather than a refusal.
@@ -921,48 +922,64 @@ def _find_error(data: object) -> object | None:
         return None
 
 
-def _summarize_error(error: object, token: object) -> tuple[int | None, str | None]:
-    """Allowlist extractor for a refusal: only ``code``/``message``, bounded.
+def _summarize_error(error: object, token: object) -> tuple[int | None, str | None, str | None]:
+    """Allowlist extractor for a refusal: ``code``, ``error_type``, ``message``.
 
     Values of an unexpected type are described by their type rather than
-    serialized, at both levels — a non-dict error and a non-str ``message`` —
-    so the pair stays a short, queryable summary of the failure whatever the
-    server put there, and a dashboard can group by it.  A code is copied only at
-    exactly ``int``, which leaves a code spelled as text unread rather than
-    guessed at.  Defensive against odd values: it must not itself raise and mask
-    the real ``AirflowException``.
+    serialized, at every level — a non-dict error, a non-str ``error_type``, a
+    non-str ``message`` — so the triple stays a short, queryable summary of the
+    failure whatever the server put there, and a dashboard can group by it.  A
+    code is copied only at exactly ``int``, which leaves a code spelled as text
+    unread rather than guessed at.  Defensive against odd values: it must not
+    itself raise and mask the real ``AirflowException``.
 
-    The message passes :func:`_safe_text`, so it reaches the event flattened
-    onto one line, bounded, and with the token cut out: a server or a proxy is
-    free to quote the ``Authorization`` header back inside a JSON ``message``,
-    and this pair words both the event's fields and the line the attempt logs.
-    A message that survives none of that is reported as no message.
+    ``error_type`` is the API's own name for the kind of refusal, and it is the
+    part a repeat is decided by where the status alone does not settle the
+    question, so it is read at exactly ``str``.
+
+    The type and the message pass :func:`_safe_text`, so they reach the event
+    flattened onto one line, bounded, and with the token cut out: a server or a
+    proxy is free to quote the ``Authorization`` header back inside a JSON
+    ``message``, and this triple words both the event's fields and the line the
+    attempt logs.  Text that survives none of that is reported as no text.
     """
     if not isinstance(error, dict):
-        return None, f"<non-dict error: {type(error).__name__}>"
+        return None, None, f"<non-dict error: {type(error).__name__}>"
     raw_code = error.get("code")
     code = raw_code if type(raw_code) is int else None  # `type(...) is int` excludes bool
+    raw_type = error.get("error_type")
+    if raw_type is None:
+        error_type = None
+    elif type(raw_type) is not str:
+        error_type = f"<non-str error_type: {type(raw_type).__name__}>"
+    else:
+        error_type = _safe_text(raw_type, token)
     message = error.get("message")
     if message is None:
-        return code, None
+        return code, error_type, None
     if type(message) is not str:
-        return code, f"<non-str message: {type(message).__name__}>"
-    return code, _safe_text(message, token)
+        return code, error_type, f"<non-str message: {type(message).__name__}>"
+    return code, error_type, _safe_text(message, token)
 
 
-def _describe_error(code: int | None, message: str | None) -> str:
-    """Read a refusal out of its two parsed parts, for a human.
+def _describe_error(code: int | None, error_type: str | None, message: str | None) -> str:
+    """Read a refusal out of its three parsed parts, for a human.
 
     The composition is the same wherever the refusal is told — the line an
     attempt logs and the text of the exception that ends the request: the code
-    first, the server's own message after it.  Either part may be missing, and
-    the phrase then holds what there is.  The code is spelled bare, because the
-    API documents no codes and nothing here branches on the value: the policy
-    for a refusal is decided by the HTTP status alone.  ``message`` arrives
-    already bounded and masked by :func:`_summarize_error`.
+    first, the API's own name for the kind of refusal after it, the server's own
+    message last.  Any part may be missing, and the phrase then holds what there
+    is.  The code is spelled bare, because the API documents no codes and
+    nothing here branches on the value; ``error_type`` is spelled as the server
+    wrote it, and it is the part the policy for a 400 is read from, so a reader
+    comparing a repeated refusal with a final one sees in the line the very word
+    the branch weighed.  ``error_type`` and ``message`` arrive already bounded
+    and masked by :func:`_summarize_error`.
     """
-    head = f"code {code}" if code is not None else None
-    if head is not None and message:
+    head = ", ".join(
+        part for part in (f"code {code}" if code is not None else None, error_type) if part
+    )
+    if head and message:
         return f"{head}: {message}"
     return head or message or "no code and no message"
 
@@ -978,9 +995,10 @@ def _with_error(message: str, event: dict) -> str:
 
     Reads the event's own keys, so it runs on an event this module assembled.
     """
-    code, error_message = event["error_code"], event["error_message"]
-    if code is not None or error_message:
-        return f"{message}: {_describe_error(code, error_message)}"
+    code, error_type = event["error_code"], event["error_type"]
+    error_message = event["error_message"]
+    if code is not None or error_type or error_message:
+        return f"{message}: {_describe_error(code, error_type, error_message)}"
     return message
 
 
@@ -1036,9 +1054,10 @@ def _attempt_reason(event: dict) -> str:
     status = event["http_status"]
     parts = [f"HTTP {status}" if status is not None else "no response"]
     outcome = event["outcome"]
-    code, message = event["error_code"], event["error_message"]
-    if code is not None or message:
-        parts.append(_describe_error(code, message))
+    code, error_type = event["error_code"], event["error_type"]
+    message = event["error_message"]
+    if code is not None or error_type or message:
+        parts.append(_describe_error(code, error_type, message))
     if outcome in ("empty_shape", "unexpected_error") and event["payload_kind"] is not None:
         parts.append(_describe_unreadable_body(event))
     elif outcome == "invalid_json":
@@ -1069,17 +1088,24 @@ def _log_attempt(event: dict, retry_delay: float | None) -> None:
     log.warning("%s", line)
 
 
-def _stamp_response_error(event: dict, resp: object, token: object) -> None:
-    """Copy the refusal a non-200 answer carries onto *event*.
+def _stamp_response_error(
+    event: dict, resp: object, token: object
+) -> tuple[int | None, str | None, str | None]:
+    """Copy the refusal a non-200 answer carries onto *event*, and return it.
 
     The body goes through the same :func:`_find_error` and
     :func:`_summarize_error` as an HTTP-200 one, so the exception, the line the
-    attempt logs and the event's ``error_code``/``error_message`` tell one
-    failure in one set of terms: a dashboard grouping by ``error_code`` sees the
-    refusals that came with a status as well as the ones that came inside a 200.
-    An answer that names no error this way — HTML from a proxy, an empty answer,
-    a ``json()`` that raises — leaves the pair as it found it and is described by
-    its status alone.
+    attempt logs and the event's ``error_code``/``error_type``/``error_message``
+    tell one failure in one set of terms: a dashboard grouping by ``error_type``
+    sees the refusals that came with a status as well as the ones that came
+    inside a 200.  An answer that names no error this way — HTML from a proxy,
+    an empty answer, a ``json()`` that raises — leaves the three fields as it
+    found them and is described by its status alone.
+
+    The triple is returned as well as stamped, so that a branch choosing what to
+    do about the refusal reads the parsed value rather than the event: what the
+    provider does stays independent of which fields the diagnostic schema
+    happens to carry.
 
     Parsing the whole document is what ``resp.json()`` costs, and it is the same
     cost the HTTP-200 branch pays: what :func:`_bounded_body` bounds is the copy
@@ -1089,12 +1115,19 @@ def _stamp_response_error(event: dict, resp: object, token: object) -> None:
     a body that refuses to be read must leave both the type of that exception
     and the reason for it exactly as they are.
     """
+    code: int | None = None
+    error_type: str | None = None
+    message: str | None = None
     try:
         error = _find_error(resp.json())
         if error is not None:
-            event["error_code"], event["error_message"] = _summarize_error(error, token)
+            code, error_type, message = _summarize_error(error, token)
+            event["error_code"] = code
+            event["error_type"] = error_type
+            event["error_message"] = message
     except Exception:
         pass
+    return code, error_type, message
 
 
 def _meta_value(value: object, token: object) -> object:
@@ -2188,9 +2221,11 @@ class AdmetricaHook(BaseHook):
                         # campaign that had no impressions.
                         error = _find_error(data)
                         if error is not None:
-                            event["error_code"], event["error_message"] = _summarize_error(
-                                error, token
-                            )
+                            (
+                                event["error_code"],
+                                event["error_type"],
+                                event["error_message"],
+                            ) = _summarize_error(error, token)
                         raise _MaskedError(
                             _with_error(
                                 f"AdMetrica {endpoint} returned HTTP 200 with "

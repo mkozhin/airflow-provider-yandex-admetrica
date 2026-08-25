@@ -604,6 +604,7 @@ EVENT_KEYS = frozenset(
         "contains_sensitive_data",
         "data_lag",
         "error_code",
+        "error_type",
         "error_message",
         "exception_type",
         "exception_message",
@@ -800,6 +801,16 @@ class TestNewEvent:
     def test_the_schema_version_is_stamped(self):
         assert _event()["schema_version"] == _SCHEMA_VERSION
 
+    def test_the_field_set_is_the_second_one(self):
+        """Spelled out, not read from the module.
+
+        The number is what a reader of a stored event resolves its field set
+        by, so a change to it is a change to the contract with that reader and
+        has to be made deliberately rather than travel along with an edit to
+        the schema.
+        """
+        assert _event()["schema_version"] == 2
+
     @pytest.mark.parametrize("endpoint", ["stat", "campaigns"])
     def test_the_url_follows_the_endpoint(self, endpoint):
         event = _new_event(
@@ -958,63 +969,139 @@ class TestFindError:
 
 class TestSummarizeError:
     def test_the_code_and_the_message_are_taken(self):
-        assert _summarize_error({"code": 403, "message": "Forbidden"}, TOKEN) == (403, "Forbidden")
+        assert _summarize_error({"code": 403, "message": "Forbidden"}, TOKEN) == (
+            403,
+            None,
+            "Forbidden",
+        )
 
     def test_a_reflected_token_leaves_the_message_masked(self):
         error = {"code": 401, "message": f"Invalid credentials: {_TOKEN_SCHEME} {TOKEN}"}
 
-        code, message = _summarize_error(error, TOKEN)
+        code, error_type, message = _summarize_error(error, TOKEN)
 
-        assert code == 401
+        assert (code, error_type) == (401, None)
         assert TOKEN not in message
         assert _TOKEN_REDACTED in message
 
     def test_a_message_the_token_survives_does_not_travel(self):
         error = {"code": 401, "message": " ".join(TOKEN)}
 
-        assert _summarize_error(error, TOKEN) == (401, None)
+        assert _summarize_error(error, TOKEN) == (401, None, None)
 
     def test_a_message_is_flattened_and_bounded(self):
-        code, message = _summarize_error({"message": "a\n\nb" + "x" * _TEXT_LIMIT}, TOKEN)
+        code, error_type, message = _summarize_error(
+            {"message": "a\n\nb" + "x" * _TEXT_LIMIT}, TOKEN
+        )
 
-        assert code is None
+        assert (code, error_type) == (None, None)
         assert len(message) == _TEXT_LIMIT
         assert message.startswith("a b")
 
     def test_a_code_spelled_as_text_is_left_unread(self):
-        assert _summarize_error({"code": "403", "message": "no"}, TOKEN) == (None, "no")
+        assert _summarize_error({"code": "403", "message": "no"}, TOKEN) == (None, None, "no")
 
     def test_a_flag_is_not_a_code(self):
-        assert _summarize_error({"code": True, "message": "no"}, TOKEN) == (None, "no")
+        assert _summarize_error({"code": True, "message": "no"}, TOKEN) == (None, None, "no")
 
     def test_an_error_that_is_not_a_dict_is_named_by_its_type(self):
-        assert _summarize_error("Forbidden", TOKEN) == (None, "<non-dict error: str>")
+        assert _summarize_error("Forbidden", TOKEN) == (None, None, "<non-dict error: str>")
 
     def test_a_message_that_is_not_text_is_named_by_its_type(self):
         assert _summarize_error({"code": 1, "message": {"ru": "no"}}, TOKEN) == (
             1,
+            None,
             "<non-str message: dict>",
         )
 
     def test_an_error_without_a_message(self):
-        assert _summarize_error({"code": 500}, TOKEN) == (500, None)
+        assert _summarize_error({"code": 500}, TOKEN) == (500, None, None)
 
     def test_a_message_that_says_nothing_is_no_message(self):
-        assert _summarize_error({"code": 500, "message": "  \n "}, TOKEN) == (500, None)
+        assert _summarize_error({"code": 500, "message": "  \n "}, TOKEN) == (500, None, None)
+
+
+    def test_the_refusal_this_api_really_sends_is_read_as_a_type(self):
+        """The body a refused report answers with, copied from the wire.
+
+        The code sits at the top level of the document while ``_find_error``
+        describes ``errors[0]``, so ``error_code`` stays empty and the type is
+        the only name the refusal has.
+        """
+        error = _find_error(
+            {
+                "errors": [
+                    {
+                        "error_type": "query_error",
+                        "message": "Query is too complicated. Please reduce the date "
+                        "interval or sampling.",
+                    }
+                ],
+                "code": 400,
+                "message": "Query is too complicated. Please reduce the date interval "
+                "or sampling.",
+            }
+        )
+
+        code, error_type, message = _summarize_error(error, TOKEN)
+
+        assert (code, error_type) == (None, "query_error")
+        assert message.startswith("Query is too complicated")
+
+    def test_a_type_that_is_not_text_is_named_by_its_type(self):
+        assert _summarize_error({"error_type": {"ru": "no"}, "message": "no"}, TOKEN) == (
+            None,
+            "<non-str error_type: dict>",
+            "no",
+        )
+
+    def test_a_refusal_without_a_type_leaves_it_empty(self):
+        assert _summarize_error({"code": 403, "message": "Forbidden"}, TOKEN) == (
+            403,
+            None,
+            "Forbidden",
+        )
+
+    def test_a_reflected_token_leaves_the_type_masked(self):
+        error = {"error_type": f"{_TOKEN_SCHEME} {TOKEN}", "message": "no"}
+
+        code, error_type, message = _summarize_error(error, TOKEN)
+
+        assert TOKEN not in error_type
+        assert _TOKEN_REDACTED in error_type
+
+    def test_a_type_the_token_survives_does_not_travel(self):
+        error = {"error_type": " ".join(TOKEN), "message": "no"}
+
+        assert _summarize_error(error, TOKEN) == (None, None, "no")
 
 
 class TestDescribeError:
     def test_both_parts(self):
-        assert _describe_error(403, "Forbidden") == "code 403: Forbidden"
+        assert _describe_error(403, None, "Forbidden") == "code 403: Forbidden"
 
     def test_a_code_alone(self):
-        assert _describe_error(403, None) == "code 403"
+        assert _describe_error(403, None, None) == "code 403"
 
     def test_a_message_alone(self):
-        assert _describe_error(None, "Forbidden") == "Forbidden"
+        assert _describe_error(None, None, "Forbidden") == "Forbidden"
 
     def test_neither(self):
-        assert _describe_error(None, None) == "no code and no message"
+        assert _describe_error(None, None, None) == "no code and no message"
+
+
+    def test_the_type_stands_between_the_code_and_the_message(self):
+        assert _describe_error(403, "invalid_token", "Forbidden") == (
+            "code 403, invalid_token: Forbidden"
+        )
+
+    def test_a_type_alone_carries_the_phrase(self):
+        assert _describe_error(None, "query_error", None) == "query_error"
+
+    def test_a_type_and_a_message_without_a_code(self):
+        assert _describe_error(None, "query_error", "too complicated") == (
+            "query_error: too complicated"
+        )
 
 
 class TestDescribeUnreadableBody:
@@ -1036,9 +1123,25 @@ class TestStampResponseError:
     def test_a_refusal_reaches_the_event(self):
         event = _event()
 
-        _stamp_response_error(event, _Answer({"error": {"code": 403, "message": "no"}}), TOKEN)
+        stamped = _stamp_response_error(
+            event, _Answer({"error": {"code": 403, "message": "no"}}), TOKEN
+        )
 
-        assert (event["error_code"], event["error_message"]) == (403, "no")
+        assert (event["error_code"], event["error_type"], event["error_message"]) == (
+            403,
+            None,
+            "no",
+        )
+        assert stamped == (403, None, "no")
+
+    def test_the_type_reaches_the_event_and_comes_back(self):
+        event = _event()
+        body = {"errors": [{"error_type": "query_error", "message": "too complicated"}]}
+
+        stamped = _stamp_response_error(event, _Answer(body), TOKEN)
+
+        assert stamped == (None, "query_error", "too complicated")
+        assert event["error_type"] == "query_error"
 
     def test_a_reflected_token_reaches_the_event_masked(self):
         event = _event()
