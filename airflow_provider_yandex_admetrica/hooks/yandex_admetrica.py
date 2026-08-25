@@ -222,6 +222,18 @@ _RETRY_STATUSES = frozenset({429, *range(500, 600)})
 #: minutes, and what a task spends on retries stays small.
 _BACKOFF_DELAYS = [1, 2, 4]
 
+#: The pause before each repeat of a refusal the API states in the body of a
+#: 400, in seconds.  The span of the ladder is a minute because the condition
+#: behind such a refusal drifts on the scale of minutes: a request refused now
+#: is answered once the window it fell into has passed.
+_QUERY_ERROR_DELAYS = [5, 15, 45]
+
+#: The values of ``error_type`` a repeat can fix.  The check is membership of
+#: this set rather than the status alone: a 400 carries every complaint the API
+#: has about a request, and only the one named here says the request is sound
+#: and the moment was not.
+_RETRYABLE_ERROR_TYPES = frozenset({"query_error"})
+
 #: The header a server names its own wait in, and the longest such wait this
 #: provider honours.  The header outranks the ladder — a server that says when
 #: to come back knows its window better than a rung chosen in advance — but only

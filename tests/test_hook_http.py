@@ -17,6 +17,7 @@ from airflow_provider_yandex_admetrica.hooks.yandex_admetrica import (
     _BACKOFF_DELAYS,
     _ENDPOINT_URLS,
     _OUTCOME_UNKNOWN,
+    _QUERY_ERROR_DELAYS,
     _REQUEST_TIMEOUT,
     _RETRY_AFTER_HEADER,
     _RETRY_AFTER_MAX,
@@ -151,6 +152,12 @@ class TestSuccessfulAnswer:
 # ---------------------------------------------------------------------------
 # Answers a repeat can fix
 # ---------------------------------------------------------------------------
+
+
+class TestTheLadders:
+    def test_both_ladders_are_of_one_length(self):
+        """The attempt number is counted off one ladder and indexes either."""
+        assert len(_QUERY_ERROR_DELAYS) == len(_BACKOFF_DELAYS)
 
 
 class TestRetries:

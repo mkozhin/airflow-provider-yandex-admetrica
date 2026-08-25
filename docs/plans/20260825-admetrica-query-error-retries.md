@@ -242,10 +242,10 @@ AdMetrica stat campaign_id=75098 date=2026-08-23 offset=1: recovered on attempt 
 - Modify: `airflow_provider_yandex_admetrica/hooks/yandex_admetrica.py`
 - Modify: `tests/test_hook_http.py`
 
-- [ ] добавить `_QUERY_ERROR_DELAYS = [5, 15, 45]` рядом с `_BACKOFF_DELAYS` (`:223`). Комментарий формулируется положительно — «размах лестницы минутный, потому что отказ дрейфует на масштабе минут», — а не через то, чего не умеет соседняя константа
-- [ ] добавить `_RETRYABLE_ERROR_TYPES = frozenset({"query_error"})`
-- [ ] тест: `len(_QUERY_ERROR_DELAYS) == len(_BACKOFF_DELAYS)` — номер попытки считается по длине одной из них, и рассогласование сломало бы индексацию ступеней
-- [ ] прогнать тесты — зелено перед шагом 3
+- [x] добавить `_QUERY_ERROR_DELAYS = [5, 15, 45]` рядом с `_BACKOFF_DELAYS` (`:223`). Комментарий формулируется положительно — «размах лестницы минутный, потому что отказ дрейфует на масштабе минут», — а не через то, чего не умеет соседняя константа
+- [x] добавить `_RETRYABLE_ERROR_TYPES = frozenset({"query_error"})`
+- [x] тест: `len(_QUERY_ERROR_DELAYS) == len(_BACKOFF_DELAYS)` — номер попытки считается по длине одной из них, и рассогласование сломало бы индексацию ступеней
+- [x] прогнать тесты — зелено перед шагом 3
 
 ### Task 3: Повторять HTTP 400 с `query_error`
 
