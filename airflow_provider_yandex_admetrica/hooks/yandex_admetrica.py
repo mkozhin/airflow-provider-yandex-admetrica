@@ -215,11 +215,12 @@ _REQUEST_TIMEOUT = 30
 #: the request never reached the logic that would refuse it on its merits.
 _RETRY_STATUSES = frozenset({429, *range(500, 600)})
 
-#: The pause before each repeat, in seconds.  The length of the ladder is also
-#: the number of repeats, so a request gets one attempt plus one rung per pause.
-#: AdMetrica publishes no quota, so the ladder is short and conservative: a
-#: refusal the server means to last is answered within seconds rather than
-#: minutes, and what a task spends on retries stays small.
+#: The pause before each repeat of a rate limit, a server-side failure or a
+#: request the network did not carry, in seconds.  The length of the ladder is
+#: also the number of repeats, so a request gets one attempt plus one rung per
+#: pause.  AdMetrica publishes no quota, so the ladder is short and
+#: conservative: a refusal the server means to last is answered within seconds
+#: rather than minutes, and what a task spends on retries stays small.
 _BACKOFF_DELAYS = [1, 2, 4]
 
 #: The pause before each repeat of a refusal the API states in the body of a
@@ -1308,8 +1309,9 @@ def _event_level(event: dict) -> str:
     advertiser's campaigns, and the caveats a successful answer can carry —
     sampling, rows the API withheld — travel as fields of their own and as
     warnings in the task log.  A refusal the provider repeats — a rate limit, a
-    server-side failure, a network that did not carry the request — is a warning
-    while an attempt is left and a failure on the last one.  A refusal to
+    server-side failure, a 400 the API states a retryable ``error_type`` in, a
+    network that did not carry the request — is a warning while an attempt is
+    left and a failure on the last one.  A refusal to
     authorize is an error at first sight: the token is long-lived and nothing
     here refreshes it, so the attempt after it would be refused the same way.
 
@@ -2118,11 +2120,16 @@ class AdmetricaHook(BaseHook):
 
         A 429 or a 5xx and a request the network did not carry are repeated
         along :data:`_BACKOFF_DELAYS`, and the wait is the server's own
-        ``Retry-After`` wherever it named one.  A 401 fails at once: the token is
-        long-lived and nothing here refreshes it, so the attempt after it would
-        be refused the same way.  A 400 or any other 4xx fails at once too, with
-        the server's words for it read out of the body — the request itself is
-        what is being refused, and a repeat brings back the same answer.
+        ``Retry-After`` wherever it named one.  A 400 whose body names an
+        ``error_type`` listed in :data:`_RETRYABLE_ERROR_TYPES` is repeated too,
+        along the minute-wide :data:`_QUERY_ERROR_DELAYS`: such a refusal says
+        the request is sound and the moment was not, so the repeat waits out the
+        window instead of the seconds a rate limit is answered in.  A 401 fails
+        at once: the token is long-lived and nothing here refreshes it, so the
+        attempt after it would be refused the same way.  Every other 4xx fails
+        at once as well, with the server's words for it read out of the body —
+        the request itself is what is being refused, and a repeat brings back
+        the same answer.
 
         An HTTP-200 body is asked one question: is the rows value the list of
         objects it promises.  Only a body that answers yes — the empty list of a
@@ -2201,10 +2208,10 @@ class AdmetricaHook(BaseHook):
                     _stamp_duration(event, started)
                     event["http_status"] = resp.status_code
 
-                    # One chain, not a run of separate `if`s: the retryable
-                    # branch has a path that neither returns nor raises — it
-                    # names a pause and leaves for `time.sleep` at the foot of
-                    # the loop.
+                    # One chain, not a run of separate `if`s: a refusal a
+                    # repeat can fix has a path that neither returns nor raises
+                    # — it names a pause and leaves for `time.sleep` at the foot
+                    # of the loop.
                     if resp.status_code == 200:
                         try:
                             data = resp.json()
@@ -2281,14 +2288,38 @@ class AdmetricaHook(BaseHook):
                         )
 
                     else:
-                        event["outcome"] = "http_error"
-                        _stamp_response_error(event, resp, token)
-                        raise _MaskedError(
-                            _with_error(
-                                f"AdMetrica {endpoint} returned {resp.status_code} for {url}",
-                                event,
+                        # The body is read before the outcome is chosen: a 400
+                        # states what it objects to in `error_type`, and that
+                        # word decides the policy along with the status.  The
+                        # branch reads the value `_stamp_response_error`
+                        # returns rather than the event it stamped, so what the
+                        # provider does stays independent of which fields the
+                        # diagnostic schema carries.
+                        _, error_type, _ = _stamp_response_error(event, resp, token)
+                        if (
+                            resp.status_code == 400
+                            and error_type in _RETRYABLE_ERROR_TYPES
+                        ):
+                            event["outcome"] = "retryable_error"
+                            if last_attempt:
+                                raise _MaskedError(
+                                    _with_error(
+                                        f"AdMetrica {endpoint} returned {resp.status_code} "
+                                        f"for {url} on attempt {max_attempts} of "
+                                        f"{max_attempts}",
+                                        event,
+                                    )
+                                )
+                            retry_delay = _QUERY_ERROR_DELAYS[attempt]
+                        else:
+                            event["outcome"] = "http_error"
+                            raise _MaskedError(
+                                _with_error(
+                                    f"AdMetrica {endpoint} returned {resp.status_code} "
+                                    f"for {url}",
+                                    event,
+                                )
                             )
-                        )
             except BaseException as e:
                 # Safety net: record what escaped, then decide how it leaves.
                 # `BaseException` so that an interrupted attempt is classified
@@ -2343,8 +2374,10 @@ class AdmetricaHook(BaseHook):
                             type(diag_error).__name__,
                         )
 
-            # Reached only where an attempt named a pause: a non-final retryable
-            # status, or a request the network did not carry with attempts left.
+            # Reached only where an attempt named a pause: a non-final refusal
+            # a repeat can fix — a retryable status or a 400 the API states a
+            # retryable `error_type` in — or a request the network did not carry
+            # with attempts left.
             # The event is already pushed, so a Loki outage never delays its
             # visibility.
             time.sleep(retry_delay)

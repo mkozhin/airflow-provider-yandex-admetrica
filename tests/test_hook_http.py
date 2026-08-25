@@ -87,6 +87,23 @@ def _ok(rows: list | None = None, **extra) -> MagicMock:
     return _response(200, {"data": rows if rows is not None else [], **extra})
 
 
+#: The words the reporting endpoint refuses a request it could not answer in
+#: time with; the ``error_type`` is what the provider reads the policy off.
+QUERY_ERROR_MESSAGE = "Query is too complicated. Please reduce the date interval or sampling."
+
+
+def _refused(error_type: str, message: str = QUERY_ERROR_MESSAGE) -> MagicMock:
+    """A 400 in the shape the API states its complaints in."""
+    return _response(
+        400,
+        {
+            "errors": [{"error_type": error_type, "message": message}],
+            "code": 400,
+            "message": message,
+        },
+    )
+
+
 def _delays(mock_sleep: MagicMock) -> list:
     """The delay each ``time.sleep`` call was given, in order."""
     return [call.args[0] for call in mock_sleep.call_args_list]
@@ -213,6 +230,66 @@ class TestRetries:
         assert TOKEN not in str(excinfo.value)
         assert _TOKEN_REDACTED in str(excinfo.value)
         assert TOKEN not in "\n".join(_lines(caplog))
+
+
+class TestARefusalTheMomentCaused:
+    def test_a_query_error_walks_its_own_ladder_to_the_end(self):
+        hook = _hook()
+        with patch("requests.get", return_value=_refused("query_error")) as get:
+            with patch("time.sleep") as sleep:
+                with pytest.raises(AirflowException, match="returned 400") as excinfo:
+                    _call(hook)
+        assert get.call_count == len(_QUERY_ERROR_DELAYS) + 1
+        assert _delays(sleep) == _QUERY_ERROR_DELAYS == [5, 15, 45]
+        assert "on attempt 4 of 4" in str(excinfo.value)
+        assert QUERY_ERROR_MESSAGE in str(excinfo.value)
+
+    def test_a_query_error_gives_way_to_the_page_that_follows_it(self):
+        hook = _hook()
+        with patch("requests.get", side_effect=[_refused("query_error"), _ok()]) as get:
+            with patch("time.sleep") as sleep:
+                assert _call(hook) == {"data": []}
+        assert get.call_count == 2
+        assert _delays(sleep) == [_QUERY_ERROR_DELAYS[0]]
+
+    def test_a_400_of_any_other_type_fails_at_once(self):
+        hook = _hook()
+        with patch("requests.get", return_value=_refused("invalid_parameter")) as get:
+            with patch("time.sleep") as sleep:
+                with pytest.raises(AirflowException, match="returned 400"):
+                    _call(hook)
+        assert get.call_count == 1
+        sleep.assert_not_called()
+
+    def test_a_400_naming_no_type_at_all_fails_at_once(self):
+        hook = _hook()
+        with patch("requests.get", return_value=_response(400, {"nothing": "readable"})) as get:
+            with patch("time.sleep") as sleep:
+                with pytest.raises(AirflowException, match="returned 400"):
+                    _call(hook)
+        assert get.call_count == 1
+        sleep.assert_not_called()
+
+    def test_the_dashboard_tells_it_from_a_5xx_by_status_and_type(self):
+        sink = _Sink()
+        hook = _hook(loki=sink)
+        with patch("requests.get", side_effect=[_refused("query_error"), _ok()]):
+            with patch("time.sleep"):
+                _call(hook)
+        refused = sink.pushed[0]
+        assert refused["outcome"] == "retryable_error"
+        assert refused["http_status"] == 400
+        assert refused["error_type"] == "query_error"
+        assert refused["error_code"] is None
+
+    def test_a_repeat_still_to_come_is_a_warning_and_the_last_one_an_error(self):
+        sink = _Sink()
+        hook = _hook(loki=sink)
+        with patch("requests.get", return_value=_refused("query_error")):
+            with patch("time.sleep"):
+                with pytest.raises(AirflowException):
+                    _call(hook)
+        assert [event["level"] for event in sink.pushed] == ["warn", "warn", "warn", "error"]
 
 
 # ---------------------------------------------------------------------------
