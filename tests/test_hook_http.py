@@ -263,6 +263,15 @@ class TestARefusalTheMomentCaused:
         assert get.call_count == 2
         assert _delays(sleep) == [_QUERY_ERROR_DELAYS[0]]
 
+    def test_a_header_on_a_query_error_is_left_unread(self):
+        """A window the server keeps is not the ladder an endpoint running long asks for."""
+        refused = _refused("query_error")
+        refused.headers = {_RETRY_AFTER_HEADER: "1"}
+        with patch("requests.get", side_effect=[refused, _ok()]):
+            with patch("time.sleep") as sleep:
+                assert _call(_hook()) == {"data": []}
+        assert _delays(sleep) == [_QUERY_ERROR_DELAYS[0]]
+
     def test_a_400_of_any_other_type_fails_at_once(self):
         hook = _hook()
         with patch("requests.get", return_value=_refused("invalid_parameter")) as get:
@@ -723,6 +732,22 @@ class TestTheLineSayingTheRepeatWorked:
                 with patch(target, side_effect=RuntimeError("no words")):
                     assert _call(hook) == {"data": []}
 
+    def test_a_line_that_cannot_be_worded_still_leaves_the_event_behind(self):
+        """The event carries the attempt in fields, so it outlives the wording."""
+        sink = _Sink()
+        hook = _hook(loki=sink)
+        target = (
+            "airflow_provider_yandex_admetrica.hooks.yandex_admetrica._log_recovery"
+        )
+        with patch("requests.get", side_effect=[_response(503), _ok()]):
+            with patch("time.sleep"):
+                with patch(target, side_effect=RuntimeError("no words")):
+                    assert _call(hook) == {"data": []}
+        assert [event["outcome"] for event in sink.pushed] == [
+            "retryable_error",
+            "success",
+        ]
+
     def test_a_page_that_came_back_at_once_says_nothing(self, caplog):
         hook = _hook()
         with caplog.at_level(logging.DEBUG, logger=_HOOK_LOGGER):
@@ -841,6 +866,20 @@ class TestDiagnostics:
         with patch("requests.get", return_value=_ok()):
             _call(hook)
         assert sink.pushed == []
+
+    def test_an_attempt_line_that_cannot_be_worded_still_pushes_its_event(self):
+        """Wording the chronicle and pushing the event stand under separate nets."""
+        sink = _Sink()
+        hook = _hook(loki=sink)
+        target = (
+            "airflow_provider_yandex_admetrica.hooks.yandex_admetrica._log_attempt"
+        )
+        with patch("requests.get", return_value=_response(503)):
+            with patch("time.sleep"):
+                with patch(target, side_effect=RuntimeError("no words")):
+                    with pytest.raises(AirflowException):
+                        _call(hook)
+        assert len(sink.pushed) == len(_BACKOFF_DELAYS) + 1
 
     def test_a_sink_that_raises_never_reaches_the_caller(self):
         sink = _Sink()

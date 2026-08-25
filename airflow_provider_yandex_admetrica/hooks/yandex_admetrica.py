@@ -2234,7 +2234,9 @@ class AdmetricaHook(BaseHook):
         token masked, and — for anything :func:`_event_level` rates above
         ``info`` — the raw body, bounded and with the token cut out.  Emission
         never affects control flow: it lives in ``finally`` and every failure of
-        its own is swallowed there.
+        its own is swallowed there.  The push goes ahead of the task-log line
+        and under a net of its own, so an event still reaches the sink where
+        wording the line is the thing that failed.
         """
         url = _ENDPOINT_URLS[endpoint]
         token = self._get_token()
@@ -2444,6 +2446,23 @@ class AdmetricaHook(BaseHook):
                 # the attempt a stop cut short goes unreported, deliberately —
                 # the reason for it is in the Airflow task log.
                 if not interrupted:
+                    # Two halves under two nets of their own, and the push goes
+                    # first: the event carries the whole attempt in fields, so
+                    # it is what a reader wants most exactly when wording the
+                    # line is what failed, and neither half can cost the other.
+                    if self._loki is not None:
+                        try:
+                            _emit_event(self._loki, event, resp, token)
+                        except Exception as diag_error:
+                            # Defense in depth: a raise here would replace the
+                            # exception in flight, so reading the body and
+                            # pushing what it says are covered.  The type, not
+                            # the text: an unexpected failure can carry the
+                            # environment's proxy URL, credentials included.
+                            log.debug(
+                                "Pushing the event raised %s; the event is dropped",
+                                type(diag_error).__name__,
+                            )
                     try:
                         if event["outcome"] != "success":
                             # The task log gets the chronicle of the page: one
@@ -2456,17 +2475,12 @@ class AdmetricaHook(BaseHook):
                             # the caller, and the line saying so closes the run
                             # of WARNINGs above it.
                             _log_recovery(event)
-                        if self._loki is not None:
-                            _emit_event(self._loki, event, resp, token)
                     except Exception as diag_error:
-                        # Defense in depth: a raise here would replace the
-                        # exception in flight, so everything reporting does —
-                        # reading the body and wording the line included — is
-                        # covered.  The type, not the text: an unexpected
-                        # failure can carry the environment's proxy URL,
-                        # credentials included.
+                        # Covered for the same reason, and named apart from the
+                        # push so the DEBUG line says which half of reporting
+                        # went missing.
                         log.debug(
-                            "Diagnostics raised %s; the event is dropped",
+                            "Wording the task-log line raised %s; the line is dropped",
                             type(diag_error).__name__,
                         )
 
@@ -3006,6 +3020,13 @@ class AdmetricaHook(BaseHook):
         not a reason to fail a day that is probably whole.  The walk under a
         rounded total ends only on a short page, which is the API's own word
         that the rows have run out.
+
+        Rounding is one reading of such a difference, and a report that lost
+        rows between two pages is another: the pages of a walk are separated by
+        whatever the requests carrying them waited out, and a repeat along
+        :data:`_QUERY_ERROR_DELAYS` is the longest of those waits.  The warning
+        names both readings, so a shortfall far past any plausible rounding is
+        taken for what it is by whoever finds it.
         """
         if collected == total:
             return
@@ -3016,7 +3037,10 @@ class AdmetricaHook(BaseHook):
         if rounded:
             log.warning(
                 "%s. total_rows_rounded is set, so the declared number is an "
-                "approximation and the collected rows are the ones written.",
+                "approximation and the collected rows are the ones written. A "
+                "report that lost rows between pages reads the same way from "
+                "here, so a difference far past a rounding is worth taking as "
+                "that one.",
                 summary,
             )
             return

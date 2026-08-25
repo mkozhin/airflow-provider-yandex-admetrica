@@ -656,6 +656,16 @@ class TestCompleteness:
         assert len(records) == 1
         assert any("total_rows_rounded" in r.getMessage() for r in caplog.records)
 
+    def test_the_warning_names_the_other_reading_of_a_shortfall(self, caplog):
+        """Rounding explains a small difference; a lost page explains any of them."""
+        rows = [_row(_placement("A", 1), {"name": "mobile"})]
+        with caplog.at_level(logging.WARNING, logger=_HOOK_LOGGER):
+            _collect(_hook(), [_campaign(1)], [_page(rows, total=5, rounded=True)])
+        (message,) = [
+            r.getMessage() for r in caplog.records if "total_rows_rounded" in r.getMessage()
+        ]
+        assert "lost rows between pages" in message
+
     def test_an_answer_without_a_readable_total_fails_the_day(self):
         """Rows nothing can be checked against are rows nothing may trust."""
         rows = [_row(_placement("A", 1), {"name": "mobile"})]
