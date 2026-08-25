@@ -119,6 +119,15 @@ def _lines(caplog) -> list[str]:
     ]
 
 
+def _info_lines(caplog) -> list[str]:
+    """The lines a page that came back on a repeat left in the task log, in order."""
+    return [
+        record.getMessage()
+        for record in caplog.records
+        if record.name == _HOOK_LOGGER and record.levelno == logging.INFO
+    ]
+
+
 def _call(hook: AdmetricaHook, endpoint: str = "stat", params: dict | None = None) -> dict:
     fields = STAT_FIELDS if endpoint == "stat" else {"advertiser_id": 17004, "offset": 0}
     return hook._request_page(
@@ -165,6 +174,7 @@ class TestSuccessfulAnswer:
             with patch("requests.get", return_value=_ok()):
                 _call(hook)
         assert _lines(caplog) == []
+        assert _info_lines(caplog) == []
 
 
 # ---------------------------------------------------------------------------
@@ -592,6 +602,48 @@ class TestAttemptLines:
         }
         reason = _attempt_reason(event)
         assert reason == "HTTP 200, invalid JSON (Expecting value: line 1 column 1 (char 0))"
+
+
+class TestTheLineSayingTheRepeatWorked:
+    def test_a_page_that_came_back_on_a_repeat_names_the_attempt(self, caplog):
+        hook = _hook()
+        with caplog.at_level(logging.DEBUG, logger=_HOOK_LOGGER):
+            with patch("requests.get", side_effect=[_response(503), _ok()]):
+                with patch("time.sleep"):
+                    _call(hook)
+        assert len(_lines(caplog)) == 1
+        (line,) = _info_lines(caplog)
+        assert line == (
+            "AdMetrica stat campaign_id=123456 date=2026-08-20 offset=1: "
+            "recovered on attempt 2/4"
+        )
+
+    def test_a_repeated_refusal_the_moment_caused_is_recovered_from_too(self, caplog):
+        hook = _hook()
+        answers = [_refused("query_error"), _refused("query_error"), _ok()]
+        with caplog.at_level(logging.DEBUG, logger=_HOOK_LOGGER):
+            with patch("requests.get", side_effect=answers):
+                with patch("time.sleep"):
+                    _call(hook)
+        (line,) = _info_lines(caplog)
+        assert line.endswith("recovered on attempt 3/4")
+
+    def test_a_page_that_came_back_at_once_says_nothing(self, caplog):
+        hook = _hook()
+        with caplog.at_level(logging.DEBUG, logger=_HOOK_LOGGER):
+            with patch("requests.get", return_value=_ok()):
+                _call(hook)
+        assert _info_lines(caplog) == []
+
+    def test_a_request_that_never_came_back_says_nothing_either(self, caplog):
+        hook = _hook()
+        with caplog.at_level(logging.DEBUG, logger=_HOOK_LOGGER):
+            with patch("requests.get", return_value=_response(503)):
+                with patch("time.sleep"):
+                    with pytest.raises(AirflowException):
+                        _call(hook)
+        assert _info_lines(caplog) == []
+        assert len(_lines(caplog)) == len(_BACKOFF_DELAYS) + 1
 
 
 # ---------------------------------------------------------------------------

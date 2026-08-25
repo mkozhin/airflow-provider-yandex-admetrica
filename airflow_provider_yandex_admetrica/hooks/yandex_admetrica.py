@@ -1114,6 +1114,28 @@ def _log_attempt(event: dict, retry_delay: float | None) -> None:
     log.warning("%s", line)
 
 
+def _log_recovery(event: dict) -> None:
+    """Write the task-log line naming the attempt a repeated request came back on.
+
+    Written only where a repeat did the work: an attempt past the first that
+    brought a page back closes a run of WARNING lines whose end would otherwise
+    have to be inferred from the silence after it.  A page that arrived on the
+    first attempt says nothing at all, so a healthy export reads exactly as it
+    did before any refusal was worth repeating.
+
+    INFO, and the fraction it carries is the same one the lines above it count
+    off, so the whole run of a page reads as one chronicle at one prefix.
+
+    Reads the event's own keys, so it runs on an event this module assembled.
+    """
+    log.info(
+        "%s: recovered on attempt %s/%s",
+        _describe_target(event),
+        event["attempt"],
+        event["max_attempts"],
+    )
+
+
 def _stamp_response_error(
     event: dict, resp: object, token: object
 ) -> tuple[int | None, str | None, str | None]:
@@ -2152,9 +2174,12 @@ class AdmetricaHook(BaseHook):
         that describes it, so a zero the provider could not read is never handed
         on as a zero the API reported.
 
-        Every attempt that did not bring a page back leaves one line in the task
-        log, the last one included, so that a minute of waiting reads as a
-        chronicle rather than as a silence.  The line carries parsed fields only.
+        Every attempt that did not bring a page back leaves one WARNING line in
+        the task log, the last one included, so that a minute of waiting reads
+        as a chronicle rather than as a silence, and a page that arrived on a
+        repeat adds one INFO line naming the attempt it came back on, so the
+        run has an end as well as a beginning.  A page that arrived on the
+        first attempt says nothing at all.  The lines carry parsed fields only.
 
         Every attempt emits exactly one diagnostic event when a sink is
         configured: how the attempt went, the request as it went out with the
@@ -2374,6 +2399,10 @@ class AdmetricaHook(BaseHook):
                             # whether a pause follows it or the exception in
                             # flight ends the export.
                             _log_attempt(event, retry_delay)
+                        elif event["attempt"] > 1:
+                            # The page arrived on a repeat, and the line saying
+                            # so closes the run of WARNINGs above it.
+                            _log_recovery(event)
                         if self._loki is not None:
                             _emit_event(self._loki, event, resp, token)
                     except Exception as diag_error:
