@@ -80,7 +80,7 @@ The operator writes JSONL files and returns a `list[dict]`, one entry per file w
 
 `advertiser_id` travels with every entry because the tasks downstream build the S3 key and the table name from it and have nowhere else to read it: the advertiser is named in the connection, which only the hook opens.
 
-**Plan for a long task.** A day is one request per campaign, plus one page more for every full page a campaign fills, plus the walk over the campaign list. An advertiser with 70 campaigns therefore costs about 70 requests for a day of ordinary volume, each spaced by `request_delay` and bounded by a 30 s timeout. A storm of retries adds up to 7 s of backoff to any one of them when the ladder decides the wait — but a server that sends `Retry-After` names the wait itself, and each of the three rungs then costs up to 300 s, so one request can hold the task for 15 minutes. Size `execution_timeout` for the number of days a run exports — the example DAG allows two hours.
+**Plan for a long task.** A day is one request per campaign, plus one page more for every full page a campaign fills, plus the walk over the campaign list. An advertiser with 70 campaigns therefore costs about 70 requests for a day of ordinary volume, each spaced by `request_delay` and bounded by a 30 s timeout. A storm of retries adds up to 7 s of backoff to any one of them when the ladder decides the wait — but a server that sends `Retry-After` names the wait itself, and each of the three rungs then costs up to 300 s, so one request can hold the task for 15 minutes. A 400 the API words as `query_error` walks a ladder of its own: 65 s of pauses plus three more requests, each bounded by the same 30 s timeout and empirically about 10 s where it runs into the deadline, so such a request holds the task for about 155 s. Size `execution_timeout` for the number of days a run exports — the example DAG allows two hours.
 
 ### Operator parameters
 
@@ -92,7 +92,7 @@ The operator writes JSONL files and returns a `list[dict]`, one entry per file w
 | `metrics` | — | Metrics, e.g. `["am:e:renders", "am:e:clicks"]`. Required. At most 20 |
 | `filters` | `None` | A filter expression passed to the API as `filters`. Left out of the request when unset |
 | `accuracy` | `"full"` | Sampling accuracy. `"full"` asks for the whole selection, which is what keeps the numbers from drifting between runs; pass another value to trade accuracy for speed |
-| `include_undefined` | `True` | Keeps the rows whose first grouping is undefined. With it off the API drops them and the sum no longer agrees with `totals` |
+| `include_undefined` | `True` | Keeps the rows whose first grouping is undefined. With it off the API drops them and the sum no longer agrees with `totals`. `None` leaves the parameter out of the request, so whatever the API defaults to decides |
 | `limit` | `10000` | Rows per page of statistics. The API allows up to 100 000 |
 | `request_delay` | `0.2` | Seconds of quiet between two requests. AdMetrica publishes neither a quota nor a rate, so this is a conservative pace to raise or lower once a real advertiser has been measured |
 | `timezone` | `None` | Passed to the API as `timezone`. Left out of the request when unset |
@@ -250,8 +250,9 @@ Bringing history to the new shape is a manual operation — re-export the period
 |---|---|
 | 429, and any 5xx | Retried along a 1 / 2 / 4 s backoff, four attempts to a request. A `Retry-After` header outranks the ladder in both of its spellings — seconds and an HTTP date — capped at 300 s; a longer wait would hold a task slot for the whole of it, and failing the day costs less than that |
 | A request the network did not carry | Retried on the same ladder |
-| 401 | Raises at once. The token is long-lived and nothing here refreshes it, so the attempt after it would be refused the same way |
-| 400 and any other 4xx | Raises at once, with the server's own words for it read out of the body. The request itself is what is being refused, and a repeat brings back the same answer |
+| 401 or 403 | Raises at once. The token is long-lived and nothing here refreshes it, so the attempt after it would be refused the same way. Either status says the same thing about a credential the API will not accept |
+| 400 whose body names `error_type: query_error` | Retried along a 5 / 15 / 45 s backoff of its own, four attempts to a request. The request is sound and the moment was not, and the ladder spans a minute because the condition behind such a refusal drifts on that scale |
+| 400 with any other `error_type`, and any other 4xx | Raises at once, with the server's own words for it read out of the body. The request itself is what is being refused, and a repeat brings back the same answer |
 | An HTTP 200 no rows could be read out of | Raises, naming what the body held instead. **A zero is never green when it came from a failure** — only a well-formed answer, the empty one included, is handed on |
 | A row carrying another number of grouping or metric values than were asked for | `AirflowException` naming the campaign, the day and both counts: position is all that ties a value to its name, and such a row counts towards `total_rows` like a whole one |
 | Rows collected disagree with an exact `total_rows` | `AirflowException` |
@@ -269,22 +270,23 @@ Bringing history to the new shape is a manual operation — re-export the period
 
 A single request is given 30 s before it counts as one the network did not carry.
 
-**Every unsuccessful attempt leaves one line in the task log**, the last one included, so a minute of waiting reads as a chronicle rather than as a silence. The one exception is an attempt the task itself was stopped in — a `BaseException` that is not an `Exception`, such as an execution timeout or a SIGTERM: it writes no line and pushes no event, deliberately, because the reason for it is already in the Airflow task log and a push would hold the stop for its own length.
+**Every unsuccessful attempt leaves one line in the task log**, the last one included, so a minute of waiting reads as a chronicle rather than as a silence. A page that came back on an attempt past the first adds one INFO line naming that attempt — `recovered on attempt 3/4` — so a run of warnings carries its own ending; a page that arrived on the first attempt says nothing at all, and a healthy export leaves the log as it was. The one exception is an attempt the task itself was stopped in — a `BaseException` that is not an `Exception`, such as an execution timeout or a SIGTERM: it writes no line and pushes no event, deliberately, because the reason for it is already in the Airflow task log and a push would hold the stop for its own length.
 
 ```
 AdMetrica stat campaign_id=123456 date=2026-08-20 offset=1: attempt 1/4 failed — HTTP 429. Retrying in 1 s
 AdMetrica stat campaign_id=123456 date=2026-08-20 offset=1: attempt 2/4 failed — HTTP 502. Retrying in 2 s
 AdMetrica stat campaign_id=123456 date=2026-08-20 offset=1: attempt 3/4 failed — no response, ConnectionError. Retrying in 4 s
 AdMetrica stat campaign_id=123456 date=2026-08-20 offset=1: attempt 4/4 failed — HTTP 500, code 42: internal error
-AdMetrica campaigns offset=0: attempt 1/4 failed — HTTP 200, no readable rows (payload_kind=rows_absent)
+AdMetrica campaigns offset=0: failed, not retryable — HTTP 200, no readable rows (payload_kind=rows_absent)
 ```
 
-`Retrying in N s` appears only where a pause really follows, which is how the final attempt reads as final. The line carries parsed fields only — the HTTP status, the refusal the body named, the label saying what stood in place of rows, the position a JSON document broke at, the type of a network failure — so one attempt stays one line whatever the server wrote. The raw answer belongs to the other channel: it travels in the diagnostic event, if one is configured, never in the task log.
+`Retrying in N s` appears only where a pause really follows, which is how the final attempt reads as final. A refusal no ladder applies to reads `failed, not retryable` in place of the fraction, because a fraction there would promise attempts the request will never be given. The line carries parsed fields only — the HTTP status, the refusal the body named, the label saying what stood in place of rows, the position a JSON document broke at, the type of a network failure — so one attempt stays one line whatever the server wrote. The raw answer belongs to the other channel: it travels in the diagnostic event, if one is configured, never in the task log.
 
 ### What the API does not document
 
 - **Quotas and request rate.** The documentation names neither, which is why `request_delay` defaults to a conservative 0.2 s and is a parameter rather than a constant.
 - **The shape of an error.** The specification describes the answer to a successful request and nothing else. The provider looks for a refusal in three shapes — `{"error": {…}}`, `{"errors": [{…}]}` and a top-level `{"code": …, "message": …}` — and reports the code and the message it finds; `error_code` therefore stays empty for an answer worded some other way.
+- **What a `query_error` really objects to.** The 400 worded `Query is too complicated. Please reduce the date interval or sampling.` is transient rather than a verdict on the request: one campaign answered the same day with the same parameters in 641 ms and ran into the refusal eleven minutes later, and every variant of that request — fewer groupings, fewer metrics, another `accuracy` — was answered too. What decides the outcome is how long the endpoint takes at that moment, and the refusal arrives at around ten seconds. That is why this one refusal is repeated and its wording is not taken at face value.
 - **Whether `Retry-After` is ever sent.** It is honoured wherever it arrives and the backoff ladder stands in when it does not.
 - **The values `accuracy` accepts.** `"full"` is the default here because the alternative is numbers that drift between runs; the documentation lists no vocabulary to check it against.
 - **The fields inside a grouping's value.** Only `name` is guaranteed, and the single example in the specification is empty. That is exactly why the value travels as the object it arrived as.
@@ -358,7 +360,7 @@ Because that label is the same for every task, all tasks write into one stream. 
 
 | Field | Description |
 |---|---|
-| `schema_version` | Event format version, currently `1` |
+| `schema_version` | Event format version, currently `2` |
 | `dag_id`, `task_id`, `dag_run_id`, `try_number`, `map_index` | Correlation with the Airflow task instance (`map_index` is `-1` when not mapped). These five are stamped by the Loki client at push time; the other fields come from the request itself |
 | `outcome` | How the attempt ended — see the table below |
 | `level` | Severity of the attempt: `info`, `warn` or `error` — see [Severity](#severity-level) below |
@@ -367,7 +369,7 @@ Because that label is the same for every task, all tasks write into one stream. 
 | `advertiser_id` | The advertiser the connection names |
 | `campaign_id`, `date` | The campaign and the day the request was scoped to. Empty for a request to the campaign list, which is scoped to neither |
 | `offset` | The page being asked for. It counts rows already skipped on the campaign list, starting at 0, and rows themselves on the statistics endpoint, starting at 1 — that is the API's own numbering, and a walk starting at 0 there would ask for the first row twice |
-| `attempt`, `max_attempts` | Retry counters for one request: `attempt` counts from 1 up to `max_attempts` as 429s, 5xx answers and network failures are retried out of one budget |
+| `attempt`, `max_attempts` | Retry counters for one request: `attempt` counts from 1 up to `max_attempts` as 429s, 5xx answers, network failures and a 400 the API names `query_error` are retried out of one budget |
 | `request_method`, `request_url` | `"GET"` and the endpoint's address |
 | `request_headers` | The headers the provider sets — `Authorization` (masked, see below) and `Accept` |
 | `request_params` | The query as it went out: `ids`, `date1`, `date2`, `metrics`, `dimensions`, `limit`, `offset`, `sort` and the rest. Bounded parameter by parameter: at most 24 of them are described, a name at 40 characters and a text value at 300, each cut marked with `…`. A query carrying more than 24 parameters gets a `<params truncated>` key saying how many were left out. A name is a way out of the process like any other, so it passes the same masking gate as a value, and two names the bound reduces to the same text are told apart by the position of the parameter |
@@ -380,7 +382,7 @@ Because that label is the same for every task, all tasks write into one stream. 
 | `sampled`, `sample_share`, `sample_size`, `sample_space` | What the report said about sampling |
 | `contains_sensitive_data` | Whether the API withheld part of the rows |
 | `data_lag` | How far behind the data is, as the report declared it |
-| `error_code`, `error_message` | `code` and `message` of the refusal the answer carried, in whichever of the three shapes it came: `{"error": {…}}`, `{"errors": [{…}]}` or a top-level `{"code": …, "message": …}`. The message is flattened onto one line, bounded to 300 characters and passed through the same masking gate as everything else that leaves the process. Filled for an HTTP 200 whose rows could not be read and for any non-200 whose body names an error |
+| `error_code`, `error_type`, `error_message` | `code`, `error_type` and `message` of the refusal the answer carried, in whichever of the three shapes it came: `{"error": {…}}`, `{"errors": [{…}]}` or a top-level `{"code": …, "message": …}`. `error_type` is the API's own name for the kind of refusal — `query_error`, `invalid_token` — and it is read from the refusal object itself, which is where this API states it; `error_code` stays empty for such an answer, because the `code` sits at the top level of the body rather than inside the refusal, and the refusal is what is described. The type and the message are flattened onto one line, bounded to 300 characters and passed through the same masking gate as everything else that leaves the process. Filled for an HTTP 200 whose rows could not be read and for any non-200 whose body names an error |
 | `exception_type`, `exception_message` | Type of the exception that ended the attempt; the message is filled only for a JSON parse error reported by the standard decoder, from a fixed vocabulary |
 | `rate_limit_limit`, `rate_limit_remaining` | `X-RateLimit-*` headers, collected on HTTP 429. AdMetrica documents no headers of the kind, so these are the conventional spellings read in case the API sends them. A header value is text the server wrote, so it passes the same masking point as everything else leaving the process |
 | `response_body` | Raw response text, bounded and with the live token cut out — see [Raw response body](#raw-response-body) below |
@@ -408,8 +410,8 @@ The key set of an event is constant: a field the attempt never determined is pre
 |---|---|
 | `success` | HTTP 200 with a well-formed answer, including an empty one — "this campaign had no impressions on this day" is a valid answer |
 | `empty_shape` | HTTP 200 in which no list of row objects was recognised — the attempt raises, whatever `payload_kind` says about it |
-| `auth_error` | HTTP 401 — raises at once, since nothing here refreshes the token |
-| `retryable_error` | HTTP 429 or any 5xx — retried along the backoff ladder, or, on the last attempt, raised. A `Retry-After` the answer named is honoured in place of the ladder's rung, capped at 300 s |
+| `auth_error` | HTTP 401 or 403 — raises at once, since nothing here refreshes the token |
+| `retryable_error` | HTTP 429, any 5xx, or a 400 whose body names `error_type: query_error` — retried and, on the last attempt, raised. 429 and 5xx walk the 1 / 2 / 4 s ladder, and a `Retry-After` the answer named is honoured in place of its rung, capped at 300 s; the repeatable 400 walks a 5 / 15 / 45 s ladder of its own. The outcome names the policy, and `http_status` with `error_type` name the fact, which is how a dashboard tells the two apart |
 | `http_error` | Any other non-200 status — raises at once |
 | `network_error` | The request never completed (timeout, DNS, TLS, proxy) — retried like a 5xx |
 | `invalid_json` | HTTP 200 whose body could not be parsed |
@@ -455,15 +457,15 @@ The raw response body leaves the process whenever the answer was not intelligibl
 
 - **A body without recognised rows is not a body without sensitive content.** A response can carry socio-demographic breakdowns, internal identifiers or secrets inside an error object while holding no list of rows at all — and that body ships whole.
 - **Known edge:** an anomalous outcome alongside recognised rows ships a body containing the report itself.
-- **The token guarantee covers every channel.** The OAuth token is masked in `request_headers`, cut out of `response_body`, and cut out of `error_message` and of the text of every exception this module raises — a server or a proxy is free to quote the `Authorization` header back inside a JSON `message`, and a structured description of an error is as much a way out as a raw body. Text the token survives — an answer that spells it out with something standing between its characters, as UTF-16 read as UTF-8 does — is dropped whole rather than shipped: the value outranks the diagnostic. A failure of an unforeseen kind — one neither this module nor the network layer worded — leaves the request path reworded the same way: its type names it and its text passes the same gate. The guarantee covers the task log too, whose lines are built from the same masked fields, and the traceback printed with a failure: an exception this module raises carries no original exception along as its cause or context, because an attached exception prints its own unmasked words underneath.
-- **The structured fields are a structure, not a boundary.** `error_code`/`error_message` and `exception_message` are narrow, queryable summaries; they describe the failure, they do not bound what the event discloses, because the body travels alongside.
+- **The token guarantee covers every channel.** The OAuth token is masked in `request_headers`, cut out of `response_body`, and cut out of `error_type`, `error_message` and the text of every exception this module raises — a server or a proxy is free to quote the `Authorization` header back inside a JSON `message`, and a structured description of an error is as much a way out as a raw body. Text the token survives — an answer that spells it out with something standing between its characters, as UTF-16 read as UTF-8 does — is dropped whole rather than shipped: the value outranks the diagnostic. A failure of an unforeseen kind — one neither this module nor the network layer worded — leaves the request path reworded the same way: its type names it and its text passes the same gate. The guarantee covers the task log too, whose lines are built from the same masked fields, and the traceback printed with a failure: an exception this module raises carries no original exception along as its cause or context, because an attached exception prints its own unmasked words underneath.
+- **The structured fields are a structure, not a boundary.** `error_code`/`error_type`/`error_message` and `exception_message` are narrow, queryable summaries; they describe the failure, they do not bound what the event discloses, because the body travels alongside.
 - **There is no setting that keeps diagnostics on and bodies out.** The level table decides what travels; the only way to stop bodies from leaving is to leave `loki_conn_id` unset, which turns the whole feature off.
 - Response headers other than the two `X-RateLimit-*` are not copied.
 - Retention and access follow Loki: bodies live as long as the instance keeps them, and everyone holding the shared Loki credentials can read them.
 
 How the structured fields are built:
 
-- From a refusal only `code` (a value whose type is exactly `int`) and `message` (a value whose type is exactly `str`, flattened onto one line, masked and truncated to 300 characters) are taken. A value of an unexpected type is described by its type — `<non-dict error: list>`, `<non-str message: dict>` — rather than serialised, so nested keys such as `details` or `trace` are never summarised into the event.
+- From a refusal only `code` (a value whose type is exactly `int`), `error_type` (a value whose type is exactly `str`, masked and truncated the same way as the message) and `message` (a value whose type is exactly `str`, flattened onto one line, masked and truncated to 300 characters) are taken. A value of an unexpected type is described by its type — `<non-dict error: list>`, `<non-str error_type: int>`, `<non-str message: dict>` — rather than serialised, so nested keys such as `details` or `trace` are never summarised into the event.
 - `exception_message` is filled only for `invalid_json`, and only when the standard JSON decoder reported the failure. It is rebuilt from the exception's own attributes rather than from its rendered text, and the wording is chosen from a fixed vocabulary of the decoder's own literals — `Expecting value`, `Expecting ',' delimiter`, `Expecting ':' delimiter`, `Expecting property name enclosed in double quotes`, `Extra data`, `Unterminated string starting at`, `Invalid control character at`, `Invalid \escape`, `Invalid \uXXXX escape` — followed by the position counted in the document: `Expecting value: line 1 column 1 (char 0)`. Anything the decoder words differently is reported as `<other decoder message>` with the same position, because some decoder messages are formatted around a character taken from the document. A parse failure of any other origin records `exception_type` alone, as does every other outcome.
 - Of the response headers, only the two `X-RateLimit-*` are copied, and only when their type is exactly `str`, truncated to 32 characters. A value of any other type is described by its type (`<non-str header: int>`), so no unknown object is ever rendered into the event.
 - Truncation bounds length, not content.
