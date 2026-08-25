@@ -2446,23 +2446,13 @@ class AdmetricaHook(BaseHook):
                 # the attempt a stop cut short goes unreported, deliberately —
                 # the reason for it is in the Airflow task log.
                 if not interrupted:
-                    # Two halves under two nets of their own, and the push goes
-                    # first: the event carries the whole attempt in fields, so
-                    # it is what a reader wants most exactly when wording the
-                    # line is what failed, and neither half can cost the other.
-                    if self._loki is not None:
-                        try:
-                            _emit_event(self._loki, event, resp, token)
-                        except Exception as diag_error:
-                            # Defense in depth: a raise here would replace the
-                            # exception in flight, so reading the body and
-                            # pushing what it says are covered.  The type, not
-                            # the text: an unexpected failure can carry the
-                            # environment's proxy URL, credentials included.
-                            log.debug(
-                                "Pushing the event raised %s; the event is dropped",
-                                type(diag_error).__name__,
-                            )
+                    # Two halves under two nets of their own, so neither can
+                    # cost the other, and the line goes first.  The push is the
+                    # half a stop can travel out of: `LokiClient.push` lets an
+                    # alarm or a signal through by design, and a stop arriving
+                    # in the middle of one leaves the `finally` with it.  The
+                    # line is written before that can happen, so the attempt is
+                    # in the task log whatever the moment brings next.
                     try:
                         if event["outcome"] != "success":
                             # The task log gets the chronicle of the page: one
@@ -2476,13 +2466,26 @@ class AdmetricaHook(BaseHook):
                             # of WARNINGs above it.
                             _log_recovery(event)
                     except Exception as diag_error:
-                        # Covered for the same reason, and named apart from the
-                        # push so the DEBUG line says which half of reporting
-                        # went missing.
+                        # Defense in depth: a raise here would replace the
+                        # exception in flight, so wording the line is covered.
+                        # The type, not the text: an unexpected failure can
+                        # carry the environment's proxy URL, credentials
+                        # included.
                         log.debug(
                             "Wording the task-log line raised %s; the line is dropped",
                             type(diag_error).__name__,
                         )
+                    if self._loki is not None:
+                        try:
+                            _emit_event(self._loki, event, resp, token)
+                        except Exception as diag_error:
+                            # Covered for the same reason, and named apart from
+                            # the line so the DEBUG says which half of reporting
+                            # went missing.
+                            log.debug(
+                                "Pushing the event raised %s; the event is dropped",
+                                type(diag_error).__name__,
+                            )
 
             # Reached only where an attempt named a pause: a non-final refusal
             # a repeat can fix — a retryable status or a 400 the API states a
@@ -2874,10 +2877,16 @@ class AdmetricaHook(BaseHook):
         whose ``total_rows_rounded`` is not a boolean, and — while the totals
         are exact — one naming a different total than an earlier page all fail
         the day.  Each is a completeness signal the day would otherwise be
-        called whole without, and a rounded total is exempt from the last only
-        because approximations are free to differ.  The rounding flag is
-        remembered once seen, so a later page declaring an exact total cannot
-        re-arm a check the answer has already disowned.
+        called whole without.  The rounding flag is remembered once seen, so a
+        later page declaring an exact total cannot re-arm a check the answer has
+        already disowned.
+
+        Under a rounded total a changed total is a WARNING instead: an
+        approximation may differ from an exact count, so the day is not failed
+        on one, but the same report rounds to the same number at every offset,
+        and a number that changes says the report moved under the walk.  That
+        tells a short day caused by rows going missing between two requests
+        apart from one caused by the rounding, which the rows themselves cannot.
 
         Rows are checked against each other by the identity of their groupings,
         and the set of what has been seen lives here — one campaign, one set.
@@ -2900,6 +2909,7 @@ class AdmetricaHook(BaseHook):
         seen: set[tuple] = set()
         total: int | None = None
         rounded = False
+        moved = False
         offset = _STAT_OFFSET_BASE
         budget = _page_budget(self.limit, _MAX_ROWS)
 
@@ -2952,6 +2962,34 @@ class AdmetricaHook(BaseHook):
                     f"under the walk is one neither answer can be trusted from. The "
                     f"day stops here rather than being checked against a number the "
                     f"API has already replaced."
+                )
+            elif declared != total and not moved:
+                # A rounded total under the walk, and a different one than the
+                # page before.  An approximation is free to differ from an exact
+                # count, which is why it is not failed on, but it is not free to
+                # differ from itself: for a report standing still `total_rows`
+                # is a function of that report and rounds to the same number at
+                # every offset, so a number that changes is the report moving —
+                # rows arriving or going missing between two requests.  That is
+                # the one reading of a short day the rows themselves cannot
+                # carry, and it is said here, where it is still discriminating,
+                # rather than left for a reader of the final count to guess at.
+                # Once per walk: the totals may go on drifting, and the first
+                # change is the whole of what this says.
+                moved = True
+                log.warning(
+                    "AdMetrica declared %s rows for campaign %s on %s on an earlier "
+                    "page and %s on the page at offset %s, with total_rows_rounded "
+                    "set. A rounded total is an approximation, but the same report "
+                    "rounds to the same number at every offset, so a total that "
+                    "changes under the walk is the report itself changing. The rows "
+                    "collected are the ones written, and a count short of what was "
+                    "declared is to be read as that change rather than as a rounding.",
+                    total,
+                    campaign_id,
+                    date,
+                    declared,
+                    offset,
                 )
 
             for raw_row in rows:
@@ -3026,7 +3064,9 @@ class AdmetricaHook(BaseHook):
         whatever the requests carrying them waited out, and a repeat along
         :data:`_QUERY_ERROR_DELAYS` is the longest of those waits.  The warning
         names both readings, so a shortfall far past any plausible rounding is
-        taken for what it is by whoever finds it.
+        taken for what it is by whoever finds it.  Where the walk itself saw the
+        declared total change it has already said so in a line of its own, and
+        that line settles which of the two readings this one is.
         """
         if collected == total:
             return

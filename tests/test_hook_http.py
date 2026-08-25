@@ -175,6 +175,7 @@ class TestSuccessfulAnswer:
                 _call(hook)
         assert _lines(caplog) == []
         assert _info_lines(caplog) == []
+        assert _info_lines(caplog) == []
 
 
 # ---------------------------------------------------------------------------
@@ -766,6 +767,7 @@ class TestTheLineSayingTheRepeatWorked:
         assert len(_lines(caplog)) == len(_BACKOFF_DELAYS) + 1
 
 
+
 # ---------------------------------------------------------------------------
 # The event every attempt leaves behind
 # ---------------------------------------------------------------------------
@@ -887,6 +889,23 @@ class TestDiagnostics:
         hook = _hook(loki=sink)
         with patch("requests.get", return_value=_ok()):
             assert _call(hook) == {"data": []}
+
+    def test_a_stop_out_of_the_sink_leaves_the_attempt_line_behind(self, caplog):
+        """`push` lets a stop of the task through, and the line is written before it."""
+        sink = _Sink()
+        stop = AirflowTaskTimeout("Timeout, PID: 4242")
+        sink.push = MagicMock(side_effect=stop)
+        hook = _hook(loki=sink)
+
+        with caplog.at_level(logging.DEBUG, logger=_HOOK_LOGGER):
+            with patch("requests.get", return_value=_response(503)):
+                with patch("time.sleep"):
+                    with pytest.raises(AirflowTaskTimeout) as excinfo:
+                        _call(hook)
+
+        assert excinfo.value is stop
+        (line,) = _lines(caplog)
+        assert "HTTP 503" in line
 
     def test_without_a_sink_no_event_is_built_at_all(self):
         hook = _hook()

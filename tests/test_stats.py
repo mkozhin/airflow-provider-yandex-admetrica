@@ -501,6 +501,69 @@ class TestPagination:
         assert len(records) == 5
         assert len(_stat_params(mock_get)) == 3
 
+    def test_a_rounded_total_that_changes_under_the_walk_warns(self, caplog):
+        """The same report rounds to the same number, so a changed one moved."""
+        first = [
+            _row(_placement("A", 1), {"name": "mobile"}),
+            _row(_placement("B", 2), {"name": "mobile"}),
+        ]
+        second = [_row(_placement("C", 3), {"name": "mobile"})]
+        pages = [_page(first, total=4, rounded=True), _page(second, total=3, rounded=True)]
+        with caplog.at_level(logging.WARNING, logger=_HOOK_LOGGER):
+            records, _ = _collect(_hook(limit=2), [_campaign(1)], pages)
+        assert len(records) == 3
+        (message,) = [
+            r.getMessage() for r in caplog.records if "under the walk" in r.getMessage()
+        ]
+        assert "4" in message and "3" in message
+        assert "offset 3" in message
+
+    def test_a_changed_rounded_total_is_named_once_for_the_whole_walk(self, caplog):
+        """The totals may drift on; the first change is the whole of what it says."""
+        first = [
+            _row(_placement("A", 1), {"name": "mobile"}),
+            _row(_placement("B", 2), {"name": "mobile"}),
+        ]
+        second = [
+            _row(_placement("C", 3), {"name": "mobile"}),
+            _row(_placement("D", 4), {"name": "mobile"}),
+        ]
+        third = [_row(_placement("E", 5), {"name": "mobile"})]
+        pages = [
+            _page(first, total=9, rounded=True),
+            _page(second, total=8, rounded=True),
+            _page(third, total=7, rounded=True),
+        ]
+        with caplog.at_level(logging.WARNING, logger=_HOOK_LOGGER):
+            records, _ = _collect(_hook(limit=2), [_campaign(1)], pages)
+        assert len(records) == 5
+        assert len([r for r in caplog.records if "under the walk" in r.getMessage()]) == 1
+
+    def test_a_rounded_total_that_holds_says_nothing_about_moving(self, caplog):
+        """An approximation repeating itself is the report standing still."""
+        first = [
+            _row(_placement("A", 1), {"name": "mobile"}),
+            _row(_placement("B", 2), {"name": "mobile"}),
+        ]
+        second = [_row(_placement("C", 3), {"name": "mobile"})]
+        pages = [_page(first, total=3, rounded=True), _page(second, total=3, rounded=True)]
+        with caplog.at_level(logging.WARNING, logger=_HOOK_LOGGER):
+            _collect(_hook(limit=2), [_campaign(1)], pages)
+        assert [r for r in caplog.records if "under the walk" in r.getMessage()] == []
+
+    def test_a_total_that_turns_rounded_only_later_still_warns_on_the_change(self, caplog):
+        """The flag disarms the failure, not the reading of a number that moved."""
+        first = [
+            _row(_placement("A", 1), {"name": "mobile"}),
+            _row(_placement("B", 2), {"name": "mobile"}),
+        ]
+        second = [_row(_placement("C", 3), {"name": "mobile"})]
+        pages = [_page(first, total=4, rounded=False), _page(second, total=3, rounded=True)]
+        with caplog.at_level(logging.WARNING, logger=_HOOK_LOGGER):
+            records, _ = _collect(_hook(limit=2), [_campaign(1)], pages)
+        assert len(records) == 3
+        assert len([r for r in caplog.records if "under the walk" in r.getMessage()]) == 1
+
     def test_each_campaign_is_walked_from_the_first_row_again(self):
         rows = [
             _row(_placement("A", 1), {"name": "mobile"}),
