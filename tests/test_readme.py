@@ -18,6 +18,9 @@ from airflow.models import BaseOperator
 
 from airflow_provider_yandex_admetrica.hooks.loki import LokiClient
 from airflow_provider_yandex_admetrica.hooks.yandex_admetrica import (
+    _AUTH_STATUSES,
+    _BACKOFF_DELAYS,
+    _QUERY_ERROR_DELAYS,
     _RESERVED_PARAMS,
     AdmetricaHook,
     _normalize_name,
@@ -148,6 +151,18 @@ class TestNamingTable:
             assert _normalize_name(name, extra) == key, name
             checked += 1
         assert checked >= 8
+
+
+class TestRetryPolicy:
+    """The ladders and the statuses a README spells out are the ones the code walks."""
+
+    @pytest.mark.parametrize("ladder", [_BACKOFF_DELAYS, _QUERY_ERROR_DELAYS])
+    def test_a_documented_ladder_is_the_one_the_code_walks(self, readme, ladder):
+        assert " / ".join(str(rung) for rung in ladder) in readme
+
+    def test_the_statuses_that_name_the_token_are_documented_as_one_pair(self, readme):
+        assert _AUTH_STATUSES == frozenset({401, 403})
+        assert re.search(r"401 (or|или) 403", readme)
 
 
 class TestStructure:

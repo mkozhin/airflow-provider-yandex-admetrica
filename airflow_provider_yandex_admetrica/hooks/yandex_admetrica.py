@@ -222,17 +222,23 @@ _RETRY_STATUSES = frozenset({429, *range(500, 600)})
 _AUTH_STATUSES = frozenset({401, 403})
 
 #: The pause before each repeat of a rate limit, a server-side failure or a
-#: request the network did not carry, in seconds.  The length of the ladder is
-#: also the number of repeats, so a request gets one attempt plus one rung per
-#: pause.  AdMetrica publishes no quota, so the ladder is short and
-#: conservative: a refusal the server means to last is answered within seconds
-#: rather than minutes, and what a task spends on retries stays small.
+#: request the network did not carry, in seconds.  A request gets one attempt
+#: plus one rung per pause, and the rung is picked by the number of the attempt
+#: that follows it, so every ladder in this module has to be able to answer for
+#: every repeat the budget allows — ``_request_page`` therefore counts the
+#: budget off the shorter of them.  AdMetrica publishes no quota, so this ladder
+#: is short and conservative: a refusal the server means to last is answered
+#: within seconds rather than minutes, and what a task spends on retries stays
+#: small.
 _BACKOFF_DELAYS = [1, 2, 4]
 
 #: The pause before each repeat of a refusal the API states in the body of a
 #: 400, in seconds.  The span of the ladder is a minute because the condition
 #: behind such a refusal drifts on the scale of minutes: a request refused now
-#: is answered once the window it fell into has passed.
+#: is answered once the window it fell into has passed.  It holds as many rungs
+#: as :data:`_BACKOFF_DELAYS` so that both ladders answer for the same attempt
+#: budget: the budget is one attempt plus a rung, and a ladder shorter than its
+#: neighbour would shorten it for every kind of refusal at once.
 _QUERY_ERROR_DELAYS = [5, 15, 45]
 
 #: The values of ``error_type`` a repeat can fix.  The check is membership of
@@ -256,7 +262,9 @@ _OUTCOME_UNKNOWN = "unknown"
 #: Outcomes the provider answers with a repeat: a refusal the server may not
 #: repeat itself, and a request the network did not carry at all.  While an
 #: attempt is left, an event carrying one of them is a warning rather than a
-#: failure.
+#: failure, and the line the attempt logs counts itself off the attempt budget
+#: — :func:`_event_level` and :func:`_log_attempt` read this one set, so the
+#: severity in Loki and the wording in the task log name the same policy.
 _RETRIED_OUTCOMES = frozenset({"retryable_error", "network_error"})
 
 #: What ``request_params`` may cost the line: how many parameters are described
@@ -941,6 +949,25 @@ def _find_error(data: object) -> object | None:
         return None
 
 
+def _safe_field(raw: object, token: object, label: str) -> str | None:
+    """Return one text part of a refusal in the form an event may carry it.
+
+    A value that is not text is described by its type rather than serialized,
+    so the part stays a short, queryable summary of the failure whatever the
+    server put there and a dashboard can group by it.  Text passes
+    :func:`_safe_text`, which flattens it onto one line, bounds it and cuts the
+    token out; text that survives none of that is reported as no text.
+
+    *label* names the part in the description of an unexpected type, so a
+    reader of an event sees which of them the server worded oddly.
+    """
+    if raw is None:
+        return None
+    if type(raw) is not str:
+        return f"<non-str {label}: {type(raw).__name__}>"
+    return _safe_text(raw, token)
+
+
 def _summarize_error(error: object, token: object) -> tuple[int | None, str | None, str | None]:
     """Allowlist extractor for a refusal: ``code``, ``error_type``, ``message``.
 
@@ -966,19 +993,11 @@ def _summarize_error(error: object, token: object) -> tuple[int | None, str | No
         return None, None, f"<non-dict error: {type(error).__name__}>"
     raw_code = error.get("code")
     code = raw_code if type(raw_code) is int else None  # `type(...) is int` excludes bool
-    raw_type = error.get("error_type")
-    if raw_type is None:
-        error_type = None
-    elif type(raw_type) is not str:
-        error_type = f"<non-str error_type: {type(raw_type).__name__}>"
-    else:
-        error_type = _safe_text(raw_type, token)
-    message = error.get("message")
-    if message is None:
-        return code, error_type, None
-    if type(message) is not str:
-        return code, error_type, f"<non-str message: {type(message).__name__}>"
-    return code, error_type, _safe_text(message, token)
+    return (
+        code,
+        _safe_field(error.get("error_type"), token, "error_type"),
+        _safe_field(error.get("message"), token, "message"),
+    )
 
 
 def _describe_error(code: int | None, error_type: str | None, message: str | None) -> str:
@@ -995,12 +1014,31 @@ def _describe_error(code: int | None, error_type: str | None, message: str | Non
     the branch weighed.  ``error_type`` and ``message`` arrive already bounded
     and masked by :func:`_summarize_error`.
     """
-    head = ", ".join(
-        part for part in (f"code {code}" if code is not None else None, error_type) if part
-    )
+    named = [f"code {code}"] if code is not None else []
+    if error_type:
+        named.append(error_type)
+    head = ", ".join(named)
     if head and message:
         return f"{head}: {message}"
-    return head or message or "no code and no message"
+    return head or message or "nothing the refusal named"
+
+
+def _error_parts(event: dict) -> tuple[int | None, str | None, str | None] | None:
+    """Return the three parts of the refusal *event* carries, or ``None``.
+
+    One reading of "does this answer name a refusal at all", so that the text of
+    the exception and the line the attempt logs agree on when there is something
+    to spell out: a code, the API's own name for the kind of refusal, the
+    server's own message — any one of the three is a refusal a reader wants
+    told.
+
+    Reads the event's own keys, so it runs on an event this module assembled.
+    """
+    code, error_type = event["error_code"], event["error_type"]
+    message = event["error_message"]
+    if code is not None or error_type or message:
+        return code, error_type, message
+    return None
 
 
 def _with_error(message: str, event: dict) -> str:
@@ -1014,11 +1052,8 @@ def _with_error(message: str, event: dict) -> str:
 
     Reads the event's own keys, so it runs on an event this module assembled.
     """
-    code, error_type = event["error_code"], event["error_type"]
-    error_message = event["error_message"]
-    if code is not None or error_type or error_message:
-        return f"{message}: {_describe_error(code, error_type, error_message)}"
-    return message
+    error = _error_parts(event)
+    return f"{message}: {_describe_error(*error)}" if error is not None else message
 
 
 def _describe_unreadable_body(event: dict) -> str:
@@ -1073,10 +1108,9 @@ def _attempt_reason(event: dict) -> str:
     status = event["http_status"]
     parts = [f"HTTP {status}" if status is not None else "no response"]
     outcome = event["outcome"]
-    code, error_type = event["error_code"], event["error_type"]
-    message = event["error_message"]
-    if code is not None or error_type or message:
-        parts.append(_describe_error(code, error_type, message))
+    error = _error_parts(event)
+    if error is not None:
+        parts.append(_describe_error(*error))
     if outcome in ("empty_shape", "unexpected_error") and event["payload_kind"] is not None:
         parts.append(_describe_unreadable_body(event))
     elif outcome == "invalid_json":
@@ -1103,6 +1137,11 @@ def _log_attempt(event: dict, retry_delay: float | None) -> None:
     apart by the same word.  Every other outcome ends the export where it
     stands, and its line says so — ``failed, not retryable`` — because a
     fraction there would promise attempts the request will never be given.
+
+    The pause is separated from the reason by exactly one period, whether or
+    not the server's own message already ended in one: the sentence about the
+    answer and the sentence about the wait are two, and the server writes only
+    the first.
     """
     if event["outcome"] in _RETRIED_OUTCOMES:
         verdict = f"attempt {event['attempt']}/{event['max_attempts']} failed"
@@ -1110,7 +1149,7 @@ def _log_attempt(event: dict, retry_delay: float | None) -> None:
         verdict = "failed, not retryable"
     line = f"{_describe_target(event)}: {verdict} — {_attempt_reason(event)}"
     if retry_delay is not None:
-        line = f"{line}. Retrying in {retry_delay} s"
+        line = f"{line.rstrip('.')}. Retrying in {retry_delay} s"
     log.warning("%s", line)
 
 
@@ -1120,8 +1159,8 @@ def _log_recovery(event: dict) -> None:
     Written only where a repeat did the work: an attempt past the first that
     brought a page back closes a run of WARNING lines whose end would otherwise
     have to be inferred from the silence after it.  A page that arrived on the
-    first attempt says nothing at all, so a healthy export reads exactly as it
-    did before any refusal was worth repeating.
+    first attempt says nothing at all, so a healthy export writes no lines about
+    its attempts.
 
     INFO, and the fraction it carries is the same one the lines above it count
     off, so the whole run of a page reads as one chronicle at one prefix.
@@ -1136,10 +1175,8 @@ def _log_recovery(event: dict) -> None:
     )
 
 
-def _stamp_response_error(
-    event: dict, resp: object, token: object
-) -> tuple[int | None, str | None, str | None]:
-    """Copy the refusal a non-200 answer carries onto *event*, and return it.
+def _stamp_response_error(event: dict, resp: object, token: object) -> str | None:
+    """Copy the refusal a non-200 answer carries onto *event*, and name its kind.
 
     The body goes through the same :func:`_find_error` and
     :func:`_summarize_error` as an HTTP-200 one, so the exception, the line the
@@ -1150,10 +1187,15 @@ def _stamp_response_error(
     an empty answer, a ``json()`` that raises — leaves the three fields as it
     found them and is described by its status alone.
 
-    The triple is returned as well as stamped, so that a branch choosing what to
-    do about the refusal reads the parsed value rather than the event: what the
+    The kind of the refusal is returned as well as stamped, so that a branch
+    choosing what to do about it reads a value rather than the event: what the
     provider does stays independent of which fields the diagnostic schema
-    happens to carry.
+    happens to carry.  What comes back is ``error_type`` as the body spelled it,
+    while the event carries the copy the masking gate made — a policy is read
+    off the API's own word, and the diagnostic layer is free to shorten, flatten
+    or blank the text it ships without moving the decision with it.  A value
+    that is not text names no kind, so it comes back as ``None`` and the answer
+    is refused on its status alone.
 
     Parsing the whole document is what ``resp.json()`` costs, and it is the same
     cost the HTTP-200 branch pays: what :func:`_bounded_body` bounds is the copy
@@ -1163,19 +1205,21 @@ def _stamp_response_error(
     a body that refuses to be read must leave both the type of that exception
     and the reason for it exactly as they are.
     """
-    code: int | None = None
-    error_type: str | None = None
-    message: str | None = None
+    kind: str | None = None
     try:
         error = _find_error(resp.json())
         if error is not None:
-            code, error_type, message = _summarize_error(error, token)
-            event["error_code"] = code
-            event["error_type"] = error_type
-            event["error_message"] = message
+            (
+                event["error_code"],
+                event["error_type"],
+                event["error_message"],
+            ) = _summarize_error(error, token)
+            if isinstance(error, dict):
+                raw_type = error.get("error_type")
+                kind = raw_type if type(raw_type) is str else None
     except Exception:
         pass
-    return code, error_type, message
+    return kind
 
 
 def _meta_value(value: object, token: object) -> object:
@@ -1346,9 +1390,9 @@ def _event_level(event: dict) -> str:
     warnings in the task log.  A refusal the provider repeats — a rate limit, a
     server-side failure, a 400 the API states a retryable ``error_type`` in, a
     network that did not carry the request — is a warning while an attempt is
-    left and a failure on the last one.  A refusal to
-    authorize is an error at first sight: the token is long-lived and nothing
-    here refreshes it, so the attempt after it would be refused the same way.
+    left and a failure on the last one.  A refusal to authorize is an error at
+    first sight: the token is long-lived and nothing here refreshes it, so the
+    attempt after it would be refused the same way.
 
     The level is the content policy as well as the severity: an answer that
     stays at ``info`` keeps its body inside the process, and moving a row of
@@ -2159,13 +2203,17 @@ class AdmetricaHook(BaseHook):
         ``error_type`` listed in :data:`_RETRYABLE_ERROR_TYPES` is repeated too,
         along the minute-wide :data:`_QUERY_ERROR_DELAYS`: such a refusal says
         the request is sound and the moment was not, so the repeat waits out the
-        window instead of the seconds a rate limit is answered in.  A status in
-        :data:`_AUTH_STATUSES` fails at once: the token is long-lived and
-        nothing here refreshes it, so the attempt after it would be refused the
-        same way.  Every other 4xx fails
-        at once as well, with the server's words for it read out of the body —
-        the request itself is what is being refused, and a repeat brings back
-        the same answer.
+        window instead of the seconds a rate limit is answered in, and
+        ``Retry-After`` is left unread there — a header names a window the
+        server is keeping, and this refusal is the endpoint running long rather
+        than a window it announced.  Whichever ladder applies, the rung is
+        picked by the number of the attempt about to be spent rather than by how
+        often that kind of refusal has come, so a 400 arriving third waits the
+        third rung.  A status in :data:`_AUTH_STATUSES` fails at once: the token
+        is long-lived and nothing here refreshes it, so the attempt after it
+        would be refused the same way.  Every other 4xx fails at once as well,
+        with the server's words for it read out of the body — the request itself
+        is what is being refused, and a repeat brings back the same answer.
 
         An HTTP-200 body is asked one question: is the rows value the list of
         objects it promises.  Only a body that answers yes — the empty list of a
@@ -2197,7 +2245,10 @@ class AdmetricaHook(BaseHook):
             "Authorization": f"{_TOKEN_SCHEME} {token}",
             "Accept": "application/json",
         }
-        max_attempts = len(_BACKOFF_DELAYS) + 1
+        # One attempt plus one rung per repeat, counted off the shorter ladder:
+        # the rung is picked by the number of the attempt that follows it, so
+        # the budget is what every ladder in the module can answer for.
+        max_attempts = 1 + min(len(_BACKOFF_DELAYS), len(_QUERY_ERROR_DELAYS))
         self._pace()
 
         for attempt in range(max_attempts):
@@ -2213,6 +2264,9 @@ class AdmetricaHook(BaseHook):
             # Set where a pause follows, and read at the foot of the loop as the
             # one answer to "does anything follow this attempt".
             retry_delay: float | None = None
+            # Set where a page is on its way back to the caller, and read in
+            # `finally` as the one answer to "did a repeat bring this one back".
+            recovered = False
             last_attempt = attempt == max_attempts - 1
             # Per attempt, so that a network failure reports the absence of a
             # response instead of the body the previous attempt received.
@@ -2247,10 +2301,11 @@ class AdmetricaHook(BaseHook):
                     _stamp_duration(event, started)
                     event["http_status"] = resp.status_code
 
-                    # One chain, not a run of separate `if`s: a refusal a
-                    # repeat can fix has a path that neither returns nor raises
-                    # — it names a pause and leaves for `time.sleep` at the foot
-                    # of the loop.
+                    # Two halves: an HTTP 200 is asked what it carries, and
+                    # every other status is read out of its body before an
+                    # outcome is chosen.  A refusal a repeat can fix has a path
+                    # that neither returns nor raises — it names a pause and
+                    # leaves for `time.sleep` at the foot of the loop.
                     if resp.status_code == 200:
                         try:
                             data = resp.json()
@@ -2271,6 +2326,7 @@ class AdmetricaHook(BaseHook):
 
                         if _classify_payload(event, data):
                             _stamp_report_meta(event, data, token)
+                            recovered = event["attempt"] > 1
                             return data
 
                         # No list of rows was recognised, so there is no page to
@@ -2292,73 +2348,69 @@ class AdmetricaHook(BaseHook):
                             )
                         )
 
-                    elif resp.status_code in _AUTH_STATUSES:
-                        event["outcome"] = "auth_error"
-                        _stamp_response_error(event, resp, token)
-                        raise _MaskedError(
-                            _with_error(
-                                f"AdMetrica {endpoint} returned {resp.status_code}: the OAuth "
-                                f"token in connection {self.admetrica_conn_id!r} was refused, "
-                                f"and nothing here refreshes it",
-                                event,
-                            )
-                        )
+                    else:
+                        # The body is read before an outcome is chosen: a 400
+                        # states what it objects to in `error_type`, and that
+                        # word decides the policy along with the status.  What
+                        # is weighed is the value `_stamp_response_error`
+                        # returns rather than the event it stamped, so what the
+                        # provider does stays independent of which fields the
+                        # diagnostic schema carries and of what the masking gate
+                        # makes of them.
+                        error_type = _stamp_response_error(event, resp, token)
+                        status = resp.status_code
 
-                    elif resp.status_code in _RETRY_STATUSES:
-                        event["outcome"] = "retryable_error"
-                        if resp.status_code == 429:
+                        if status in _AUTH_STATUSES:
+                            event["outcome"] = "auth_error"
+                            raise _MaskedError(
+                                _with_error(
+                                    f"AdMetrica {endpoint} returned {status}: the OAuth "
+                                    f"token in connection {self.admetrica_conn_id!r} was "
+                                    f"refused, and nothing here refreshes it",
+                                    event,
+                                )
+                            )
+
+                        if status == 429:
                             _record_rate_limit(event, resp, token)
-                        _stamp_response_error(event, resp, token)
+
+                        # Two ways to earn a repeat, one policy for both: the
+                        # status says the request never reached the logic that
+                        # would judge it, or the body says the request is sound
+                        # and the moment was not.
+                        by_status = status in _RETRY_STATUSES
+                        by_type = status == 400 and error_type in _RETRYABLE_ERROR_TYPES
+                        if not (by_status or by_type):
+                            event["outcome"] = "http_error"
+                            raise _MaskedError(
+                                _with_error(
+                                    f"AdMetrica {endpoint} returned {status} for {url}",
+                                    event,
+                                )
+                            )
+
+                        event["outcome"] = "retryable_error"
                         if last_attempt:
                             raise _MaskedError(
                                 _with_error(
-                                    f"AdMetrica {endpoint} returned {resp.status_code} for "
+                                    f"AdMetrica {endpoint} returned {status} for "
                                     f"{url} on attempt {max_attempts} of {max_attempts}",
                                     event,
                                 )
                             )
-                        # The server's own `Retry-After` wins whenever it
-                        # named one, in both directions: a longer wait is a
-                        # window that has not passed yet, a shorter one an
-                        # invitation to come back before the ladder would.
-                        asked = _retry_after(resp)
-                        retry_delay = (
-                            _BACKOFF_DELAYS[attempt] if asked is None else asked
-                        )
-
-                    else:
-                        # The body is read before the outcome is chosen: a 400
-                        # states what it objects to in `error_type`, and that
-                        # word decides the policy along with the status.  The
-                        # branch reads the value `_stamp_response_error`
-                        # returns rather than the event it stamped, so what the
-                        # provider does stays independent of which fields the
-                        # diagnostic schema carries.
-                        _, error_type, _ = _stamp_response_error(event, resp, token)
-                        if (
-                            resp.status_code == 400
-                            and error_type in _RETRYABLE_ERROR_TYPES
-                        ):
-                            event["outcome"] = "retryable_error"
-                            if last_attempt:
-                                raise _MaskedError(
-                                    _with_error(
-                                        f"AdMetrica {endpoint} returned {resp.status_code} "
-                                        f"for {url} on attempt {max_attempts} of "
-                                        f"{max_attempts}",
-                                        event,
-                                    )
-                                )
-                            retry_delay = _QUERY_ERROR_DELAYS[attempt]
+                        if by_status:
+                            # The server's own `Retry-After` wins whenever it
+                            # named one, in both directions: a longer wait is a
+                            # window that has not passed yet, a shorter one an
+                            # invitation to come back before the ladder would.
+                            asked = _retry_after(resp)
+                            retry_delay = _BACKOFF_DELAYS[attempt] if asked is None else asked
                         else:
-                            event["outcome"] = "http_error"
-                            raise _MaskedError(
-                                _with_error(
-                                    f"AdMetrica {endpoint} returned {resp.status_code} "
-                                    f"for {url}",
-                                    event,
-                                )
-                            )
+                            # The ladder alone: a header names a window the
+                            # server is keeping, while this refusal is the
+                            # endpoint running long, and the minute-wide rung is
+                            # the measured answer to that.
+                            retry_delay = _QUERY_ERROR_DELAYS[attempt]
             except BaseException as e:
                 # Safety net: record what escaped, then decide how it leaves.
                 # `BaseException` so that an interrupted attempt is classified
@@ -2399,9 +2451,10 @@ class AdmetricaHook(BaseHook):
                             # whether a pause follows it or the exception in
                             # flight ends the export.
                             _log_attempt(event, retry_delay)
-                        elif event["attempt"] > 1:
-                            # The page arrived on a repeat, and the line saying
-                            # so closes the run of WARNINGs above it.
+                        elif recovered:
+                            # The page arrived on a repeat and is on its way to
+                            # the caller, and the line saying so closes the run
+                            # of WARNINGs above it.
                             _log_recovery(event)
                         if self._loki is not None:
                             _emit_event(self._loki, event, resp, token)

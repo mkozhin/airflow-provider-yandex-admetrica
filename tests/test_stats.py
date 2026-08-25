@@ -62,9 +62,9 @@ def _hook(**kwargs) -> AdmetricaHook:
     return hook
 
 
-def _response(payload: object) -> MagicMock:
+def _response(payload: object, status: int = 200) -> MagicMock:
     resp = MagicMock()
-    resp.status_code = 200
+    resp.status_code = status
     resp.json.return_value = payload
     resp.content = json.dumps(payload, ensure_ascii=False).encode()
     resp.headers = {}
@@ -109,17 +109,14 @@ def _campaign(campaign_id: int) -> dict:
 def _refused() -> MagicMock:
     """A 400 in the shape the reporting endpoint states a passing complaint in."""
     message = "Query is too complicated. Please reduce the date interval or sampling."
-    body = {
-        "errors": [{"error_type": "query_error", "message": message}],
-        "code": 400,
-        "message": message,
-    }
-    resp = MagicMock()
-    resp.status_code = 400
-    resp.json.return_value = body
-    resp.content = json.dumps(body, ensure_ascii=False).encode()
-    resp.headers = {}
-    return resp
+    return _response(
+        {
+            "errors": [{"error_type": "query_error", "message": message}],
+            "code": 400,
+            "message": message,
+        },
+        status=400,
+    )
 
 
 def _api(campaigns: list[dict], pages: list[dict | MagicMock]):
@@ -544,7 +541,6 @@ class TestOneCampaignRefused:
                 with pytest.raises(AirflowException, match="returned 400"):
                     _hook().get_stats(DATE, DIMENSIONS, METRICS)
         assert len(_stat_params(mock_get)) == len(_QUERY_ERROR_DELAYS) + 1
-
 
 
 # ---------------------------------------------------------------------------

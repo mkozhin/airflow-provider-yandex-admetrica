@@ -1020,7 +1020,6 @@ class TestSummarizeError:
     def test_a_message_that_says_nothing_is_no_message(self):
         assert _summarize_error({"code": 500, "message": "  \n "}, TOKEN) == (500, None, None)
 
-
     def test_the_refusal_this_api_really_sends_is_read_as_a_type(self):
         """The body a refused report answers with, copied from the wire.
 
@@ -1055,11 +1054,11 @@ class TestSummarizeError:
             "no",
         )
 
-    def test_a_refusal_without_a_type_leaves_it_empty(self):
-        assert _summarize_error({"code": 403, "message": "Forbidden"}, TOKEN) == (
-            403,
+    def test_a_refusal_naming_only_a_type_carries_it_alone(self):
+        assert _summarize_error({"error_type": "query_error"}, TOKEN) == (
             None,
-            "Forbidden",
+            "query_error",
+            None,
         )
 
     def test_a_reflected_token_leaves_the_type_masked(self):
@@ -1067,6 +1066,7 @@ class TestSummarizeError:
 
         code, error_type, message = _summarize_error(error, TOKEN)
 
+        assert (code, message) == (None, "no")
         assert TOKEN not in error_type
         assert _TOKEN_REDACTED in error_type
 
@@ -1086,9 +1086,8 @@ class TestDescribeError:
     def test_a_message_alone(self):
         assert _describe_error(None, None, "Forbidden") == "Forbidden"
 
-    def test_neither(self):
-        assert _describe_error(None, None, None) == "no code and no message"
-
+    def test_none_of_the_three(self):
+        assert _describe_error(None, None, None) == "nothing the refusal named"
 
     def test_the_type_stands_between_the_code_and_the_message(self):
         assert _describe_error(403, "invalid_token", "Forbidden") == (
@@ -1123,7 +1122,7 @@ class TestStampResponseError:
     def test_a_refusal_reaches_the_event(self):
         event = _event()
 
-        stamped = _stamp_response_error(
+        kind = _stamp_response_error(
             event, _Answer({"error": {"code": 403, "message": "no"}}), TOKEN
         )
 
@@ -1132,16 +1131,38 @@ class TestStampResponseError:
             None,
             "no",
         )
-        assert stamped == (403, None, "no")
+        assert kind is None
 
     def test_the_type_reaches_the_event_and_comes_back(self):
         event = _event()
         body = {"errors": [{"error_type": "query_error", "message": "too complicated"}]}
 
-        stamped = _stamp_response_error(event, _Answer(body), TOKEN)
+        kind = _stamp_response_error(event, _Answer(body), TOKEN)
 
-        assert stamped == (None, "query_error", "too complicated")
+        assert kind == "query_error"
         assert event["error_type"] == "query_error"
+
+    def test_the_kind_that_comes_back_is_the_one_the_body_spelled(self):
+        """The decision is read off the API's own word, the event off the gate.
+
+        A type the masking gate rewrites or blanks still names the kind of
+        refusal the API stated, so what the provider does about it stays where
+        the API put it rather than following the diagnostic layer.
+        """
+        event = _event()
+        body = {"errors": [{"error_type": f"query_error {TOKEN}", "message": "no"}]}
+
+        kind = _stamp_response_error(event, _Answer(body), TOKEN)
+
+        assert kind == f"query_error {TOKEN}"
+        assert TOKEN not in json.dumps(event)
+
+    def test_a_type_that_is_not_text_names_no_kind(self):
+        event = _event()
+        body = {"errors": [{"error_type": 400, "message": "no"}]}
+
+        assert _stamp_response_error(event, _Answer(body), TOKEN) is None
+        assert event["error_type"] == "<non-str error_type: int>"
 
     def test_a_reflected_token_reaches_the_event_masked(self):
         event = _event()

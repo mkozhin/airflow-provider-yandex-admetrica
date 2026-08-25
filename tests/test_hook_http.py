@@ -272,6 +272,28 @@ class TestARefusalTheMomentCaused:
         assert get.call_count == 1
         sleep.assert_not_called()
 
+    @pytest.mark.parametrize("status", [404, 422])
+    def test_the_type_earns_a_repeat_on_a_400_and_nowhere_else(self, status):
+        """The status is half the condition: the word alone does not buy attempts."""
+        refused = _refused("query_error")
+        refused.status_code = status
+        with patch("requests.get", return_value=refused) as get:
+            with patch("time.sleep") as sleep:
+                with pytest.raises(AirflowException, match=f"returned {status}"):
+                    _call(_hook())
+        assert get.call_count == 1
+        sleep.assert_not_called()
+
+    def test_a_5xx_naming_the_type_still_walks_the_ladder_of_its_status(self):
+        """A status that earns a repeat by itself takes no ladder from the body."""
+        refused = _refused("query_error")
+        refused.status_code = 500
+        with patch("requests.get", return_value=refused):
+            with patch("time.sleep") as sleep:
+                with pytest.raises(AirflowException, match="returned 500"):
+                    _call(_hook())
+        assert _delays(sleep) == _BACKOFF_DELAYS
+
     def test_a_400_naming_no_type_at_all_fails_at_once(self):
         hook = _hook()
         with patch("requests.get", return_value=_response(400, {"nothing": "readable"})) as get:
@@ -280,6 +302,16 @@ class TestARefusalTheMomentCaused:
                     _call(hook)
         assert get.call_count == 1
         sleep.assert_not_called()
+
+    def test_the_campaign_list_earns_the_same_repeat(self):
+        """One request path serves both endpoints, and one policy with it."""
+        answers = [_refused("query_error"), _response(200, {"campaigns": []})]
+        params = {"advertiser_id": 17004, "limit": 100, "offset": 0}
+        with patch("requests.get", side_effect=answers) as get:
+            with patch("time.sleep") as sleep:
+                assert _call(_hook(), "campaigns", params) == {"campaigns": []}
+        assert get.call_count == 2
+        assert _delays(sleep) == [_QUERY_ERROR_DELAYS[0]]
 
     def test_the_dashboard_tells_it_from_a_5xx_by_status_and_type(self):
         sink = _Sink()
@@ -369,7 +401,16 @@ class TestRetryAfter:
 
 
 class TestRefusals:
-    @pytest.mark.parametrize("status", sorted(_AUTH_STATUSES))
+    def test_the_statuses_that_name_the_token_are_the_documented_pair(self):
+        """Spelled out, not read from the module.
+
+        The cases below name their statuses themselves, so the set has to be
+        pinned somewhere: a status leaving it would otherwise delete a case
+        rather than fail one.
+        """
+        assert _AUTH_STATUSES == frozenset({401, 403})
+
+    @pytest.mark.parametrize("status", [401, 403])
     def test_a_refused_token_fails_at_once(self, status):
         hook = _hook()
         with patch("requests.get", return_value=_response(status)) as get:
@@ -382,15 +423,17 @@ class TestRefusals:
         assert "nothing here refreshes it" in str(excinfo.value)
         assert "'admetrica'" in str(excinfo.value)
 
-    @pytest.mark.parametrize("status", sorted(_AUTH_STATUSES))
+    @pytest.mark.parametrize("status", [401, 403])
     def test_a_refused_token_is_told_apart_from_a_refused_request(self, status):
         sink = _Sink()
         hook = _hook(loki=sink)
         body = {"errors": [{"error_type": "invalid_token", "message": "token is invalid"}]}
         with patch("requests.get", return_value=_response(status, body)) as get:
-            with pytest.raises(AirflowException) as excinfo:
-                _call(hook)
+            with patch("time.sleep") as sleep:
+                with pytest.raises(AirflowException) as excinfo:
+                    _call(hook)
         assert get.call_count == 1
+        sleep.assert_not_called()
         (event,) = sink.pushed
         assert event["outcome"] == "auth_error"
         assert event["http_status"] == status
@@ -414,6 +457,30 @@ class TestRefusals:
             with pytest.raises(AirflowException, match=f"returned {status}"):
                 _call(hook)
         assert get.call_count == 1
+
+    def test_a_refusal_whose_only_readable_part_is_the_type_is_told_by_it(self, caplog):
+        """The type alone is a refusal, in the exception and in the line alike."""
+        hook = _hook()
+        body = {"errors": [{"error_type": "invalid_parameter"}]}
+        with caplog.at_level(logging.DEBUG, logger=_HOOK_LOGGER):
+            with patch("requests.get", return_value=_response(400, body)):
+                with pytest.raises(AirflowException) as excinfo:
+                    _call(hook)
+        assert str(excinfo.value).endswith(": invalid_parameter")
+        (line,) = _lines(caplog)
+        assert line.endswith("HTTP 400, invalid_parameter")
+
+    def test_a_non_200_whose_body_is_not_json_is_refused_on_its_status(self):
+        """A body no parser reads names no error, and the status decides alone."""
+        hook = _hook()
+        resp = _response(400)
+        resp.json.side_effect = ValueError("Expecting value")
+        with patch("requests.get", return_value=resp) as get:
+            with patch("time.sleep") as sleep:
+                with pytest.raises(AirflowException, match="returned 400"):
+                    _call(hook)
+        assert get.call_count == 1
+        sleep.assert_not_called()
 
     def test_a_body_naming_no_error_is_described_by_its_status_alone(self):
         hook = _hook()
@@ -528,6 +595,11 @@ class TestAttemptLines:
         for number, line in enumerate(lines, start=1):
             assert f"attempt {number}/4 failed" in line
             assert "not retryable" not in line
+        # The pause each line promises is its own rung, and the last promises
+        # none; the server's message ends in a period, and the line adds one.
+        for delay, line in zip(_QUERY_ERROR_DELAYS, lines):
+            assert line.endswith(f"or sampling. Retrying in {delay} s")
+        assert "Retrying in" not in lines[-1]
 
     def test_a_refusal_no_repeat_can_fix_promises_no_attempts(self, caplog):
         hook = _hook()
@@ -544,7 +616,7 @@ class TestAttemptLines:
         assert "Retrying in" not in line
         assert "HTTP 400, invalid_parameter" in line
 
-    @pytest.mark.parametrize("status", sorted(_AUTH_STATUSES))
+    @pytest.mark.parametrize("status", [401, 403])
     def test_a_refused_token_promises_no_attempts_either(self, status, caplog):
         hook = _hook()
         with caplog.at_level(logging.DEBUG, logger=_HOOK_LOGGER):
@@ -554,6 +626,18 @@ class TestAttemptLines:
         (line,) = _lines(caplog)
         assert "failed, not retryable" in line
         assert "attempt" not in line
+
+    def test_the_line_the_readme_spells_out_is_the_line_written(self, caplog):
+        """The example in both READMEs, produced rather than transcribed."""
+        hook = _hook()
+        with caplog.at_level(logging.DEBUG, logger=_HOOK_LOGGER):
+            with patch("requests.get", return_value=_response(200, {"total": 0})):
+                with pytest.raises(AirflowException):
+                    _call(hook, "campaigns", {"advertiser_id": 17004, "limit": 100, "offset": 0})
+        assert _lines(caplog) == [
+            "AdMetrica campaigns offset=0: failed, not retryable — "
+            "HTTP 200, no readable rows (payload_kind=rows_absent)"
+        ]
 
     def test_an_unreadable_answer_promises_no_attempts_either(self, caplog):
         hook = _hook()
@@ -627,6 +711,17 @@ class TestTheLineSayingTheRepeatWorked:
                     _call(hook)
         (line,) = _info_lines(caplog)
         assert line.endswith("recovered on attempt 3/4")
+
+    def test_a_line_that_cannot_be_worded_still_hands_the_page_on(self):
+        """Reporting sits inside the net that keeps it out of the export's way."""
+        hook = _hook()
+        target = (
+            "airflow_provider_yandex_admetrica.hooks.yandex_admetrica._log_recovery"
+        )
+        with patch("requests.get", side_effect=[_response(503), _ok()]):
+            with patch("time.sleep"):
+                with patch(target, side_effect=RuntimeError("no words")):
+                    assert _call(hook) == {"data": []}
 
     def test_a_page_that_came_back_at_once_says_nothing(self, caplog):
         hook = _hook()
