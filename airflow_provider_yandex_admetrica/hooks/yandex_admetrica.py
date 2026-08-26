@@ -2764,7 +2764,8 @@ class AdmetricaHook(BaseHook):
         therefore a day that stops, not a file quietly written short.  The gap
         is a rounded total: under ``total_rows_rounded`` the count mismatch
         softens to a warning, since an approximation is free to differ, and a
-        shortfall under that flag is left to the repeat detector alone.
+        shortfall under that flag is watched by the repeat detector and by a
+        warning of its own wherever the declared total changed under the walk.
 
         The day, the documented ceilings and the parameters this hook owns are
         checked before the first request, so a report configured wrongly costs
