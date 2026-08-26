@@ -19,6 +19,7 @@ from airflow_provider_yandex_admetrica.hooks.yandex_admetrica import (
     _MAX_METRICS,
     _MAX_PAGES,
     _MAX_ROWS,
+    _QUERY_ERROR_DELAYS,
     _RESERVED_PARAMS,
     _STAT_OFFSET_BASE,
     AdmetricaHook,
@@ -61,9 +62,9 @@ def _hook(**kwargs) -> AdmetricaHook:
     return hook
 
 
-def _response(payload: object) -> MagicMock:
+def _response(payload: object, status: int = 200) -> MagicMock:
     resp = MagicMock()
-    resp.status_code = 200
+    resp.status_code = status
     resp.json.return_value = payload
     resp.content = json.dumps(payload, ensure_ascii=False).encode()
     resp.headers = {}
@@ -105,19 +106,35 @@ def _campaign(campaign_id: int) -> dict:
     }
 
 
-def _api(campaigns: list[dict], pages: list[dict]):
+def _refused() -> MagicMock:
+    """A 400 in the shape the reporting endpoint states a passing complaint in."""
+    message = "Query is too complicated. Please reduce the date interval or sampling."
+    return _response(
+        {
+            "errors": [{"error_type": "query_error", "message": message}],
+            "code": 400,
+            "message": message,
+        },
+        status=400,
+    )
+
+
+def _api(campaigns: list[dict], pages: list[dict | MagicMock]):
     """A ``requests.get`` stand-in answering both endpoints.
 
     The campaign list is answered from *campaigns* however often it is asked
     for; every statistics request takes the next of *pages*, so a test spells
-    out the walk it expects and a request too many fails loudly.
+    out the walk it expects and a request too many fails loudly.  An entry that
+    is a response of its own goes out as it is, which is how a test hands the
+    walk an answer other than a well-formed page.
     """
     remaining = list(pages)
 
     def get(url, **kwargs):
         if url == _ENDPOINT_URLS["campaigns"]:
             return _response({"campaigns": campaigns, "total": len(campaigns)})
-        return _response(remaining.pop(0))
+        answer = remaining.pop(0)
+        return answer if isinstance(answer, MagicMock) else _response(answer)
 
     return get
 
@@ -238,6 +255,25 @@ class TestRequest:
         sent = _stat_params(mock_get)[0]
         assert sent["accuracy"] == "0.1"
         assert sent["include_undefined"] == "false"
+
+    @pytest.mark.parametrize(("value", "sent"), [(True, "true"), (False, "false")])
+    def test_include_undefined_goes_out_in_the_apis_spelling(self, value, sent):
+        _, mock_get = _collect(
+            _hook(),
+            [_campaign(1)],
+            [_page([], total=0)],
+            include_undefined=value,
+        )
+        assert _stat_params(mock_get)[0]["include_undefined"] == sent
+
+    def test_include_undefined_of_none_is_left_out_of_the_query(self):
+        _, mock_get = _collect(
+            _hook(),
+            [_campaign(1)],
+            [_page([], total=0)],
+            include_undefined=None,
+        )
+        assert "include_undefined" not in _stat_params(mock_get)[0]
 
     def test_filters_timezone_and_lang_go_out(self):
         _, mock_get = _collect(
@@ -465,6 +501,69 @@ class TestPagination:
         assert len(records) == 5
         assert len(_stat_params(mock_get)) == 3
 
+    def test_a_rounded_total_that_changes_under_the_walk_warns(self, caplog):
+        """The same report rounds to the same number, so a changed one moved."""
+        first = [
+            _row(_placement("A", 1), {"name": "mobile"}),
+            _row(_placement("B", 2), {"name": "mobile"}),
+        ]
+        second = [_row(_placement("C", 3), {"name": "mobile"})]
+        pages = [_page(first, total=4, rounded=True), _page(second, total=3, rounded=True)]
+        with caplog.at_level(logging.WARNING, logger=_HOOK_LOGGER):
+            records, _ = _collect(_hook(limit=2), [_campaign(1)], pages)
+        assert len(records) == 3
+        (message,) = [
+            r.getMessage() for r in caplog.records if "under the walk" in r.getMessage()
+        ]
+        assert "declared 4 rows" in message
+        assert "and 3 on the page at offset 3" in message
+
+    def test_a_changed_rounded_total_is_named_once_for_the_whole_walk(self, caplog):
+        """The totals may drift on; the first change is the whole of what it says."""
+        first = [
+            _row(_placement("A", 1), {"name": "mobile"}),
+            _row(_placement("B", 2), {"name": "mobile"}),
+        ]
+        second = [
+            _row(_placement("C", 3), {"name": "mobile"}),
+            _row(_placement("D", 4), {"name": "mobile"}),
+        ]
+        third = [_row(_placement("E", 5), {"name": "mobile"})]
+        pages = [
+            _page(first, total=9, rounded=True),
+            _page(second, total=8, rounded=True),
+            _page(third, total=7, rounded=True),
+        ]
+        with caplog.at_level(logging.WARNING, logger=_HOOK_LOGGER):
+            records, _ = _collect(_hook(limit=2), [_campaign(1)], pages)
+        assert len(records) == 5
+        assert len([r for r in caplog.records if "under the walk" in r.getMessage()]) == 1
+
+    def test_a_rounded_total_that_holds_says_nothing_about_moving(self, caplog):
+        """An approximation repeating itself is the report standing still."""
+        first = [
+            _row(_placement("A", 1), {"name": "mobile"}),
+            _row(_placement("B", 2), {"name": "mobile"}),
+        ]
+        second = [_row(_placement("C", 3), {"name": "mobile"})]
+        pages = [_page(first, total=3, rounded=True), _page(second, total=3, rounded=True)]
+        with caplog.at_level(logging.WARNING, logger=_HOOK_LOGGER):
+            _collect(_hook(limit=2), [_campaign(1)], pages)
+        assert [r for r in caplog.records if "under the walk" in r.getMessage()] == []
+
+    def test_a_total_that_turns_rounded_only_later_still_warns_on_the_change(self, caplog):
+        """The flag disarms the failure, not the reading of a number that moved."""
+        first = [
+            _row(_placement("A", 1), {"name": "mobile"}),
+            _row(_placement("B", 2), {"name": "mobile"}),
+        ]
+        second = [_row(_placement("C", 3), {"name": "mobile"})]
+        pages = [_page(first, total=4, rounded=False), _page(second, total=3, rounded=True)]
+        with caplog.at_level(logging.WARNING, logger=_HOOK_LOGGER):
+            records, _ = _collect(_hook(limit=2), [_campaign(1)], pages)
+        assert len(records) == 3
+        assert len([r for r in caplog.records if "under the walk" in r.getMessage()]) == 1
+
     def test_each_campaign_is_walked_from_the_first_row_again(self):
         rows = [
             _row(_placement("A", 1), {"name": "mobile"}),
@@ -478,6 +577,33 @@ class TestPagination:
         ]
         _, mock_get = _collect(_hook(limit=2), [_campaign(1), _campaign(2)], pages)
         assert [p["offset"] for p in _stat_params(mock_get)] == [1, 3, 1, 3]
+
+
+# ---------------------------------------------------------------------------
+# A refusal the moment caused
+# ---------------------------------------------------------------------------
+
+
+class TestOneCampaignRefused:
+    def test_a_campaign_refused_once_is_asked_again_and_the_day_comes_back_whole(self):
+        """The repeat lives inside one request, so the day costs a pause, not a rerun."""
+        rows = [_row(_placement("A", 1), {"name": "mobile"})]
+        pages = [_page(rows, total=1), _refused(), _page(rows, total=1)]
+        campaigns = [_campaign(1), _campaign(2)]
+        with patch("time.sleep") as sleep:
+            records, mock_get = _collect(_hook(), campaigns, pages)
+        assert [r["campaign_id"] for r in records] == [1, 2]
+        assert [p["ids"] for p in _stat_params(mock_get)] == [1, 2, 2]
+        assert [call.args[0] for call in sleep.call_args_list] == [_QUERY_ERROR_DELAYS[0]]
+
+    def test_a_campaign_refused_to_the_end_fails_the_day(self):
+        """Four refusals in a row are the answer the day cannot be made out of."""
+        pages = [_refused() for _ in range(len(_QUERY_ERROR_DELAYS) + 1)]
+        with patch("time.sleep"):
+            with patch("requests.get", side_effect=_api([_campaign(1)], pages)) as mock_get:
+                with pytest.raises(AirflowException, match="returned 400"):
+                    _hook().get_stats(DATE, DIMENSIONS, METRICS)
+        assert len(_stat_params(mock_get)) == len(_QUERY_ERROR_DELAYS) + 1
 
 
 # ---------------------------------------------------------------------------
@@ -592,6 +718,16 @@ class TestCompleteness:
             )
         assert len(records) == 1
         assert any("total_rows_rounded" in r.getMessage() for r in caplog.records)
+
+    def test_the_warning_names_the_other_reading_of_a_shortfall(self, caplog):
+        """Rounding explains a small difference; a lost page explains any of them."""
+        rows = [_row(_placement("A", 1), {"name": "mobile"})]
+        with caplog.at_level(logging.WARNING, logger=_HOOK_LOGGER):
+            _collect(_hook(), [_campaign(1)], [_page(rows, total=5, rounded=True)])
+        (message,) = [
+            r.getMessage() for r in caplog.records if "total_rows_rounded" in r.getMessage()
+        ]
+        assert "lost rows between pages" in message
 
     def test_an_answer_without_a_readable_total_fails_the_day(self):
         """Rows nothing can be checked against are rows nothing may trust."""

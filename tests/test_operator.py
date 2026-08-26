@@ -362,6 +362,14 @@ class TestParametersReachTheHook:
         assert kwargs["accuracy"] == "full"
         assert kwargs["include_undefined"] is True
 
+    def test_include_undefined_of_none_reaches_the_hook_as_none(self, tmp_path):
+        """``None`` is the ask to leave the parameter out and take the API default."""
+        op = _operator(base_dir=str(tmp_path), include_undefined=None)
+        with _Run([_row()]) as run:
+            op.execute(_context())
+        _, kwargs = run.get_stats.call_args
+        assert kwargs["include_undefined"] is None
+
     def test_pace_and_page_size_reach_the_hook(self, tmp_path):
         op = _operator(base_dir=str(tmp_path), limit=500, request_delay=1.5)
         with _Run([_row()]) as run:

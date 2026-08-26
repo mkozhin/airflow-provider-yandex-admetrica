@@ -41,7 +41,7 @@ class _MaskedError(AirflowException):
 
 #: Version of the diagnostic event's field set.  A reader of a stored event
 #: knows by this number which fields it may expect.
-_SCHEMA_VERSION = 1
+_SCHEMA_VERSION = 2
 
 #: Host every request goes to.
 _API_HOST = "https://api.media.metrika.yandex.net"
@@ -215,18 +215,56 @@ _REQUEST_TIMEOUT = 30
 #: the request never reached the logic that would refuse it on its merits.
 _RETRY_STATUSES = frozenset({429, *range(500, 600)})
 
-#: The pause before each repeat, in seconds.  The length of the ladder is also
-#: the number of repeats, so a request gets one attempt plus one rung per pause.
-#: AdMetrica publishes no quota, so the ladder is short and conservative: a
-#: refusal the server means to last is answered within seconds rather than
-#: minutes, and what a task spends on retries stays small.
+#: Statuses that name the token rather than the request.  Both say the same
+#: thing about a long-lived credential nothing here refreshes — the API answers
+#: a token it will not accept with either of them — so both end the attempt
+#: where it stands.
+_AUTH_STATUSES = frozenset({401, 403})
+
+#: The one status whose body decides what happens next.  A 400 is the API's
+#: answer to everything it objects to in a request — a name it does not know, a
+#: value it cannot use, a report that ran long — so the status alone settles
+#: nothing there and ``error_type`` is read to tell those apart.  Every other
+#: status this module branches on says all it has to say in the status line.
+_TYPED_REFUSAL_STATUS = 400
+
+#: The pause before each repeat of a rate limit, a server-side failure or a
+#: request the network did not carry, in seconds.  A request gets one attempt
+#: plus one rung per pause, and the rung is picked by the number of the attempt
+#: that follows it, so every ladder in this module has to be able to answer for
+#: every repeat the budget allows — ``_request_page`` therefore counts the
+#: budget off the shorter of them.  AdMetrica publishes no quota, so this ladder
+#: is short and conservative: a refusal the server means to last is answered
+#: within seconds rather than minutes, and what a task spends on retries stays
+#: small.
 _BACKOFF_DELAYS = [1, 2, 4]
 
+#: The pause before each repeat of a refusal the API states in the body of a
+#: 400, in seconds.  Every kind of refusal named in
+#: :data:`_RETRYABLE_ERROR_TYPES` is repeated along it: that set is what selects
+#: this ladder, and a kind joining it walks these same rungs.  The span of the
+#: ladder is a minute because the condition behind such a refusal drifts on the
+#: scale of minutes: a request refused now is answered once the window it fell
+#: into has passed.  It holds as many rungs as :data:`_BACKOFF_DELAYS` so that
+#: both ladders answer for the same attempt budget: the budget is one attempt
+#: plus a rung, and a ladder shorter than its neighbour would shorten it for
+#: every kind of refusal at once.
+_QUERY_ERROR_DELAYS = [5, 15, 45]
+
+#: The values of ``error_type`` a repeat can fix.  The check is membership of
+#: this set rather than the status alone: a 400 carries every complaint the API
+#: has about a request, and only the one named here says the request is sound
+#: and the moment was not.
+_RETRYABLE_ERROR_TYPES = frozenset({"query_error"})
+
 #: The header a server names its own wait in, and the longest such wait this
-#: provider honours.  The header outranks the ladder — a server that says when
-#: to come back knows its window better than a rung chosen in advance — but only
-#: up to the cap: a wait of hours would hold a task slot for the whole of it,
-#: and failing the day costs less than that.
+#: provider honours.  The header outranks a rung of :data:`_BACKOFF_DELAYS` — a
+#: server that says when to come back knows its window better than a rung chosen
+#: in advance — but only up to the cap: a wait of hours would hold a task slot
+#: for the whole of it, and failing the day costs less than that.  A repeat
+#: along :data:`_QUERY_ERROR_DELAYS` takes its wait from that ladder alone: the
+#: header names a window the server is keeping, while such a refusal is the
+#: endpoint running long.
 _RETRY_AFTER_HEADER = "Retry-After"
 _RETRY_AFTER_MAX = 300
 
@@ -237,7 +275,9 @@ _OUTCOME_UNKNOWN = "unknown"
 #: Outcomes the provider answers with a repeat: a refusal the server may not
 #: repeat itself, and a request the network did not carry at all.  While an
 #: attempt is left, an event carrying one of them is a warning rather than a
-#: failure.
+#: failure, and the line the attempt logs counts itself off the attempt budget
+#: — :func:`_event_level` and :func:`_log_attempt` read this one set, so the
+#: severity in Loki and the wording in the task log name the same policy.
 _RETRIED_OUTCOMES = frozenset({"retryable_error", "network_error"})
 
 #: What ``request_params`` may cost the line: how many parameters are described
@@ -787,6 +827,7 @@ def _new_event(
         "contains_sensitive_data": None,
         "data_lag": None,
         "error_code": None,
+        "error_type": None,
         "error_message": None,
         "exception_type": None,
         "exception_message": None,
@@ -888,7 +929,7 @@ def _find_error(data: object) -> object | None:
     * ``{"error": {…}}`` — a refusal under a key of its own.
     * ``{"errors": [{…}, …]}`` — the plural spelling the Yandex API family
       writes; the first element is the one described, since the event carries
-      one code and one message.
+      one refusal.
     * ``{"code": …, "message": …}`` — the pair written at the top level.  Both
       parts are required and ``code`` has to say something, so an answer that
       merely carries a ``message`` stays an answer rather than a refusal.
@@ -921,50 +962,111 @@ def _find_error(data: object) -> object | None:
         return None
 
 
-def _summarize_error(error: object, token: object) -> tuple[int | None, str | None]:
-    """Allowlist extractor for a refusal: only ``code``/``message``, bounded.
+def _raw_error_type(error: object) -> object:
+    """Return the value a refusal names its kind with, as the body wrote it.
+
+    One reading of where the kind lives, so that the part an event carries and
+    the part a policy is read from come out of the same key of the same object.
+    The two travel apart afterwards — one through the masking gate into
+    ``error_type``, one straight into the branch weighing a repeat — and a
+    second traversal of the body could name a different place.  A refusal that
+    is not a mapping names no kind.
+
+    Never raises: the lookup runs on a real ``dict`` or not at all.
+    """
+    return error.get("error_type") if isinstance(error, dict) else None
+
+
+def _safe_field(raw: object, token: object, label: str) -> str | None:
+    """Return one text part of a refusal in the form an event may carry it.
+
+    A value that is not text is described by its type rather than serialized,
+    so the part stays a short, queryable summary of the failure whatever the
+    server put there and a dashboard can group by it.  Text passes
+    :func:`_safe_text`, which flattens it onto one line, bounds it and cuts the
+    token out; text that survives none of that is reported as no text.
+
+    *label* names the part in the description of an unexpected type, so a
+    reader of an event sees which of them the server worded oddly.
+    """
+    if raw is None:
+        return None
+    if type(raw) is not str:
+        return f"<non-str {label}: {type(raw).__name__}>"
+    return _safe_text(raw, token)
+
+
+def _summarize_error(error: object, token: object) -> tuple[int | None, str | None, str | None]:
+    """Allowlist extractor for a refusal: ``code``, ``error_type``, ``message``.
 
     Values of an unexpected type are described by their type rather than
-    serialized, at both levels — a non-dict error and a non-str ``message`` —
-    so the pair stays a short, queryable summary of the failure whatever the
-    server put there, and a dashboard can group by it.  A code is copied only at
-    exactly ``int``, which leaves a code spelled as text unread rather than
-    guessed at.  Defensive against odd values: it must not itself raise and mask
-    the real ``AirflowException``.
+    serialized, at every level — a non-dict error, a non-str ``error_type``, a
+    non-str ``message`` — so the triple stays a short, queryable summary of the
+    failure whatever the server put there, and a dashboard can group by it.  A
+    code is copied only at exactly ``int``, which leaves a code spelled as text
+    unread rather than guessed at.  Defensive against odd values: it must not
+    itself raise and mask the real ``AirflowException``.
 
-    The message passes :func:`_safe_text`, so it reaches the event flattened
-    onto one line, bounded, and with the token cut out: a server or a proxy is
-    free to quote the ``Authorization`` header back inside a JSON ``message``,
-    and this pair words both the event's fields and the line the attempt logs.
-    A message that survives none of that is reported as no message.
+    ``error_type`` is the API's own name for the kind of refusal, and it is the
+    part a repeat is decided by where the status alone does not settle the
+    question, so it is read at exactly ``str``.
+
+    The type and the message pass :func:`_safe_text`, so they reach the event
+    flattened onto one line, bounded, and with the token cut out: a server or a
+    proxy is free to quote the ``Authorization`` header back inside a JSON
+    ``message``, and this triple words both the event's fields and the line the
+    attempt logs.  Text that survives none of that is reported as no text.
     """
     if not isinstance(error, dict):
-        return None, f"<non-dict error: {type(error).__name__}>"
+        return None, None, f"<non-dict error: {type(error).__name__}>"
     raw_code = error.get("code")
     code = raw_code if type(raw_code) is int else None  # `type(...) is int` excludes bool
-    message = error.get("message")
-    if message is None:
-        return code, None
-    if type(message) is not str:
-        return code, f"<non-str message: {type(message).__name__}>"
-    return code, _safe_text(message, token)
+    return (
+        code,
+        _safe_field(_raw_error_type(error), token, "error_type"),
+        _safe_field(error.get("message"), token, "message"),
+    )
 
 
-def _describe_error(code: int | None, message: str | None) -> str:
-    """Read a refusal out of its two parsed parts, for a human.
+def _describe_error(code: int | None, error_type: str | None, message: str | None) -> str:
+    """Read a refusal out of its three parsed parts, for a human.
 
     The composition is the same wherever the refusal is told — the line an
     attempt logs and the text of the exception that ends the request: the code
-    first, the server's own message after it.  Either part may be missing, and
-    the phrase then holds what there is.  The code is spelled bare, because the
-    API documents no codes and nothing here branches on the value: the policy
-    for a refusal is decided by the HTTP status alone.  ``message`` arrives
-    already bounded and masked by :func:`_summarize_error`.
+    first, the API's own name for the kind of refusal after it, the server's own
+    message last.  Any part may be missing, and the phrase then holds what there
+    is.  The code is spelled bare, because the API documents no codes and
+    nothing here branches on the value; ``error_type`` is spelled as the server
+    wrote it, and it is the part the policy for a 400 is read from, so a reader
+    comparing a repeated refusal with a final one sees in the line the very word
+    the branch weighed.  ``error_type`` and ``message`` arrive already bounded
+    and masked by :func:`_summarize_error`.
     """
-    head = f"code {code}" if code is not None else None
-    if head is not None and message:
+    named = [f"code {code}"] if code is not None else []
+    if error_type:
+        named.append(error_type)
+    head = ", ".join(named)
+    if head and message:
         return f"{head}: {message}"
-    return head or message or "no code and no message"
+    return head or message or "nothing the refusal named"
+
+
+def _error_parts(event: dict) -> tuple[int | None, str | None, str | None] | None:
+    """Return the three parts of the refusal *event* carries, or ``None``.
+
+    One reading of "does this answer name a refusal at all", so that the text of
+    the exception and the line the attempt logs agree on when there is something
+    to spell out: a code, the API's own name for the kind of refusal, the
+    server's own message — any one of the three is a refusal a reader wants
+    told.
+
+    Reads the event's own keys, so it runs on an event this module assembled.
+    """
+    code, error_type = event["error_code"], event["error_type"]
+    message = event["error_message"]
+    if code is not None or error_type or message:
+        return code, error_type, message
+    return None
 
 
 def _with_error(message: str, event: dict) -> str:
@@ -973,15 +1075,13 @@ def _with_error(message: str, event: dict) -> str:
     Every exception this module raises for an answer it read is worded this way,
     so a reader comparing two failures sees the same two halves in both: what the
     provider was doing and what the status was, then the server's own words for
-    it.  An answer that named neither a code nor a message is left as it is
+    it.  An answer that named no code, no kind and no message is left as it is
     rather than followed by an empty phrase.
 
     Reads the event's own keys, so it runs on an event this module assembled.
     """
-    code, error_message = event["error_code"], event["error_message"]
-    if code is not None or error_message:
-        return f"{message}: {_describe_error(code, error_message)}"
-    return message
+    error = _error_parts(event)
+    return f"{message}: {_describe_error(*error)}" if error is not None else message
 
 
 def _describe_unreadable_body(event: dict) -> str:
@@ -1036,9 +1136,9 @@ def _attempt_reason(event: dict) -> str:
     status = event["http_status"]
     parts = [f"HTTP {status}" if status is not None else "no response"]
     outcome = event["outcome"]
-    code, message = event["error_code"], event["error_message"]
-    if code is not None or message:
-        parts.append(_describe_error(code, message))
+    error = _error_parts(event)
+    if error is not None:
+        parts.append(_describe_error(*error))
     if outcome in ("empty_shape", "unexpected_error") and event["payload_kind"] is not None:
         parts.append(_describe_unreadable_body(event))
     elif outcome == "invalid_json":
@@ -1055,31 +1155,75 @@ def _log_attempt(event: dict, retry_delay: float | None) -> None:
     Every outcome but ``success`` gets a line, the last attempt included: the
     attempt after which the task fails is the one whose reason is wanted most,
     and a chronicle that stopped one line short of it would answer the question
-    "what was tried, and why did it end" everywhere except there.  The final line
-    differs by what it lacks — ``Retrying in N s`` appears only where a pause
-    really follows, so a reader and a test tell the two apart by the same word.
+    "what was tried, and why did it end" everywhere except there.
+
+    The line takes one of two forms, by whether the ladder applies to the
+    outcome at all.  An outcome in :data:`_RETRIED_OUTCOMES` spends a step of
+    the attempt budget, so its line counts it — ``attempt N/M failed`` — and
+    the last of those differs by what it lacks: ``Retrying in N s`` appears
+    only where a pause really follows, so a reader and a test tell the two
+    apart by the same word.  Every other outcome ends the export where it
+    stands, and its line says so — ``failed, not retryable`` — because a
+    fraction there would promise attempts the request will never be given.
+
+    The pause is separated from the reason by exactly one period, whether or
+    not the server's own message already ended in one: the sentence about the
+    answer and the sentence about the wait are two, and the server writes only
+    the first.
     """
-    line = (
-        f"{_describe_target(event)}: "
-        f"attempt {event['attempt']}/{event['max_attempts']} failed — "
-        f"{_attempt_reason(event)}"
-    )
+    if event["outcome"] in _RETRIED_OUTCOMES:
+        verdict = f"attempt {event['attempt']}/{event['max_attempts']} failed"
+    else:
+        verdict = "failed, not retryable"
+    line = f"{_describe_target(event)}: {verdict} — {_attempt_reason(event)}"
     if retry_delay is not None:
-        line = f"{line}. Retrying in {retry_delay} s"
+        reason = line[:-1] if line.endswith(".") else line
+        line = f"{reason}. Retrying in {retry_delay} s"
     log.warning("%s", line)
 
 
-def _stamp_response_error(event: dict, resp: object, token: object) -> None:
-    """Copy the refusal a non-200 answer carries onto *event*.
+def _log_recovery(event: dict) -> None:
+    """Write the task-log line naming the attempt a repeated request came back on.
+
+    Written only where a repeat did the work: an attempt past the first that
+    brought a page back closes a run of WARNING lines whose end would otherwise
+    have to be inferred from the silence after it.  A page that arrived on the
+    first attempt says nothing at all, so a healthy export writes no lines about
+    its attempts.
+
+    INFO, and the fraction it carries is the same one the lines above it count
+    off, so the whole run of a page reads as one chronicle at one prefix.
+
+    Reads the event's own keys, so it runs on an event this module assembled.
+    """
+    line = (
+        f"{_describe_target(event)}: recovered on attempt "
+        f"{event['attempt']}/{event['max_attempts']}"
+    )
+    log.info("%s", line)
+
+
+def _stamp_response_error(event: dict, resp: object, token: object) -> str | None:
+    """Copy the refusal a non-200 answer carries onto *event*, and name its kind.
 
     The body goes through the same :func:`_find_error` and
     :func:`_summarize_error` as an HTTP-200 one, so the exception, the line the
-    attempt logs and the event's ``error_code``/``error_message`` tell one
-    failure in one set of terms: a dashboard grouping by ``error_code`` sees the
-    refusals that came with a status as well as the ones that came inside a 200.
-    An answer that names no error this way — HTML from a proxy, an empty answer,
-    a ``json()`` that raises — leaves the pair as it found it and is described by
-    its status alone.
+    attempt logs and the event's ``error_code``/``error_type``/``error_message``
+    tell one failure in one set of terms: a dashboard grouping by ``error_type``
+    sees the refusals that came with a status as well as the ones that came
+    inside a 200.  An answer that names no error this way — HTML from a proxy,
+    an empty answer, a ``json()`` that raises — leaves the three fields as it
+    found them and is described by its status alone.
+
+    The kind of the refusal is returned as well as stamped, so that a branch
+    choosing what to do about it reads a value rather than the event: what the
+    provider does stays independent of which fields the diagnostic schema
+    happens to carry.  What comes back is ``error_type`` as the body spelled it,
+    while the event carries the copy the masking gate made — a policy is read
+    off the API's own word, and the diagnostic layer is free to shorten, flatten
+    or blank the text it ships without moving the decision with it.  A value
+    that is not text names no kind, so it comes back as ``None`` and the answer
+    is refused on its status alone.
 
     Parsing the whole document is what ``resp.json()`` costs, and it is the same
     cost the HTTP-200 branch pays: what :func:`_bounded_body` bounds is the copy
@@ -1089,12 +1233,20 @@ def _stamp_response_error(event: dict, resp: object, token: object) -> None:
     a body that refuses to be read must leave both the type of that exception
     and the reason for it exactly as they are.
     """
+    kind: str | None = None
     try:
         error = _find_error(resp.json())
         if error is not None:
-            event["error_code"], event["error_message"] = _summarize_error(error, token)
+            (
+                event["error_code"],
+                event["error_type"],
+                event["error_message"],
+            ) = _summarize_error(error, token)
+            raw_type = _raw_error_type(error)
+            kind = raw_type if type(raw_type) is str else None
     except Exception:
         pass
+    return kind
 
 
 def _meta_value(value: object, token: object) -> object:
@@ -1236,13 +1388,14 @@ def _record_exception(event: dict, exc: BaseException) -> None:
     human reading the task log, and it carries the server's own ``message``,
     which the server is free to quote a token back into, or — for a network
     failure — the environment's proxy URL, credentials included.  The event
-    describes the same failure through fields it builds itself: ``error_code``
-    and ``error_message`` from the refusal the body carries, ``response_body``
-    from a bounded slice of the answer with the token cut out, and the type alone
-    for a network failure, where there is no response at all.  The one outcome
-    whose text is safe by construction — a JSON document that would not parse —
-    fills ``exception_message`` from :func:`_decoder_position`, which is built
-    from the exception's own coordinates and quotes nothing.
+    describes the same failure through fields it builds itself: ``error_code``,
+    ``error_type`` and ``error_message`` from the refusal the body carries,
+    ``response_body`` from a bounded slice of the answer with the token cut out,
+    and the type alone for a network failure, where there is no response at all.
+    The one outcome whose text is safe by construction — a JSON document that
+    would not parse — fills ``exception_message`` from
+    :func:`_decoder_position`, which is built from the exception's own
+    coordinates and quotes nothing.
 
     The first type recorded is the one kept: an attempt that failed and then
     failed again while being described is told by the failure that started it.
@@ -1263,10 +1416,11 @@ def _event_level(event: dict) -> str:
     advertiser's campaigns, and the caveats a successful answer can carry —
     sampling, rows the API withheld — travel as fields of their own and as
     warnings in the task log.  A refusal the provider repeats — a rate limit, a
-    server-side failure, a network that did not carry the request — is a warning
-    while an attempt is left and a failure on the last one.  A refusal to
-    authorize is an error at first sight: the token is long-lived and nothing
-    here refreshes it, so the attempt after it would be refused the same way.
+    server-side failure, a 400 the API states a retryable ``error_type`` in, a
+    network that did not carry the request — is a warning while an attempt is
+    left and a failure on the last one.  A refusal to authorize is an error at
+    first sight: the token is long-lived and nothing here refreshes it, so the
+    attempt after it would be refused the same way.
 
     The level is the content policy as well as the severity: an answer that
     stays at ``info`` keeps its body inside the process, and moving a row of
@@ -2073,11 +2227,21 @@ class AdmetricaHook(BaseHook):
 
         A 429 or a 5xx and a request the network did not carry are repeated
         along :data:`_BACKOFF_DELAYS`, and the wait is the server's own
-        ``Retry-After`` wherever it named one.  A 401 fails at once: the token is
-        long-lived and nothing here refreshes it, so the attempt after it would
-        be refused the same way.  A 400 or any other 4xx fails at once too, with
-        the server's words for it read out of the body — the request itself is
-        what is being refused, and a repeat brings back the same answer.
+        ``Retry-After`` wherever it named one.  A 400 whose body names an
+        ``error_type`` listed in :data:`_RETRYABLE_ERROR_TYPES` is repeated too,
+        along the minute-wide :data:`_QUERY_ERROR_DELAYS`: such a refusal says
+        the request is sound and the moment was not, so the repeat waits out the
+        window instead of the seconds a rate limit is answered in, and
+        ``Retry-After`` is left unread there — a header names a window the
+        server is keeping, and this refusal is the endpoint running long rather
+        than a window it announced.  Whichever ladder applies, the rung is
+        picked by the number of the attempt about to be spent rather than by how
+        often that kind of refusal has come, so a 400 arriving third waits the
+        third rung.  A status in :data:`_AUTH_STATUSES` fails at once: the token
+        is long-lived and nothing here refreshes it, so the attempt after it
+        would be refused the same way.  Every other 4xx fails at once as well,
+        with the server's words for it read out of the body — the request itself
+        is what is being refused, and a repeat brings back the same answer.
 
         An HTTP-200 body is asked one question: is the rows value the list of
         objects it promises.  Only a body that answers yes — the empty list of a
@@ -2086,16 +2250,22 @@ class AdmetricaHook(BaseHook):
         that describes it, so a zero the provider could not read is never handed
         on as a zero the API reported.
 
-        Every attempt that did not bring a page back leaves one line in the task
-        log, the last one included, so that a minute of waiting reads as a
-        chronicle rather than as a silence.  The line carries parsed fields only.
+        Every attempt that did not bring a page back leaves one WARNING line in
+        the task log, the last one included, so that a minute of waiting reads
+        as a chronicle rather than as a silence, and a page that arrived on a
+        repeat adds one INFO line naming the attempt it came back on, so the
+        run has an end as well as a beginning.  A page that arrived on the
+        first attempt says nothing at all.  The lines carry parsed fields only.
 
         Every attempt emits exactly one diagnostic event when a sink is
         configured: how the attempt went, the request as it went out with the
         token masked, and — for anything :func:`_event_level` rates above
         ``info`` — the raw body, bounded and with the token cut out.  Emission
         never affects control flow: it lives in ``finally`` and every failure of
-        its own is swallowed there.
+        its own is swallowed there.  The task-log line is written first, and
+        each half stands under a net of its own, so neither can cost the other
+        and the attempt is named in the task log even where a stop of the task
+        itself travels out of the push.
         """
         url = _ENDPOINT_URLS[endpoint]
         token = self._get_token()
@@ -2106,7 +2276,10 @@ class AdmetricaHook(BaseHook):
             "Authorization": f"{_TOKEN_SCHEME} {token}",
             "Accept": "application/json",
         }
-        max_attempts = len(_BACKOFF_DELAYS) + 1
+        # One attempt plus one rung per repeat, counted off the shorter ladder:
+        # the rung is picked by the number of the attempt that follows it, so
+        # the budget is what every ladder in the module can answer for.
+        max_attempts = 1 + min(len(_BACKOFF_DELAYS), len(_QUERY_ERROR_DELAYS))
         self._pace()
 
         for attempt in range(max_attempts):
@@ -2122,6 +2295,9 @@ class AdmetricaHook(BaseHook):
             # Set where a pause follows, and read at the foot of the loop as the
             # one answer to "does anything follow this attempt".
             retry_delay: float | None = None
+            # Set where a page is on its way back to the caller, and read in
+            # `finally` as the one answer to "did a repeat bring this one back".
+            recovered = False
             last_attempt = attempt == max_attempts - 1
             # Per attempt, so that a network failure reports the absence of a
             # response instead of the body the previous attempt received.
@@ -2156,10 +2332,11 @@ class AdmetricaHook(BaseHook):
                     _stamp_duration(event, started)
                     event["http_status"] = resp.status_code
 
-                    # One chain, not a run of separate `if`s: the retryable
-                    # branch has a path that neither returns nor raises — it
-                    # names a pause and leaves for `time.sleep` at the foot of
-                    # the loop.
+                    # Two halves: an HTTP 200 is asked what it carries, and
+                    # every other status is read out of its body before an
+                    # outcome is chosen.  A refusal a repeat can fix has a path
+                    # that neither returns nor raises — it names a pause and
+                    # leaves for `time.sleep` at the foot of the loop.
                     if resp.status_code == 200:
                         try:
                             data = resp.json()
@@ -2180,6 +2357,7 @@ class AdmetricaHook(BaseHook):
 
                         if _classify_payload(event, data):
                             _stamp_report_meta(event, data, token)
+                            recovered = attempt > 0
                             return data
 
                         # No list of rows was recognised, so there is no page to
@@ -2188,9 +2366,11 @@ class AdmetricaHook(BaseHook):
                         # campaign that had no impressions.
                         error = _find_error(data)
                         if error is not None:
-                            event["error_code"], event["error_message"] = _summarize_error(
-                                error, token
-                            )
+                            (
+                                event["error_code"],
+                                event["error_type"],
+                                event["error_message"],
+                            ) = _summarize_error(error, token)
                         raise _MaskedError(
                             _with_error(
                                 f"AdMetrica {endpoint} returned HTTP 200 with "
@@ -2199,49 +2379,72 @@ class AdmetricaHook(BaseHook):
                             )
                         )
 
-                    elif resp.status_code == 401:
-                        event["outcome"] = "auth_error"
-                        _stamp_response_error(event, resp, token)
-                        raise _MaskedError(
-                            _with_error(
-                                f"AdMetrica {endpoint} returned 401 Unauthorized: the OAuth "
-                                f"token in connection {self.admetrica_conn_id!r} was refused, "
-                                f"and nothing here refreshes it",
-                                event,
-                            )
-                        )
+                    else:
+                        # The body is read before an outcome is chosen: a 400
+                        # states what it objects to in `error_type`, and that
+                        # word decides the policy along with the status.  What
+                        # is weighed is the value `_stamp_response_error`
+                        # returns rather than the event it stamped, so what the
+                        # provider does stays independent of which fields the
+                        # diagnostic schema carries and of what the masking gate
+                        # makes of them.
+                        error_type = _stamp_response_error(event, resp, token)
+                        status = resp.status_code
 
-                    elif resp.status_code in _RETRY_STATUSES:
-                        event["outcome"] = "retryable_error"
-                        if resp.status_code == 429:
+                        if status in _AUTH_STATUSES:
+                            event["outcome"] = "auth_error"
+                            raise _MaskedError(
+                                _with_error(
+                                    f"AdMetrica {endpoint} returned {status}: the OAuth "
+                                    f"token in connection {self.admetrica_conn_id!r} was "
+                                    f"refused, and nothing here refreshes it",
+                                    event,
+                                )
+                            )
+
+                        if status == 429:
                             _record_rate_limit(event, resp, token)
-                        _stamp_response_error(event, resp, token)
+
+                        # Two ways to earn a repeat, one policy for both: the
+                        # status says the request never reached the logic that
+                        # would judge it, or the body says the request is sound
+                        # and the moment was not.
+                        by_status = status in _RETRY_STATUSES
+                        by_type = (
+                            status == _TYPED_REFUSAL_STATUS
+                            and error_type in _RETRYABLE_ERROR_TYPES
+                        )
+                        if not (by_status or by_type):
+                            event["outcome"] = "http_error"
+                            raise _MaskedError(
+                                _with_error(
+                                    f"AdMetrica {endpoint} returned {status} for {url}",
+                                    event,
+                                )
+                            )
+
+                        event["outcome"] = "retryable_error"
                         if last_attempt:
                             raise _MaskedError(
                                 _with_error(
-                                    f"AdMetrica {endpoint} returned {resp.status_code} for "
+                                    f"AdMetrica {endpoint} returned {status} for "
                                     f"{url} on attempt {max_attempts} of {max_attempts}",
                                     event,
                                 )
                             )
-                        # The server's own `Retry-After` wins whenever it
-                        # named one, in both directions: a longer wait is a
-                        # window that has not passed yet, a shorter one an
-                        # invitation to come back before the ladder would.
-                        asked = _retry_after(resp)
-                        retry_delay = (
-                            _BACKOFF_DELAYS[attempt] if asked is None else asked
-                        )
-
-                    else:
-                        event["outcome"] = "http_error"
-                        _stamp_response_error(event, resp, token)
-                        raise _MaskedError(
-                            _with_error(
-                                f"AdMetrica {endpoint} returned {resp.status_code} for {url}",
-                                event,
-                            )
-                        )
+                        if by_status:
+                            # The server's own `Retry-After` wins whenever it
+                            # named one, in both directions: a longer wait is a
+                            # window that has not passed yet, a shorter one an
+                            # invitation to come back before the ladder would.
+                            asked = _retry_after(resp)
+                            retry_delay = _BACKOFF_DELAYS[attempt] if asked is None else asked
+                        else:
+                            # The ladder alone: a header names a window the
+                            # server is keeping, while this refusal is the
+                            # endpoint running long, and the minute-wide rung is
+                            # the measured answer to that.
+                            retry_delay = _QUERY_ERROR_DELAYS[attempt]
             except BaseException as e:
                 # Safety net: record what escaped, then decide how it leaves.
                 # `BaseException` so that an interrupted attempt is classified
@@ -2275,6 +2478,13 @@ class AdmetricaHook(BaseHook):
                 # the attempt a stop cut short goes unreported, deliberately —
                 # the reason for it is in the Airflow task log.
                 if not interrupted:
+                    # Two halves under two nets of their own, so neither can
+                    # cost the other, and the line goes first.  The push is the
+                    # half a stop can travel out of: `LokiClient.push` lets an
+                    # alarm or a signal through by design, and a stop arriving
+                    # in the middle of one leaves the `finally` with it.  The
+                    # line is written before that can happen, so the attempt is
+                    # in the task log whatever the moment brings next.
                     try:
                         if event["outcome"] != "success":
                             # The task log gets the chronicle of the page: one
@@ -2282,22 +2492,37 @@ class AdmetricaHook(BaseHook):
                             # whether a pause follows it or the exception in
                             # flight ends the export.
                             _log_attempt(event, retry_delay)
-                        if self._loki is not None:
-                            _emit_event(self._loki, event, resp, token)
+                        elif recovered:
+                            # The page arrived on a repeat and is on its way to
+                            # the caller, and the line saying so closes the run
+                            # of WARNINGs above it.
+                            _log_recovery(event)
                     except Exception as diag_error:
                         # Defense in depth: a raise here would replace the
-                        # exception in flight, so everything reporting does —
-                        # reading the body and wording the line included — is
-                        # covered.  The type, not the text: an unexpected
-                        # failure can carry the environment's proxy URL,
-                        # credentials included.
+                        # exception in flight, so wording the line is covered.
+                        # The type, not the text: an unexpected failure can
+                        # carry the environment's proxy URL, credentials
+                        # included.
                         log.debug(
-                            "Diagnostics raised %s; the event is dropped",
+                            "Wording the task-log line raised %s; the line is dropped",
                             type(diag_error).__name__,
                         )
+                    if self._loki is not None:
+                        try:
+                            _emit_event(self._loki, event, resp, token)
+                        except Exception as diag_error:
+                            # Covered for the same reason, and named apart from
+                            # the line so the DEBUG says which half of reporting
+                            # went missing.
+                            log.debug(
+                                "Pushing the event raised %s; the event is dropped",
+                                type(diag_error).__name__,
+                            )
 
-            # Reached only where an attempt named a pause: a non-final retryable
-            # status, or a request the network did not carry with attempts left.
+            # Reached only where an attempt named a pause: a non-final refusal
+            # a repeat can fix — a retryable status or a 400 the API states a
+            # retryable `error_type` in — or a request the network did not carry
+            # with attempts left.
             # The event is already pushed, so a Loki outage never delays its
             # visibility.
             time.sleep(retry_delay)
@@ -2502,7 +2727,7 @@ class AdmetricaHook(BaseHook):
         *,
         filters: str | None = None,
         accuracy: str | None = "full",
-        include_undefined: bool = True,
+        include_undefined: bool | None = True,
         timezone: str | None = None,
         lang: str | None = None,
         extra_params: dict | None = None,
@@ -2521,12 +2746,26 @@ class AdmetricaHook(BaseHook):
         campaigns comes from :meth:`get_campaigns`, so one task instance asks
         the management API once however many campaigns it walks.
 
-        ``sort`` goes out naming every grouping that was asked for.  The report
-        is aggregated by them, so their combination orders the rows completely
-        and repeatably from one page to the next; sorting by a metric would not,
-        since a long tail of placements shares ``renders=1`` and the order
-        within that tail is the API's to choose — and rows would move between
-        pages while the walk was reading them.
+        ``sort`` goes out naming every grouping that was asked for.  The API
+        documents nothing about the order rows come back in, so a walk that
+        asked for no order would be leaning on an unwritten one holding still
+        from page to page: naming the groupings is this hook's own insurance,
+        not a consequence of anything the API promises.  The report is
+        aggregated by them, so their combination is a total order over the rows
+        — the one order that can be asked for with no tie left inside it, where
+        sorting by a metric leaves a long tail of placements sharing
+        ``renders=1`` for the API to arrange as it likes.
+
+        The insurance is backed by two checks rather than taken on faith.  Pages
+        that move under the walk repeat one row and skip another, and both marks
+        are looked for: a grouping combination seen twice inside one campaign
+        fails the day, and the collected rows are counted against the declared
+        ``total_rows`` at the end.  An order that turned out unstable is
+        therefore a day that stops, not a file quietly written short.  The gap
+        is a rounded total: under ``total_rows_rounded`` the count mismatch
+        softens to a warning, since an approximation is free to differ, and a
+        shortfall under that flag is watched by the repeat detector and by a
+        warning of its own wherever the declared total changed under the walk.
 
         The day, the documented ceilings and the parameters this hook owns are
         checked before the first request, so a report configured wrongly costs
@@ -2671,10 +2910,16 @@ class AdmetricaHook(BaseHook):
         whose ``total_rows_rounded`` is not a boolean, and — while the totals
         are exact — one naming a different total than an earlier page all fail
         the day.  Each is a completeness signal the day would otherwise be
-        called whole without, and a rounded total is exempt from the last only
-        because approximations are free to differ.  The rounding flag is
-        remembered once seen, so a later page declaring an exact total cannot
-        re-arm a check the answer has already disowned.
+        called whole without.  The rounding flag is remembered once seen, so a
+        later page declaring an exact total cannot re-arm a check the answer has
+        already disowned.
+
+        Under a rounded total a changed total is a WARNING instead: an
+        approximation may differ from an exact count, so the day is not failed
+        on one, but the same report rounds to the same number at every offset,
+        and a number that changes says the report moved under the walk.  That
+        tells a short day caused by rows going missing between two requests
+        apart from one caused by the rounding, which the rows themselves cannot.
 
         Rows are checked against each other by the identity of their groupings,
         and the set of what has been seen lives here — one campaign, one set.
@@ -2697,6 +2942,7 @@ class AdmetricaHook(BaseHook):
         seen: set[tuple] = set()
         total: int | None = None
         rounded = False
+        moved = False
         offset = _STAT_OFFSET_BASE
         budget = _page_budget(self.limit, _MAX_ROWS)
 
@@ -2749,6 +2995,34 @@ class AdmetricaHook(BaseHook):
                     f"under the walk is one neither answer can be trusted from. The "
                     f"day stops here rather than being checked against a number the "
                     f"API has already replaced."
+                )
+            elif declared != total and not moved:
+                # A rounded total under the walk, and a different one than the
+                # page before.  An approximation is free to differ from an exact
+                # count, which is why it is not failed on, but it is not free to
+                # differ from itself: for a report standing still `total_rows`
+                # is a function of that report and rounds to the same number at
+                # every offset, so a number that changes is the report moving —
+                # rows arriving or going missing between two requests.  That is
+                # the one reading of a short day the rows themselves cannot
+                # carry, and it is said here, where it is still discriminating,
+                # rather than left for a reader of the final count to guess at.
+                # Once per walk: the totals may go on drifting, and the first
+                # change is the whole of what this says.
+                moved = True
+                log.warning(
+                    "AdMetrica declared %s rows for campaign %s on %s on an earlier "
+                    "page and %s on the page at offset %s, with total_rows_rounded "
+                    "set. A rounded total is an approximation, but the same report "
+                    "rounds to the same number at every offset, so a total that "
+                    "changes under the walk is the report itself changing. The rows "
+                    "collected are the ones written, and a count short of what was "
+                    "declared is to be read as that change rather than as a rounding.",
+                    total,
+                    campaign_id,
+                    date,
+                    declared,
+                    offset,
                 )
 
             for raw_row in rows:
@@ -2817,6 +3091,15 @@ class AdmetricaHook(BaseHook):
         not a reason to fail a day that is probably whole.  The walk under a
         rounded total ends only on a short page, which is the API's own word
         that the rows have run out.
+
+        Rounding is one reading of such a difference, and a report that lost
+        rows between two pages is another: the pages of a walk are separated by
+        whatever the requests carrying them waited out, and a repeat along
+        :data:`_QUERY_ERROR_DELAYS` is the longest of those waits.  The warning
+        names both readings, so a shortfall far past any plausible rounding is
+        taken for what it is by whoever finds it.  Where the walk itself saw the
+        declared total change it has already said so in a line of its own, and
+        that line settles which of the two readings this one is.
         """
         if collected == total:
             return
@@ -2827,7 +3110,10 @@ class AdmetricaHook(BaseHook):
         if rounded:
             log.warning(
                 "%s. total_rows_rounded is set, so the declared number is an "
-                "approximation and the collected rows are the ones written.",
+                "approximation and the collected rows are the ones written. A "
+                "report that lost rows between pages reads the same way from "
+                "here, so a difference far past a rounding is worth taking as "
+                "that one.",
                 summary,
             )
             return

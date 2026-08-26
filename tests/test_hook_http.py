@@ -14,9 +14,11 @@ from airflow.exceptions import AirflowException, AirflowTaskTimeout
 from airflow.models import Connection
 
 from airflow_provider_yandex_admetrica.hooks.yandex_admetrica import (
+    _AUTH_STATUSES,
     _BACKOFF_DELAYS,
     _ENDPOINT_URLS,
     _OUTCOME_UNKNOWN,
+    _QUERY_ERROR_DELAYS,
     _REQUEST_TIMEOUT,
     _RETRY_AFTER_HEADER,
     _RETRY_AFTER_MAX,
@@ -31,6 +33,12 @@ from airflow_provider_yandex_admetrica.hooks.yandex_admetrica import (
 TOKEN = "y0__xDf" + "MIDDLE-OF-THE-SECRET" + "q9Az"
 
 _HOOK_LOGGER = "airflow_provider_yandex_admetrica.hooks.yandex_admetrica"
+
+#: The two helpers that word the chronicle of a page, where a test stands in
+#: for one of them; the module they live in is the one the logger is named
+#: after.
+_LOG_ATTEMPT = f"{_HOOK_LOGGER}._log_attempt"
+_LOG_RECOVERY = f"{_HOOK_LOGGER}._log_recovery"
 
 #: The locators a statistics request names itself by; every test that reaches
 #: the request path passes them, so the lines and the events carry a full target.
@@ -86,6 +94,23 @@ def _ok(rows: list | None = None, **extra) -> MagicMock:
     return _response(200, {"data": rows if rows is not None else [], **extra})
 
 
+#: The words the reporting endpoint refuses a request it could not answer in
+#: time with; the ``error_type`` is what the provider reads the policy off.
+QUERY_ERROR_MESSAGE = "Query is too complicated. Please reduce the date interval or sampling."
+
+
+def _refused(error_type: str, message: str = QUERY_ERROR_MESSAGE) -> MagicMock:
+    """A 400 in the shape the API states its complaints in."""
+    return _response(
+        400,
+        {
+            "errors": [{"error_type": error_type, "message": message}],
+            "code": 400,
+            "message": message,
+        },
+    )
+
+
 def _delays(mock_sleep: MagicMock) -> list:
     """The delay each ``time.sleep`` call was given, in order."""
     return [call.args[0] for call in mock_sleep.call_args_list]
@@ -97,6 +122,15 @@ def _lines(caplog) -> list[str]:
         record.getMessage()
         for record in caplog.records
         if record.name == _HOOK_LOGGER and record.levelno == logging.WARNING
+    ]
+
+
+def _info_lines(caplog) -> list[str]:
+    """The lines a page that came back on a repeat left in the task log, in order."""
+    return [
+        record.getMessage()
+        for record in caplog.records
+        if record.name == _HOOK_LOGGER and record.levelno == logging.INFO
     ]
 
 
@@ -146,11 +180,18 @@ class TestSuccessfulAnswer:
             with patch("requests.get", return_value=_ok()):
                 _call(hook)
         assert _lines(caplog) == []
+        assert _info_lines(caplog) == []
 
 
 # ---------------------------------------------------------------------------
 # Answers a repeat can fix
 # ---------------------------------------------------------------------------
+
+
+class TestTheLadders:
+    def test_both_ladders_are_of_one_length(self):
+        """The attempt number is counted off one ladder and indexes either."""
+        assert len(_QUERY_ERROR_DELAYS) == len(_BACKOFF_DELAYS)
 
 
 class TestRetries:
@@ -206,6 +247,107 @@ class TestRetries:
         assert TOKEN not in str(excinfo.value)
         assert _TOKEN_REDACTED in str(excinfo.value)
         assert TOKEN not in "\n".join(_lines(caplog))
+
+
+class TestARefusalTheMomentCaused:
+    def test_a_query_error_walks_its_own_ladder_to_the_end(self):
+        hook = _hook()
+        with patch("requests.get", return_value=_refused("query_error")) as get:
+            with patch("time.sleep") as sleep:
+                with pytest.raises(AirflowException, match="returned 400") as excinfo:
+                    _call(hook)
+        assert get.call_count == len(_QUERY_ERROR_DELAYS) + 1
+        assert _delays(sleep) == _QUERY_ERROR_DELAYS == [5, 15, 45]
+        assert "on attempt 4 of 4" in str(excinfo.value)
+        assert QUERY_ERROR_MESSAGE in str(excinfo.value)
+
+    def test_a_query_error_gives_way_to_the_page_that_follows_it(self):
+        hook = _hook()
+        with patch("requests.get", side_effect=[_refused("query_error"), _ok()]) as get:
+            with patch("time.sleep") as sleep:
+                assert _call(hook) == {"data": []}
+        assert get.call_count == 2
+        assert _delays(sleep) == [_QUERY_ERROR_DELAYS[0]]
+
+    def test_a_header_on_a_query_error_is_left_unread(self):
+        """A window the server keeps is not the ladder an endpoint running long asks for."""
+        refused = _refused("query_error")
+        refused.headers = {_RETRY_AFTER_HEADER: "1"}
+        with patch("requests.get", side_effect=[refused, _ok()]):
+            with patch("time.sleep") as sleep:
+                assert _call(_hook()) == {"data": []}
+        assert _delays(sleep) == [_QUERY_ERROR_DELAYS[0]]
+
+    def test_a_400_of_any_other_type_fails_at_once(self):
+        hook = _hook()
+        with patch("requests.get", return_value=_refused("invalid_parameter")) as get:
+            with patch("time.sleep") as sleep:
+                with pytest.raises(AirflowException, match="returned 400"):
+                    _call(hook)
+        assert get.call_count == 1
+        sleep.assert_not_called()
+
+    @pytest.mark.parametrize("status", [404, 422])
+    def test_the_type_earns_a_repeat_on_a_400_and_nowhere_else(self, status):
+        """The status is half the condition: the word alone does not buy attempts."""
+        refused = _refused("query_error")
+        refused.status_code = status
+        with patch("requests.get", return_value=refused) as get:
+            with patch("time.sleep") as sleep:
+                with pytest.raises(AirflowException, match=f"returned {status}"):
+                    _call(_hook())
+        assert get.call_count == 1
+        sleep.assert_not_called()
+
+    def test_a_5xx_naming_the_type_still_walks_the_ladder_of_its_status(self):
+        """A status that earns a repeat by itself takes no ladder from the body."""
+        refused = _refused("query_error")
+        refused.status_code = 500
+        with patch("requests.get", return_value=refused):
+            with patch("time.sleep") as sleep:
+                with pytest.raises(AirflowException, match="returned 500"):
+                    _call(_hook())
+        assert _delays(sleep) == _BACKOFF_DELAYS
+
+    def test_a_400_naming_no_type_at_all_fails_at_once(self):
+        hook = _hook()
+        with patch("requests.get", return_value=_response(400, {"nothing": "readable"})) as get:
+            with patch("time.sleep") as sleep:
+                with pytest.raises(AirflowException, match="returned 400"):
+                    _call(hook)
+        assert get.call_count == 1
+        sleep.assert_not_called()
+
+    def test_the_campaign_list_earns_the_same_repeat(self):
+        """One request path serves both endpoints, and one policy with it."""
+        answers = [_refused("query_error"), _response(200, {"campaigns": []})]
+        params = {"advertiser_id": 17004, "limit": 100, "offset": 0}
+        with patch("requests.get", side_effect=answers) as get:
+            with patch("time.sleep") as sleep:
+                assert _call(_hook(), "campaigns", params) == {"campaigns": []}
+        assert get.call_count == 2
+        assert _delays(sleep) == [_QUERY_ERROR_DELAYS[0]]
+
+    def test_the_dashboard_tells_it_from_a_5xx_by_status_and_type(self):
+        sink = _Sink()
+        hook = _hook(loki=sink)
+        with patch("requests.get", side_effect=[_refused("query_error"), _ok()]):
+            with patch("time.sleep"):
+                _call(hook)
+        refused = sink.pushed[0]
+        assert refused["outcome"] == "retryable_error"
+        assert refused["http_status"] == 400
+        assert refused["error_type"] == "query_error"
+        assert refused["error_code"] is None
+
+    def test_a_repeat_still_to_come_is_a_warning_and_the_last_one_an_error(self):
+        sink = _Sink()
+        hook = _hook(loki=sink)
+        with patch("requests.get", return_value=_refused("query_error")):
+            with patch("time.sleep"):
+                with pytest.raises(AirflowException):
+                    _call(hook)
+        assert [event["level"] for event in sink.pushed] == ["warn", "warn", "warn", "error"]
 
 
 # ---------------------------------------------------------------------------
@@ -274,16 +416,44 @@ class TestRetryAfter:
 
 
 class TestRefusals:
-    def test_a_401_fails_at_once(self):
+    def test_the_statuses_that_name_the_token_are_the_documented_pair(self):
+        """Spelled out, not read from the module.
+
+        The cases below name their statuses themselves, so the set has to be
+        pinned somewhere: a status leaving it would otherwise delete a case
+        rather than fail one.
+        """
+        assert _AUTH_STATUSES == frozenset({401, 403})
+
+    @pytest.mark.parametrize("status", [401, 403])
+    def test_a_refused_token_fails_at_once(self, status):
         hook = _hook()
-        with patch("requests.get", return_value=_response(401)) as get:
+        with patch("requests.get", return_value=_response(status)) as get:
             with patch("time.sleep") as sleep:
-                with pytest.raises(AirflowException, match="401 Unauthorized") as excinfo:
+                with pytest.raises(AirflowException) as excinfo:
                     _call(hook)
         assert get.call_count == 1
         sleep.assert_not_called()
+        assert f"returned {status}" in str(excinfo.value)
         assert "nothing here refreshes it" in str(excinfo.value)
         assert "'admetrica'" in str(excinfo.value)
+
+    @pytest.mark.parametrize("status", [401, 403])
+    def test_a_refused_token_is_told_apart_from_a_refused_request(self, status):
+        sink = _Sink()
+        hook = _hook(loki=sink)
+        body = {"errors": [{"error_type": "invalid_token", "message": "token is invalid"}]}
+        with patch("requests.get", return_value=_response(status, body)) as get:
+            with patch("time.sleep") as sleep:
+                with pytest.raises(AirflowException) as excinfo:
+                    _call(hook)
+        assert get.call_count == 1
+        sleep.assert_not_called()
+        (event,) = sink.pushed
+        assert event["outcome"] == "auth_error"
+        assert event["http_status"] == status
+        assert event["error_type"] == "invalid_token"
+        assert "token is invalid" in str(excinfo.value)
 
     def test_a_400_fails_at_once_and_carries_the_servers_words(self):
         hook = _hook()
@@ -295,13 +465,37 @@ class TestRefusals:
         assert "returned 400" in str(excinfo.value)
         assert "code 400: dimension am:e:nope is unknown" in str(excinfo.value)
 
-    @pytest.mark.parametrize("status", [403, 404, 409, 422])
+    @pytest.mark.parametrize("status", [404, 409, 422])
     def test_every_other_4xx_fails_at_once_too(self, status):
         hook = _hook()
         with patch("requests.get", return_value=_response(status)) as get:
             with pytest.raises(AirflowException, match=f"returned {status}"):
                 _call(hook)
         assert get.call_count == 1
+
+    def test_a_refusal_whose_only_readable_part_is_the_type_is_told_by_it(self, caplog):
+        """The type alone is a refusal, in the exception and in the line alike."""
+        hook = _hook()
+        body = {"errors": [{"error_type": "invalid_parameter"}]}
+        with caplog.at_level(logging.DEBUG, logger=_HOOK_LOGGER):
+            with patch("requests.get", return_value=_response(400, body)):
+                with pytest.raises(AirflowException) as excinfo:
+                    _call(hook)
+        assert str(excinfo.value).endswith(": invalid_parameter")
+        (line,) = _lines(caplog)
+        assert line.endswith("HTTP 400, invalid_parameter")
+
+    def test_a_non_200_whose_body_is_not_json_is_refused_on_its_status(self):
+        """A body no parser reads names no error, and the status decides alone."""
+        hook = _hook()
+        resp = _response(400)
+        resp.json.side_effect = ValueError("Expecting value")
+        with patch("requests.get", return_value=resp) as get:
+            with patch("time.sleep") as sleep:
+                with pytest.raises(AirflowException, match="returned 400"):
+                    _call(hook)
+        assert get.call_count == 1
+        sleep.assert_not_called()
 
     def test_a_body_naming_no_error_is_described_by_its_status_alone(self):
         hook = _hook()
@@ -404,6 +598,83 @@ class TestAttemptLines:
         )
         assert line.endswith("HTTP 503. Retrying in 1 s")
 
+    def test_a_refusal_a_repeat_can_fix_counts_the_attempt_it_spent(self, caplog):
+        hook = _hook()
+        with caplog.at_level(logging.DEBUG, logger=_HOOK_LOGGER):
+            with patch("requests.get", return_value=_refused("query_error")):
+                with patch("time.sleep"):
+                    with pytest.raises(AirflowException):
+                        _call(hook)
+        lines = _lines(caplog)
+        assert len(lines) == len(_QUERY_ERROR_DELAYS) + 1
+        for number, line in enumerate(lines, start=1):
+            assert f"attempt {number}/4 failed" in line
+            assert "not retryable" not in line
+        # The pause each line promises is its own rung, and the last promises
+        # none; the server's message ends in a period, and the line adds one.
+        for delay, line in zip(_QUERY_ERROR_DELAYS, lines):
+            assert line.endswith(f"or sampling. Retrying in {delay} s")
+        assert "Retrying in" not in lines[-1]
+
+    def test_a_message_that_trails_off_keeps_every_period_it_wrote(self, caplog):
+        """One period separates the wait from the reason; the rest are the server's."""
+        hook = _hook()
+        refused = _refused("query_error", "Report still running...")
+        with caplog.at_level(logging.DEBUG, logger=_HOOK_LOGGER):
+            with patch("requests.get", side_effect=[refused, _ok()]):
+                with patch("time.sleep"):
+                    _call(hook)
+        (line,) = _lines(caplog)
+        assert line.endswith("Report still running... Retrying in 5 s")
+
+    def test_a_refusal_no_repeat_can_fix_promises_no_attempts(self, caplog):
+        hook = _hook()
+        with caplog.at_level(logging.DEBUG, logger=_HOOK_LOGGER):
+            with patch("requests.get", return_value=_refused("invalid_parameter")):
+                with pytest.raises(AirflowException):
+                    _call(hook)
+        (line,) = _lines(caplog)
+        assert line.startswith(
+            "AdMetrica stat campaign_id=123456 date=2026-08-20 offset=1: "
+            "failed, not retryable — "
+        )
+        assert "attempt" not in line
+        assert "Retrying in" not in line
+        assert "HTTP 400, invalid_parameter" in line
+
+    @pytest.mark.parametrize("status", [401, 403])
+    def test_a_refused_token_promises_no_attempts_either(self, status, caplog):
+        hook = _hook()
+        with caplog.at_level(logging.DEBUG, logger=_HOOK_LOGGER):
+            with patch("requests.get", return_value=_response(status)):
+                with pytest.raises(AirflowException):
+                    _call(hook)
+        (line,) = _lines(caplog)
+        assert "failed, not retryable" in line
+        assert "attempt" not in line
+
+    def test_the_line_the_readme_spells_out_is_the_line_written(self, caplog):
+        """The example in both READMEs, produced rather than transcribed."""
+        hook = _hook()
+        with caplog.at_level(logging.DEBUG, logger=_HOOK_LOGGER):
+            with patch("requests.get", return_value=_response(200, {"total": 0})):
+                with pytest.raises(AirflowException):
+                    _call(hook, "campaigns", {"advertiser_id": 17004, "limit": 100, "offset": 0})
+        assert _lines(caplog) == [
+            "AdMetrica campaigns offset=0: failed, not retryable — "
+            "HTTP 200, no readable rows (payload_kind=rows_absent)"
+        ]
+
+    def test_an_unreadable_answer_promises_no_attempts_either(self, caplog):
+        hook = _hook()
+        with caplog.at_level(logging.DEBUG, logger=_HOOK_LOGGER):
+            with patch("requests.get", return_value=_response(200, {"nothing": "readable"})):
+                with pytest.raises(AirflowException):
+                    _call(hook)
+        (line,) = _lines(caplog)
+        assert "failed, not retryable" in line
+        assert "attempt" not in line
+
     def test_a_campaign_list_line_claims_no_day_and_no_campaign(self, caplog):
         hook = _hook()
         answers = [_response(503), _response(200, {"campaigns": []})]
@@ -420,6 +691,7 @@ class TestAttemptLines:
             "http_status": None,
             "outcome": "network_error",
             "error_code": None,
+            "error_type": None,
             "error_message": None,
             "payload_kind": None,
             "exception_type": "ConnectionError",
@@ -432,6 +704,7 @@ class TestAttemptLines:
             "http_status": 200,
             "outcome": "invalid_json",
             "error_code": None,
+            "error_type": None,
             "error_message": None,
             "payload_kind": None,
             "exception_type": "JSONDecodeError",
@@ -439,6 +712,69 @@ class TestAttemptLines:
         }
         reason = _attempt_reason(event)
         assert reason == "HTTP 200, invalid JSON (Expecting value: line 1 column 1 (char 0))"
+
+
+class TestTheLineSayingTheRepeatWorked:
+    def test_a_page_that_came_back_on_a_repeat_names_the_attempt(self, caplog):
+        hook = _hook()
+        with caplog.at_level(logging.DEBUG, logger=_HOOK_LOGGER):
+            with patch("requests.get", side_effect=[_response(503), _ok()]):
+                with patch("time.sleep"):
+                    _call(hook)
+        assert len(_lines(caplog)) == 1
+        (line,) = _info_lines(caplog)
+        assert line == (
+            "AdMetrica stat campaign_id=123456 date=2026-08-20 offset=1: "
+            "recovered on attempt 2/4"
+        )
+
+    def test_a_repeated_refusal_the_moment_caused_is_recovered_from_too(self, caplog):
+        hook = _hook()
+        answers = [_refused("query_error"), _refused("query_error"), _ok()]
+        with caplog.at_level(logging.DEBUG, logger=_HOOK_LOGGER):
+            with patch("requests.get", side_effect=answers):
+                with patch("time.sleep"):
+                    _call(hook)
+        (line,) = _info_lines(caplog)
+        assert line.endswith("recovered on attempt 3/4")
+
+    def test_a_line_that_cannot_be_worded_still_hands_the_page_on(self):
+        """Reporting sits inside the net that keeps it out of the export's way."""
+        hook = _hook()
+        with patch("requests.get", side_effect=[_response(503), _ok()]):
+            with patch("time.sleep"):
+                with patch(_LOG_RECOVERY, side_effect=RuntimeError("no words")):
+                    assert _call(hook) == {"data": []}
+
+    def test_a_line_that_cannot_be_worded_still_leaves_the_event_behind(self):
+        """The event carries the attempt in fields, so it outlives the wording."""
+        sink = _Sink()
+        hook = _hook(loki=sink)
+        with patch("requests.get", side_effect=[_response(503), _ok()]):
+            with patch("time.sleep"):
+                with patch(_LOG_RECOVERY, side_effect=RuntimeError("no words")):
+                    assert _call(hook) == {"data": []}
+        assert [event["outcome"] for event in sink.pushed] == [
+            "retryable_error",
+            "success",
+        ]
+
+    def test_a_page_that_came_back_at_once_says_nothing(self, caplog):
+        hook = _hook()
+        with caplog.at_level(logging.DEBUG, logger=_HOOK_LOGGER):
+            with patch("requests.get", return_value=_ok()):
+                _call(hook)
+        assert _info_lines(caplog) == []
+
+    def test_a_request_that_never_came_back_says_nothing_either(self, caplog):
+        hook = _hook()
+        with caplog.at_level(logging.DEBUG, logger=_HOOK_LOGGER):
+            with patch("requests.get", return_value=_response(503)):
+                with patch("time.sleep"):
+                    with pytest.raises(AirflowException):
+                        _call(hook)
+        assert _info_lines(caplog) == []
+        assert len(_lines(caplog)) == len(_BACKOFF_DELAYS) + 1
 
 
 # ---------------------------------------------------------------------------
@@ -542,12 +878,40 @@ class TestDiagnostics:
             _call(hook)
         assert sink.pushed == []
 
+    def test_an_attempt_line_that_cannot_be_worded_still_pushes_its_event(self):
+        """Wording the chronicle and pushing the event stand under separate nets."""
+        sink = _Sink()
+        hook = _hook(loki=sink)
+        with patch("requests.get", return_value=_response(503)):
+            with patch("time.sleep"):
+                with patch(_LOG_ATTEMPT, side_effect=RuntimeError("no words")):
+                    with pytest.raises(AirflowException):
+                        _call(hook)
+        assert len(sink.pushed) == len(_BACKOFF_DELAYS) + 1
+
     def test_a_sink_that_raises_never_reaches_the_caller(self):
         sink = _Sink()
         sink.push = MagicMock(side_effect=RuntimeError("loki is down"))
         hook = _hook(loki=sink)
         with patch("requests.get", return_value=_ok()):
             assert _call(hook) == {"data": []}
+
+    def test_a_stop_out_of_the_sink_leaves_the_attempt_line_behind(self, caplog):
+        """`push` lets a stop of the task through, and the line is written before it."""
+        sink = _Sink()
+        stop = AirflowTaskTimeout("Timeout, PID: 4242")
+        sink.push = MagicMock(side_effect=stop)
+        hook = _hook(loki=sink)
+
+        with caplog.at_level(logging.DEBUG, logger=_HOOK_LOGGER):
+            with patch("requests.get", return_value=_response(503)):
+                with patch("time.sleep"):
+                    with pytest.raises(AirflowTaskTimeout) as excinfo:
+                        _call(hook)
+
+        assert excinfo.value is stop
+        (line,) = _lines(caplog)
+        assert "HTTP 503" in line
 
     def test_without_a_sink_no_event_is_built_at_all(self):
         hook = _hook()

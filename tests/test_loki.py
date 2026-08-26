@@ -570,6 +570,7 @@ def _full_event(response_body: str, filler: str) -> dict:
         contains_sensitive_data=True,
         data_lag=86400,
         error_code=403,
+        error_type=filler * _TEXT_LIMIT,
         error_message=filler * _TEXT_LIMIT,
         exception_type="AirflowException",
         exception_message=filler * _TEXT_LIMIT,

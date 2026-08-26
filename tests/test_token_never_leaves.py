@@ -172,6 +172,20 @@ SCENARIOS = {
             400, {"error": {"code": 400, "message": f"unparsed {_TOKEN_SCHEME} {TOKEN}"}}
         )
     },
+    "400 naming the kind of its refusal with the header it read": lambda: {
+        "return_value": _response(
+            400,
+            {
+                "errors": [
+                    {
+                        "error_type": f"{_TOKEN_SCHEME} {TOKEN}",
+                        "message": "Query is too complicated.",
+                    }
+                ],
+                "code": 400,
+            },
+        )
+    },
     "403 wording its refusal with the header it read": lambda: {
         "return_value": _response(403, {"error": {"message": f"{_TOKEN_SCHEME} {TOKEN}"}})
     },
