@@ -37,9 +37,9 @@ day, dictionary → cleanup
 общем томе (NFS, PVC с `ReadWriteMany`), примонтированном в `BASE_DIR` на каждом
 воркере, который берёт задачи этого DAG.
 
-Таблицу кампании заводит `BigQueryHook.create_table`, которого у
-`apache-airflow-providers-google` нет до 13.0.0, поэтому DAG требует
-`apache-airflow-providers-google>=13.0.0`. Constraint-набор Airflow 2.9.1 прибивает
+Таблицу кампании заводит `BigQueryHook.create_table`, а самый ранний доступный на PyPI
+релиз с этим методом — 14.0.0, поэтому DAG требует
+`apache-airflow-providers-google>=14.0.0`. Constraint-набор Airflow 2.9.1 прибивает
 10.17.0, так что на такой инсталляции google-провайдер ставится выше её собственных
 constraints — иначе `load_bq` падает на первой кампании первого дня.
 
@@ -171,6 +171,21 @@ Clear нужного map index группы `day` вместе с задачам
 `WRITE_TRUNCATE` в декоратор партиции делают это безобидным: после успешного повтора
 день в витрине сходится.
 
+Загрузку, которую таска не досмотрела, она отменяет: SIGTERM ручной остановки и
+`execution_timeout` поднимаются внутри ожидания, и job кампании уходит из BigQuery
+вместе с таской. Имя job'а таска придумывает до отправки, поэтому назвать его в отмене
+есть чем и тогда, когда сорвало саму отправку, а ответ с именем не доехал.
+
+Без хозяина job остаётся в трёх случаях: жёсткое убийство воркера — SIGKILL, потеря
+узла — не исполняет отмену вовсе; отмену может отвергнуть сам BigQuery, и тогда её
+отказ уходит в лог таски; а принятая отмена не мгновенна — хук ждёт её около минуты и
+возвращается, если job за это время не закончился. Повтор той же таски грузит те же
+файлы, и оба job'а кладут в партицию одно и то же; разойтись они могут, только если
+день собран заново — clear группы `day` целиком переписывает файлы, и осиротевший job
+тогда может лечь поверх свежих цифр прежними. Такой job отменяют в консоли BigQuery —
+он грузит в `stats_{advertiser_id}_{campaign_id}` — либо, если он уже дошёл, повторяют
+день ещё раз.
+
 `cleanup` стоит с `trigger_rule="none_failed"`: при `all_done` он сносил бы локальные
 файлы и после окончательного отказа загрузки, и обычный ручной clear упавшей загрузки
 повторить её уже не смог бы — день пришлось бы выкачивать из API заново. Правило
@@ -179,10 +194,12 @@ Clear нужного map index группы `day` вместе с задачам
 `dictionary`.
 """
 
+import logging
 import os
 import shutil
 from collections.abc import Iterable
 from datetime import date, timedelta
+from uuid import uuid4
 
 from airflow.decorators import dag, task, task_group
 from airflow.exceptions import AirflowSkipException
@@ -201,6 +218,8 @@ from airflow_provider_yandex_admetrica.operators.stats import (
     YandexAdmetricaStatsOperator,
     id_segment,
 )
+
+log = logging.getLogger(__name__)
 
 # ── Конфигурация ──────────────────────────────────────────────────────────────
 
@@ -568,9 +587,21 @@ def admetrica_to_bq_and_s3():
         Направление своё: таска читает файлы дня сама и ни к чему в S3 не
         привязана, поэтому отказ той стороны её не касается.
 
-        `job_id` не задаётся: `insert_job` подмешивает в него микросекунды,
-        поэтому повтор не упирается в 409, а `WRITE_TRUNCATE` в партицию делает
-        его безобидным — кампания перезаписывается тем, что собрано заново.
+        Имя job'а таска задаёт сама и до отправки: BigQuery принимает job
+        раньше, чем ответ с именем возвращается, и придуманное заранее имя
+        называет его в отмене в любое из этих мгновений. Имя уникально на
+        попытку, поэтому повтор не упирается в 409, а `WRITE_TRUNCATE` в партицию
+        делает второй заход безобидным — кампания перезаписывается тем, что
+        собрано заново.
+
+        Job'а ждёт сама таска (`nowait=True`), и сорванное ожидание его отменяет:
+        убитая или вышедшая за `execution_timeout` таска иначе оставила бы
+        загрузку доезжать без неё, а повтор завёл бы в ту же партицию второй
+        `WRITE_TRUNCATE` — какие цифры в ней останутся, решал бы порядок, в
+        котором эти два job'а закончатся. Отмена внутрипроцессная и не всесильна:
+        SIGKILL и потеря воркера её не исполняют, а принятую BigQuery отмену хук
+        ждёт около минуты и возвращается, если job за это время не закончился, —
+        см. «## Перезапуск отдельного дня».
 
         День, за который ни одна кампания не отдала строк, файлов не пишет, и
         грузить нечего: такой день пропускается вместе с задачами ниже.
@@ -602,10 +633,23 @@ def admetrica_to_bq_and_s3():
                 location=BQ_LOCATION,
                 exists_ok=True,
             )
-            bigquery.insert_job(
-                location=BQ_LOCATION,
-                configuration=stats_load_configuration(record, object_name),
-            )
+            job_id = f"admetrica_{uuid4().hex}"
+            try:
+                bigquery.insert_job(
+                    job_id=job_id,
+                    location=BQ_LOCATION,
+                    configuration=stats_load_configuration(record, object_name),
+                    nowait=True,
+                ).result()
+            except BaseException:
+                # Отказ отмены уходит в лог, а наверх — то, что сорвало ожидание:
+                # ради него сюда и пришли. Имени может не отвечать ни один job:
+                # отправку могло сорвать до того, как её принял BigQuery.
+                try:
+                    bigquery.cancel_job(job_id=job_id, location=BQ_LOCATION)
+                except Exception:
+                    log.warning("не удалось отменить job %s", job_id, exc_info=True)
+                raise
 
     @task(multiple_outputs=True, trigger_rule="all_done")
     def dictionary_params(mapped_results, **context) -> dict:

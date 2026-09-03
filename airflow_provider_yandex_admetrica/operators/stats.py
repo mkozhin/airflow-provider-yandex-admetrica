@@ -80,6 +80,23 @@ def id_segment(identifier: str) -> str:
     return f"{_fit_bytes(safe, _SEGMENT_BYTES - _DIGEST_LENGTH - 1)}-{digest}"
 
 
+def _campaign_segment(campaign_id: int) -> str:
+    """Return the file name segment naming *campaign_id*.
+
+    A campaign is a positive whole number, and the segment is that number
+    written out.  The shape is checked rather than coerced: read through
+    ``int``, both ``1.9`` and ``"0001"`` name the file of campaign ``1``, and a
+    value that is no campaign at all ends up sharing a file with one that is.
+    A boolean is an ``int`` in Python and no campaign, so the type is refused
+    before the value is looked at.
+    """
+    if isinstance(campaign_id, bool) or not isinstance(campaign_id, int):
+        raise TypeError(f"campaign id must be an integer, got {campaign_id!r}")
+    if campaign_id <= 0:
+        raise ValueError(f"campaign id must be positive, got {campaign_id!r}")
+    return str(campaign_id)
+
+
 class ExportRecord(TypedDict):
     """One file this operator wrote, described for the tasks downstream.
 
@@ -214,15 +231,17 @@ class YandexAdmetricaStatsOperator(BaseOperator):
         addresses a directory under the base directory, spelled oddly, rather
         than a file anywhere on the worker.  The substitution holds wherever the
         day lands, the segment naming a directory as much as the one naming a
-        file.  The campaign asks for no substitution: it reaches here from
+        file.  The campaign asks for no substitution: :func:`_campaign_segment`
+        holds it to a positive whole number and refuses everything else, so no
+        character a substitution would have to reach ever gets into the segment.
+        It arrives here from
         :func:`~airflow_provider_yandex_admetrica.hooks.yandex_admetrica._campaign_record`,
-        which has already read it as a positive whole number, and ``int`` spells
-        that shape out where the segment is built, so the invariant is held here
-        rather than only in the caller that supplies it.
+        which reads it as that same shape, and the refusal is what keeps the two
+        ends of that agreement from drifting apart.
         """
         safe_date = _UNSAFE_SEGMENT_RE.sub("_", date)
         tail = (
-            (safe_date, f"{int(campaign_id)}.json")
+            (safe_date, f"{_campaign_segment(campaign_id)}.json")
             if campaign_id is not None
             else (f"{safe_date}.json",)
         )
@@ -258,8 +277,9 @@ class YandexAdmetricaStatsOperator(BaseOperator):
                     f.write(json.dumps(row, ensure_ascii=False) + "\n")
             os.replace(staged, path)
         except BaseException:
-            # The half-written file names the day a reader would take it for, so
-            # it goes rather than staying behind for an upload to find.
+            # The staged file carries however much of the export got written,
+            # so it goes rather than being left behind for a reader that walks
+            # the directory.
             if os.path.exists(staged):
                 os.unlink(staged)
             raise

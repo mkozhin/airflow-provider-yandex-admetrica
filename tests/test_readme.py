@@ -84,7 +84,7 @@ _LAYOUT_EXAMPLE = "examples.admetrica_to_bq_and_s3_dag"
 
 #: The google provider release that carries `BigQueryHook.create_table`, and
 #: with it the floor every place naming the requirement has to spell.
-_GOOGLE_FLOOR = "apache-airflow-providers-google>=13.0.0"
+_GOOGLE_FLOOR = "apache-airflow-providers-google>=14.0.0"
 
 #: The files that name the floor: the extra that installs it, the prose a reader
 #: of either BigQuery example meets before copying it, and the document that
@@ -355,11 +355,11 @@ class TestTheLayoutIsTheOneTheCodeBuilds:
 
 
 class TestGoogleProviderFloor:
-    """The day's load creates the campaign's table through a method the google
-    provider grew in 13.0.0, and the constraint set of Airflow 2.9.1 — the oldest
-    Airflow this package supports — pins 10.17.0, where the method is absent. The
-    floor is therefore a requirement of the examples rather than a preference, and
-    it holds only while every place that states it agrees."""
+    """The day's load creates the campaign's table through a method whose earliest
+    release on PyPI is google provider 14.0.0, while the constraint set of Airflow
+    2.9.1 — the oldest Airflow this package supports — pins 10.17.0, where the
+    method is absent. The floor is therefore a requirement of the examples rather
+    than a preference, and it holds only while every place that states it agrees."""
 
     def test_the_hook_carries_the_method_the_examples_call(self):
         assert hasattr(BigQueryHook, "create_table")

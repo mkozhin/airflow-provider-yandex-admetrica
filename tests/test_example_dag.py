@@ -7,7 +7,7 @@ import importlib
 from types import SimpleNamespace
 
 import pytest
-from airflow.exceptions import AirflowSkipException
+from airflow.exceptions import AirflowSkipException, AirflowTaskTimeout
 from airflow.providers.amazon.aws.hooks.s3 import S3Hook
 from airflow.providers.google.cloud.hooks.bigquery import BigQueryHook
 from airflow.providers.google.cloud.hooks.gcs import GCSHook
@@ -62,6 +62,28 @@ def _day_of_two_campaigns(date="2026-08-20"):
     ]
 
 
+class _Job:
+    """The job a submission hands back: a wait that breaks on *error*.
+
+    A live worker breaks the wait with a SIGTERM or an ``execution_timeout``,
+    which reach the task as exceptions off ``BaseException`` rather than off
+    ``Exception``, and *error* is how a test asks for the same thing.
+    """
+
+    def __init__(self, error: BaseException | None = None):
+        self.error = error
+
+    def result(self):
+        if self.error is not None:
+            raise self.error
+
+
+def _submissions(error: BaseException | None = None):
+    """Return a factory of jobs whose wait breaks the way the test asked for."""
+    return lambda _kwargs: _Job(error)
+
+
+
 @pytest.fixture
 def fake_cloud(dag_module, monkeypatch, recording_hook):
     """Replace the hooks the module holds and hand back the record of their calls.
@@ -72,8 +94,13 @@ def fake_cloud(dag_module, monkeypatch, recording_hook):
     s3 = recording_hook(S3Hook, "aws_conn_id", calls="load_file")
     gcs = recording_hook(GCSHook, "gcp_conn_id", calls="upload")
     bigquery = recording_hook(
-        BigQueryHook, "gcp_conn_id", calls="insert_job", tables="create_table"
+        BigQueryHook,
+        "gcp_conn_id",
+        calls="insert_job",
+        tables="create_table",
+        cancels="cancel_job",
     )
+    bigquery.returns["insert_job"] = _submissions()
     monkeypatch.setattr(dag_module, "S3Hook", s3)
     monkeypatch.setattr(dag_module, "GCSHook", gcs)
     monkeypatch.setattr(dag_module, "BigQueryHook", bigquery)
@@ -428,11 +455,25 @@ class TestTheDayLoadsEveryCampaign:
 
         assert len(fake_cloud.bigquery.calls) == 2
 
-    def test_the_job_is_left_to_name_itself(self, dag_obj, fake_cloud):
-        """An id of its own makes a retry a 409; the mixed-in microseconds do not."""
+    def test_every_job_carries_a_name_the_task_gave_it(self, dag_obj, fake_cloud):
+        """A name of the task's own is what a cancel has to name the job by."""
+        self._load(dag_obj)(_day_of_two_campaigns(), run_id="run_a")
+
+        assert all(call["job_id"] for call in fake_cloud.bigquery.calls)
+
+    def test_the_campaigns_of_a_day_are_named_apart(self, dag_obj, fake_cloud):
+        """One name for two jobs is a 409 on the second."""
+        self._load(dag_obj)(_day_of_two_campaigns(), run_id="run_a")
+
+        assert len({call["job_id"] for call in fake_cloud.bigquery.calls}) == 2
+
+    def test_a_second_attempt_names_its_jobs_apart_from_the_first(self, dag_obj, fake_cloud):
+        """A name carried over from the attempt before meets its job as a 409."""
+        self._load(dag_obj)([_record()], run_id="run_a")
         self._load(dag_obj)([_record()], run_id="run_a")
 
-        assert "job_id" not in fake_cloud.bigquery.calls[0]
+        first, second = fake_cloud.bigquery.calls
+        assert first["job_id"] != second["job_id"]
 
     def test_the_loads_of_a_day_go_through_the_configured_connection(
         self, dag_obj, dag_module, fake_cloud
@@ -465,6 +506,81 @@ class TestTheDayLoadsEveryCampaign:
         assert fake_cloud.gcs.calls == []
         assert fake_cloud.bigquery.calls == []
         assert fake_cloud.bigquery.tables == []
+
+
+class TestTheDayOwnsTheJobsItSubmits:
+    """A load job outlives the task that submitted it, so the task cancels the one
+    it is waiting on when the wait breaks: left running, it would race the
+    ``WRITE_TRUNCATE`` of the next attempt for the same partition, and whichever
+    finished last would decide what the partition holds. The task names the job
+    before submitting it, so the cancel has a name to use even where the break
+    caught the submission itself."""
+
+    def _load(self, dag_obj):
+        return dag_obj.get_task("day.load_bq").python_callable
+
+    def test_the_day_waits_on_the_job_itself(self, dag_obj, fake_cloud):
+        """A wait inside the task is what a termination can break into."""
+        self._load(dag_obj)(_day_of_two_campaigns(), run_id="run_a")
+
+        assert [call["nowait"] for call in fake_cloud.bigquery.calls] == [True, True]
+
+    def test_a_broken_wait_cancels_the_job_it_was_waiting_on(
+        self, dag_obj, dag_module, fake_cloud
+    ):
+        fake_cloud.bigquery.returns["insert_job"] = _submissions(AirflowTaskTimeout("timed out"))
+
+        with pytest.raises(AirflowTaskTimeout):
+            self._load(dag_obj)(_day_of_two_campaigns(), run_id="run_a")
+
+        assert fake_cloud.bigquery.cancels == [
+            {
+                "job_id": fake_cloud.bigquery.calls[0]["job_id"],
+                "location": dag_module.BQ_LOCATION,
+            }
+        ]
+
+    def test_a_broken_submission_cancels_the_job_by_the_name_it_was_given(
+        self, dag_obj, dag_module, fake_cloud
+    ):
+        """BigQuery takes a job before the answer naming it comes back, so a
+        submission broken in flight can have left one running all the same."""
+        fake_cloud.bigquery.fail_at["insert_job"] = 1
+
+        with pytest.raises(RuntimeError):
+            self._load(dag_obj)([_record()], run_id="run_a")
+
+        assert fake_cloud.bigquery.cancels == [
+            {
+                "job_id": fake_cloud.bigquery.calls[0]["job_id"],
+                "location": dag_module.BQ_LOCATION,
+            }
+        ]
+
+    def test_a_broken_wait_stops_the_day_where_it_stands(self, dag_obj, fake_cloud):
+        """The campaigns behind the broken wait are the retry's to load."""
+        fake_cloud.bigquery.returns["insert_job"] = _submissions(AirflowTaskTimeout("timed out"))
+
+        with pytest.raises(AirflowTaskTimeout):
+            self._load(dag_obj)(_day_of_two_campaigns(), run_id="run_a")
+
+        assert len(fake_cloud.bigquery.calls) == 1
+
+    def test_a_refused_cancel_leaves_the_failure_it_came_for(self, dag_obj, fake_cloud):
+        """The task is dying of the broken wait, and that is what Airflow has to
+        see: a cancel BigQuery refuses is a line in the log, not the new failure."""
+        fake_cloud.bigquery.returns["insert_job"] = _submissions(AirflowTaskTimeout("timed out"))
+        fake_cloud.bigquery.fail_at["cancel_job"] = 1
+
+        with pytest.raises(AirflowTaskTimeout):
+            self._load(dag_obj)(_day_of_two_campaigns(), run_id="run_a")
+
+        assert len(fake_cloud.bigquery.cancels) == 1
+
+    def test_a_day_that_loads_cleanly_cancels_nothing(self, dag_obj, fake_cloud):
+        self._load(dag_obj)(_day_of_two_campaigns(), run_id="run_a")
+
+        assert fake_cloud.bigquery.cancels == []
 
 
 class TestSchemas:

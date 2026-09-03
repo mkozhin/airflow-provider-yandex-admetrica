@@ -25,6 +25,11 @@ def _recording_method(real_hook, method: str, calls: list[dict]):
     the provider would refuse fails the test here instead of reaching a live
     run green. The keywords go into *calls* before the refusal a test asked
     for, so what the stand-in was asked to do stays readable either way.
+
+    What the stand-in hands back comes from ``returns``, a factory the test
+    installs under the name of the method and which is called with the keywords
+    of this call: a method whose caller goes on to use the result — a submitted
+    job, say — needs one, and every other method answers ``None``.
     """
     signature = inspect.signature(getattr(real_hook, method))
 
@@ -33,6 +38,8 @@ def _recording_method(real_hook, method: str, calls: list[dict]):
         calls.append(kwargs)
         if type(self).fail_at.get(method) == len(calls):
             raise RuntimeError(f"{real_hook.__name__}.{method} refused call {len(calls)}")
+        make_result = type(self).returns.get(method)
+        return make_result(kwargs) if make_result is not None else None
 
     return call
 
@@ -47,7 +54,8 @@ def recording_hook():
     own, so two tests share nothing.
 
     ``fail_at`` maps a method to the ordinal of the call that raises, which is
-    how a test asks the day for a refusal in the middle of its loop.
+    how a test asks the day for a refusal in the middle of its loop, and
+    ``returns`` maps a method to the factory of what it hands back.
     """
 
     def make(real_hook, conn_kwarg: str, **methods: str):
@@ -59,7 +67,7 @@ def recording_hook():
         goes into ``conn_ids``.
         """
         conn_ids: list[str] = []
-        namespace: dict = {"conn_ids": conn_ids, "fail_at": {}}
+        namespace: dict = {"conn_ids": conn_ids, "fail_at": {}, "returns": {}}
 
         def __init__(self, **kwargs):
             inspect.signature(real_hook.__init__).bind(self, **kwargs)

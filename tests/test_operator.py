@@ -20,6 +20,7 @@ from airflow_provider_yandex_admetrica.hooks.yandex_admetrica import (
     _campaign_record,
 )
 from airflow_provider_yandex_admetrica.operators.stats import (
+    DICT_CAMPAIGNS_PARTS,
     YandexAdmetricaStatsOperator,
 )
 
@@ -254,6 +255,36 @@ class TestPath:
         assert first != second
         assert "manual_a-" in first
         assert "manual_a-" in second
+
+
+class TestTheCampaignNamingTheFile:
+    """The segment is a positive whole number written out, and anything else is
+    refused rather than read into one: read through ``int``, a fraction and a
+    numeric string both name the file of the campaign they truncate to, and two
+    campaigns sharing a file is one campaign's rows read as another's."""
+
+    def test_the_campaign_names_the_file_of_the_day(self, tmp_path):
+        op = _operator(base_dir=str(tmp_path))
+        path = op._build_path(RUN_ID, ADVERTISER_ID, ("stats",), DATE, CAMPAIGN_ID)
+        assert os.path.basename(path) == f"{CAMPAIGN_ID}.json"
+
+    @pytest.mark.parametrize("campaign_id", [True, False, 1.9, 1.0, "1234", "0001"])
+    def test_what_is_no_whole_number_is_refused(self, tmp_path, campaign_id):
+        op = _operator(base_dir=str(tmp_path))
+        with pytest.raises(TypeError):
+            op._build_path(RUN_ID, ADVERTISER_ID, ("stats",), DATE, campaign_id)
+
+    @pytest.mark.parametrize("campaign_id", [0, -7])
+    def test_what_is_not_positive_is_refused(self, tmp_path, campaign_id):
+        op = _operator(base_dir=str(tmp_path))
+        with pytest.raises(ValueError):
+            op._build_path(RUN_ID, ADVERTISER_ID, ("stats",), DATE, campaign_id)
+
+    def test_the_dictionary_asks_for_no_campaign_at_all(self, tmp_path):
+        """The snapshot of the whole cabinet answers to no campaign."""
+        op = _operator(base_dir=str(tmp_path))
+        path = op._build_path(RUN_ID, ADVERTISER_ID, DICT_CAMPAIGNS_PARTS, DATE)
+        assert os.path.basename(path) == f"{DATE}.json"
 
 
 class TestWrittenFile:
@@ -731,9 +762,10 @@ class TestTheDayIsHeldToItsFormat:
         assert os.path.normpath(path).startswith(str(tmp_path) + os.sep)
 
     def test_a_campaign_that_is_not_a_number_names_no_file(self, tmp_path):
-        """The segment is spelled as a whole number where it is built."""
+        """A campaign is a whole number, so a segment that would climb out of the
+        directory is refused by its type before it names anything."""
         op = _operator(base_dir=str(tmp_path))
-        with pytest.raises(ValueError):
+        with pytest.raises(TypeError):
             op._build_path(RUN_ID, ADVERTISER_ID, ("stats",), DATE, "../..")
 
 
