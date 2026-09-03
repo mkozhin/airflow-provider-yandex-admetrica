@@ -349,15 +349,15 @@ if your query contains a `WHERE` clause on the `_TABLE_SUFFIX` pseudocolumn».
 - Modify: `examples/admetrica_to_bigquery_dag.py`
 - Modify: `tests/test_example_bigquery_dag.py`
 
-- [ ] добавить `campaign_id` в `gcs_object()` для `kind="stats"`: сейчас объект
+- [x] добавить `campaign_id` в `gcs_object()` для `kind="stats"`: сейчас объект
       адресуется днём, и два файла кампаний одного дня затрут друг друга **до**
       того, как доедут до BigQuery
-- [ ] завести `stats_table_id(record)` →
+- [x] завести `stats_table_id(record)` →
       `f"{BQ_STATS_TABLE}_{advertiser_id}_{campaign_id}${YYYYMMDD}"` — **голый**
       идентификатор без квалификации, его берёт `tableId` конфигурации
       `insert_job`, где проект и датасет идут отдельными полями. Это
       единственный адрес, по которому грузится статистика
-- [ ] `bq_table()` **не трогать**: он остаётся квалифицированным
+- [x] `bq_table()` **не трогать**: он остаётся квалифицированным
       `f"{BQ_PROJECT}.{BQ_DATASET}.{table}${YYYYMMDD}"` и обслуживает только
       словарь. Ветки для статистики в нём заводить не нужно — `load_params()`
       зовут ровно два места (`:364` со `BQ_STATS_TABLE` и `:377` со
@@ -365,12 +365,12 @@ if your query contains a `WHERE` clause on the `_TABLE_SUFFIX` pseudocolumn».
       что статистика через `bq_table()` больше не проходит вовсе. По той же
       причине `test_one_record_gives_every_address_of_its_load` (:267)
       перенастраивается на словарь, а не на статистику
-- [ ] заменить в группе `day` цепочку «`params` + `upload_gcs` + `load_bq`» на
+- [x] заменить в группе `day` цепочку «`params` + `upload_gcs` + `load_bq`» на
       одну таску, которая перебирает записи `kind="stats"`, кладёт каждую через
       `GCSHook.upload` и грузит `BigQueryHook.insert_job` с конфигурацией из
       Technical Details; пустой список — `AirflowSkipException`
-- [ ] импортировать `BigQueryHook` на уровне модуля рядом с `GCSHook`
-- [ ] обновить `doc_md`: «## Структура» (:15-21), «## Формат результата
+- [x] импортировать `BigQueryHook` на уровне модуля рядом с `GCSHook`
+- [x] обновить `doc_md`: «## Структура» (:15-21), «## Формат результата
       оператора» (:44-51), **«## Раскладка» (:59-75)** — раскладка GCS,
       «статистика и справочник живут в разных таблицах», декоратор `table$…`;
       абзац про `autodetect` (:67) не удалять, а развести по двум оставшимся
@@ -382,30 +382,30 @@ if your query contains a `WHERE` clause on the `_TABLE_SUFFIX` pseudocolumn».
       дня»; добавить
       чтение витрины через `stats_*` и `stats_<adv>_*` и предупреждение про
       вью, попадающую под шаблон
-- [ ] переписать тесты, читающие атрибуты исчезающих операторов и старые
+- [x] переписать тесты, читающие атрибуты исчезающих операторов и старые
       адреса: хелпер `_record()` (:34) — `campaign_id` и сид второй кампании;
       `TestKeys` (:231-275) — запечённые объект GCS и `.stats$20260820`;
       `_DAY_TASKS` (:15), `TestOneDayIsOneMapIndex` (:67-81),
       `test_cleanup_runs_after_every_load` (:109), `TestLoadOperators` (:117-132
       — `schema_fields`, `autodetect`, `write_disposition`), `TestTaskCallables`
       (:323-333)
-- [ ] написать тесты на **фактический** адрес загрузки: `tableId` в
+- [x] написать тесты на **фактический** адрес загрузки: `tableId` в
       конфигурации, поданной в `insert_job`, равен
       `f"{BQ_STATS_TABLE}_{advertiser_id}_{campaign_id}${YYYYMMDD}"` — с
       декоратором партиции, — а `projectId` и `datasetId` равны `BQ_PROJECT` и
       `BQ_DATASET`. Без этого формат реального адреса держится только на ручной
       галочке приёмки
-- [ ] написать тесты: таблица словаря не изменилась и осталась квалифицированной
+- [x] написать тесты: таблица словаря не изменилась и осталась квалифицированной
       проектом и датасетом, объект GCS различает кампании одного дня,
       конфигурация job'а несёт прежние схему, `writeDisposition`,
       `createDisposition` и партиционирование
-- [ ] написать замок против потери кампаний: таска дня зовёт `GCSHook.upload` и
+- [x] написать замок против потери кампаний: таска дня зовёт `GCSHook.upload` и
       `BigQueryHook.insert_job` столько раз, сколько в результате дня записей
       `kind="stats"`, и адреса вызовов различаются кампанией. Тест на
       конфигурацию, поданный одной записью, пройдёт и на реализации, берущей
       первую запись, — молчаливая потеря шестидесяти девяти партиций из семидесяти
       не будет поймана ничем
-- [ ] запустить `.venv/bin/pytest tests/test_example_bigquery_dag.py` — должно
+- [x] запустить `.venv/bin/pytest tests/test_example_bigquery_dag.py` — должно
       пройти
 
 ### Task 4: Пример с двумя направлениями сразу

@@ -13,7 +13,7 @@ DAG: статистика медийных кампаний AdMetrica за пе�
 
 ```
 get_dates ─────────┐
-                   ├─→ day[<дата>]: collect → params → upload_gcs → load_bq
+                   ├─→ day[<дата>]: collect → load_bq
 ensure_gcs_bucket ─┘
 
 day ─→ dictionary: params → upload_gcs → load_bq
@@ -22,17 +22,17 @@ day, dictionary → cleanup
 ```
 
 `day` — mapped task group: `get_dates` разворачивает период в список дат от свежих в
-прошлое, и каждый день едет отдельным map index целиком — сбор, выгрузка и загрузка в
-BigQuery. Падение дня останавливает только его собственную цепочку: остальные дни того
-же прогона выгружаются и грузятся как обычно. `collect` стоит с
-`max_active_tis_per_dag=1`, чтобы запросы к API шли последовательно; `max_active_runs=1`
-не даёт двум прогонам писать одну и ту же партицию BigQuery.
+прошлое, и каждый день едет отдельным map index целиком — сбор и загрузка в BigQuery.
+Падение дня останавливает только его собственную цепочку: остальные дни того же прогона
+грузятся как обычно. `collect` стоит с `max_active_tis_per_dag=1`, чтобы запросы к API
+шли последовательно; `max_active_runs=1` не даёт двум прогонам писать одну и ту же
+партицию BigQuery.
 
 ## Требования к развёртыванию
 
 Всем задачам прогона нужна одна и та же файловая система по пути `BASE_DIR`. `collect`
-пишет туда файл дня, а `upload_gcs` и `cleanup` — отдельные экземпляры задач, которые
-этот файл читают, тогда как привязки к воркеру внутри task group Airflow не обещает.
+пишет туда файлы дня, а `load_bq` и `cleanup` — отдельные экземпляры задач, которые
+эти файлы читают, тогда как привязки к воркеру внутри task group Airflow не обещает.
 На Celery или Kubernetes с локальными дисками воркеров выгрузка падает на отсутствующем
 файле, а собранные файлы остаются на том воркере, который их написал, — `cleanup` их не
 видит. Раскладка держится либо на однохостовом `LocalExecutor`, либо на общем томе
@@ -41,14 +41,17 @@ BigQuery. Падение дня останавливает только его �
 
 ## Формат результата оператора
 
-Оператор возвращает список записей `{kind, date, path, advertiser_id}`: `kind="stats"`
-для файла статистики дня и `kind="dict"` для снапшота справочника кампаний.
-`advertiser_id` берётся из записи — рекламодатель назван в коннекшене, и DAG узнаёт
-его только отсюда.
+Оператор возвращает список записей `{kind, date, path, advertiser_id, campaign_id}`:
+`kind="stats"` — файл одной кампании за день, и таких записей в дне столько, сколько
+кампаний дали строки; `kind="dict"` — снапшот справочника кампаний, у него
+`campaign_id=None`, потому что он описывает кабинет целиком. `advertiser_id` берётся
+из записи — рекламодатель назван в коннекшене, и DAG узнаёт его только отсюда.
 
-`day.params` собирает адреса загрузки из записи `kind="stats"` своего дня. День, за
-который API не отдал ни строки, файла не пишет: `params` такого дня поднимает
-`AirflowSkipException`, и выгрузка с загрузкой пропускаются вместе с ним.
+`day.load_bq` перебирает записи `kind="stats"` своего дня и грузит каждую в её
+собственную таблицу — через свой промежуточный объект GCS. Кампания, не отдавшая за
+день ни строки, файла не пишет, и грузить за неё нечего; день, в котором таких записей
+не оказалось вовсе, поднимает `AirflowSkipException`, и загрузка пропускается вместе
+с ним.
 
 Снапшот справочника один на прогон, а пишет его каждый день, в один и тот же файл.
 Грузится он один раз — группой `dictionary` после дней: `dictionary.params` берёт
@@ -63,12 +66,29 @@ BigQuery. Падение дня останавливает только его �
 своего DAG, а рекламодателей обслуживают несколько DAG'ов на общем `BASE_DIR`. Тем же
 парным адресом живут промежуточные объекты в GCS.
 
-В BigQuery статистика и справочник живут в разных таблицах со своими схемами.
-Схемы заданы явно, а `autodetect=False` сказано вслух: по умолчанию оператор GCS →
-BigQuery определяет схему сам, а определял бы он вложенные поля по началу файла и
-терял бы те, что встречаются дальше. Партиция адресуется декоратором `table$YYYYMMDD`
-— по `date` для статистики и по `snapshot_date` для справочника, так что
-`WRITE_TRUNCATE` перетирает один день, а не таблицу целиком.
+Локально и в GCS день статистики — каталог, а файл внутри назван кампанией:
+`…/{advertiser_id}/stats/{дата}/{campaign_id}.json`. Справочник этого уровня не
+получает: он снимок кабинета целиком и адресуется одной только датой снимка.
+
+В BigQuery статистика и справочник живут в разных таблицах со своими схемами, а
+статистика — ещё и в таблице на кампанию: `stats_{advertiser_id}_{campaign_id}`.
+Гранула перезаписи нужна двумерная, день и кампания, а BigQuery партиционирует по
+одному полю, поэтому второе измерение уходит в имя таблицы. Партиция адресуется
+декоратором `table$YYYYMMDD` — по `date` для статистики и по `snapshot_date` для
+справочника, так что `WRITE_TRUNCATE` перетирает один день одной кампании, а не
+таблицу целиком. Гранула перезаписи равна грануле выгрузки, поэтому загрузка части
+кампаний не может стереть данные остальных за те же дни.
+
+Схемы заданы явно, и `autodetect` выключен вслух в обеих загрузках: и в
+`GCSToBigQueryOperator`, которым грузится справочник, и в конфигурации job'а, которым
+грузится статистика. По умолчанию схема определяется сама, а определялась бы она по
+вложенным полям начала файла и теряла бы те, что встречаются дальше.
+
+Витрина читается wildcard-таблицами: `stats_*` — все рекламодатели, `stats_{advertiser_id}_*`
+— один. Цена такого чтения принята сознательно: нет кэша результатов и нет BI Engine, а
+схемы всех таблиц обязаны совпадать до типов и партиционирования. Вью, чьё имя попадает
+под `stats_*`, ломает wildcard-запрос целиком, даже с условием на `_TABLE_SUFFIX`, —
+вью следующего слоя держите в другом датасете либо называйте не на `stats_`.
 
 Промежуточный бакет GCS может быть общим: правило жизненного цикла, которое DAG на
 него вешает, ограничено префиксом `GCS_PREFIX` и встаёт рядом с теми правилами, что
@@ -89,14 +109,16 @@ extra:    {"advertiser_id": 17004}
 ## Перезапуск отдельного дня
 
 Clear нужного map index группы `day` вместе с задачами ниже перевыкачивает день и
-перетирает его партицию в BigQuery. Дни независимы, поэтому повтор одного не трогает
-партиции остальных.
+перетирает партиции тех кампаний, которые он собрал заново. Дни независимы, поэтому
+повтор одного не трогает партиции остальных, а кампания, не давшая за этот день строк,
+остаётся в витрине с прежними цифрами.
 
 `cleanup` стоит с `trigger_rule="none_failed"`: при `all_done` он сносил бы локальные
 файлы и после окончательного отказа загрузки, и обычный ручной clear упавшей загрузки
 повторить её уже не смог бы — день пришлось бы выкачивать из API заново. Правило
-`none_failed`, а не `all_success`, потому что пропуск — штатный исход: день без строк
-пропускает свою загрузку, а прогон без справочника — всю группу `dictionary`.
+`none_failed`, а не `all_success`, потому что пропуск — штатный исход: день без файлов
+статистики пропускает свою загрузку, а прогон без справочника — всю группу
+`dictionary`.
 """
 
 import os
@@ -107,6 +129,7 @@ from datetime import date, timedelta
 from airflow.decorators import dag, task, task_group
 from airflow.exceptions import AirflowSkipException
 from airflow.models.param import Param
+from airflow.providers.google.cloud.hooks.bigquery import BigQueryHook
 from airflow.providers.google.cloud.hooks.gcs import GCSHook
 from airflow.providers.google.cloud.transfers.gcs_to_bigquery import GCSToBigQueryOperator
 from airflow.providers.google.cloud.transfers.local_to_gcs import LocalFilesystemToGCSOperator
@@ -231,6 +254,16 @@ def find_record(records: Iterable[dict] | None, kind: str) -> dict | None:
     return None
 
 
+def select_records(records: Iterable[dict] | None, kind: str) -> list[dict]:
+    """Вернуть все записи вида `kind` в порядке, в котором их отдал оператор.
+
+    Статистика дня приходит записью на кампанию, и загрузке нужны все до одной:
+    взять одну — значит молча оставить остальные кампании дня незагруженными.
+    Порядок — тот же, в котором кабинет перечисляет кампании.
+    """
+    return [record for record in records or [] if record["kind"] == kind]
+
+
 def dictionary_record(mapped_results: Iterable[list[dict]] | None) -> dict | None:
     """Вернуть снапшот справочника прогона из результатов дней.
 
@@ -251,17 +284,41 @@ def gcs_object(record: dict, run_id: str) -> str:
     DAG и прогон входят в ключ: объект живёт до конца прогона и удаляется
     правилом жизненного цикла бакета, поэтому два прогона не должны делить один
     ключ — а бакет общий, и `run_id` одинаков у DAG'ов на общем расписании.
+
+    У статистики день — каталог, а объект назван кампанией: файлы двух кампаний
+    одного дня иначе легли бы на один адрес и затёрли бы друг друга ещё до того,
+    как доехали до BigQuery. Справочник назван датой снимка: он один на прогон.
     """
     parts = "/".join(KEY_PARTS[record["kind"]])
+    name = (
+        f"{record['date']}/{record['campaign_id']}"
+        if record["kind"] == "stats"
+        else record["date"]
+    )
     return (
         f"{GCS_PREFIX}/{id_segment(DAG_ID)}/{id_segment(run_id)}"
-        f"/{record['advertiser_id']}/{parts}/{record['date']}.json"
+        f"/{record['advertiser_id']}/{parts}/{name}.json"
     )
 
 
 def bq_table(record: dict, table: str) -> str:
     """Вернуть партицию таблицы, адресованную декоратором даты записи."""
     return f"{BQ_PROJECT}.{BQ_DATASET}.{table}${record['date'].replace('-', '')}"
+
+
+def stats_table_id(record: dict) -> str:
+    """Вернуть партицию таблицы кампании — голым идентификатором, без квалификации.
+
+    Гранула перезаписи нужна двумерная, день и кампания, а BigQuery партиционирует
+    по одному полю: второе измерение уходит в имя таблицы, и `WRITE_TRUNCATE`
+    достаёт ровно до одного дня одной кампании — перезалив части кампаний не
+    трогает партиции остальных.
+
+    Идентификатор голый: проект и датасет конфигурация `insert_job` называет
+    отдельными полями `projectId` и `datasetId`.
+    """
+    day = record["date"].replace("-", "")
+    return f"{BQ_STATS_TABLE}_{record['advertiser_id']}_{record['campaign_id']}${day}"
 
 
 def load_params(record: dict, run_id: str, table: str) -> dict:
@@ -351,17 +408,53 @@ def admetrica_to_bigquery():
         bucket.lifecycle_rules = [*rules, STAGING_LIFECYCLE_RULE]
         bucket.patch()
 
-    @task(multiple_outputs=True)
-    def day_params(records: list[dict], **context) -> dict:
-        """Вернуть адреса загрузки дня, собранные из его записи статистики.
+    @task
+    def day_load(records: list[dict], **context) -> None:
+        """Загрузить в BigQuery все файлы статистики дня — по файлу на кампанию.
 
-        День, за который API не отдал ни строки, файла не пишет, и грузить нечего:
-        такой день пропускается вместе с задачами ниже.
+        Цикл, а не оператор на запись: число кампаний за день известно только
+        после сбора, а маппинг внутри mapped-группы Airflow не поддерживает.
+        Каждая кампания едет своим промежуточным объектом GCS в свою таблицу;
+        загрузки идут последовательно, и первая же неудача роняет таску, оставляя
+        clear этого map index как повтор дня целиком.
+
+        `job_id` не задаётся: `insert_job` подмешивает в него микросекунды,
+        поэтому повтор не упирается в 409, а `WRITE_TRUNCATE` в партицию делает
+        его безобидным — кампания перезаписывается тем, что собрано заново.
+
+        День, за который ни одна кампания не отдала строк, файлов не пишет, и
+        грузить нечего: такой день пропускается вместе с задачами ниже.
         """
-        record = find_record(records, "stats")
-        if record is None:
-            raise AirflowSkipException("за этот день файла статистики нет")
-        return load_params(record, context["run_id"], BQ_STATS_TABLE)
+        stats = select_records(records, "stats")
+        if not stats:
+            raise AirflowSkipException("за этот день файлов статистики нет")
+        gcs = GCSHook(gcp_conn_id=GCP_CONN_ID)
+        bigquery = BigQueryHook(gcp_conn_id=GCP_CONN_ID)
+        for record in stats:
+            object_name = gcs_object(record, context["run_id"])
+            gcs.upload(
+                bucket_name=GCS_BUCKET,
+                object_name=object_name,
+                filename=record["path"],
+            )
+            bigquery.insert_job(
+                configuration={
+                    "load": {
+                        "sourceUris": [f"gs://{GCS_BUCKET}/{object_name}"],
+                        "destinationTable": {
+                            "projectId": BQ_PROJECT,
+                            "datasetId": BQ_DATASET,
+                            "tableId": stats_table_id(record),
+                        },
+                        "schema": {"fields": BQ_STATS_SCHEMA},
+                        "autodetect": False,
+                        "sourceFormat": "NEWLINE_DELIMITED_JSON",
+                        "writeDisposition": "WRITE_TRUNCATE",
+                        "createDisposition": "CREATE_IF_NEEDED",
+                        "timePartitioning": {"type": "DAY", "field": STATS_PARTITION_FIELD},
+                    }
+                }
+            )
 
     @task(multiple_outputs=True, trigger_rule="all_done")
     def dictionary_params(mapped_results, **context) -> dict:
@@ -404,7 +497,7 @@ def admetrica_to_bigquery():
 
     @task_group(group_id="day")
     def per_day(day: str):
-        """Собрать день и увезти его файл в BigQuery.
+        """Собрать день и загрузить его файлы в BigQuery.
 
         Всё, что делается с днём, лежит внутри группы, поэтому map index — это день
         целиком: упавший день останавливает только свою цепочку, а clear его map
@@ -421,11 +514,7 @@ def admetrica_to_bigquery():
             collect_dictionaries=True,
             max_active_tis_per_dag=1,
         ).output
-        params = day_params.override(task_id="params")(records)
-
-        upload_to_gcs("upload_gcs", params) >> load_to_bq(
-            "load_bq", params, BQ_STATS_SCHEMA, STATS_PARTITION_FIELD
-        )
+        day_load.override(task_id="load_bq")(records)
         return records
 
     @task_group(group_id="dictionary")
