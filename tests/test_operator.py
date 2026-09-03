@@ -400,6 +400,26 @@ class TestTheGrainIsADayOfACampaign:
             f"{SNAPSHOT_DATE}.json",
         )
 
+    def test_a_campaign_that_could_not_be_written_fails_the_day(self, tmp_path, monkeypatch):
+        """A file that never got written stops the task rather than shortening
+        the result: a shorter list is a day the warehouse loads as complete."""
+        op = _operator(base_dir=str(tmp_path), collect_dictionaries=False)
+        written: list[str] = []
+        write = op._write
+
+        def failing_write(records, path):
+            if written:
+                raise OSError("no space left on device")
+            written.append(path)
+            write(records, path)
+
+        monkeypatch.setattr(op, "_write", failing_write)
+        with _Run([_row(), _row(campaign_id=OTHER_CAMPAIGN_ID)]):
+            with pytest.raises(OSError):
+                op.execute(_context())
+
+        assert len(written) == 1
+
     def test_every_record_of_a_full_run_carries_the_campaign_key(self, tmp_path):
         """A DAG walks the whole list, so a missing key would fail it on the dict."""
         op = _operator(base_dir=str(tmp_path))

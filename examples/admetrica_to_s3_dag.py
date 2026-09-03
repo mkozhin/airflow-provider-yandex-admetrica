@@ -77,6 +77,18 @@ API шли последовательно; `max_active_runs=1` не даёт д�
 кампаний не может стереть данные остальных за те же дни. Справочник кампанией не
 адресуется: он снимок кабинета целиком, и переписывается целиком.
 
+Бакет, в который этот DAG выгружает впервые, под `{S3_PREFIX}/{advertiser_id}/stats/`
+должен быть пуст: объект, лежащий по ключу дня без уровня `_campaign_id=`, читатель
+префикса возьмёт наравне с файлами кампаний и посчитает строки дня дважды. Такие ключи
+снимают или уводят в архивный префикс до первого прогона, а внешнюю таблицу или
+краулер переопределяют под ключ партиции `_campaign_id`.
+
+Цена такой грануле — число объектов и число вызовов S3. День стоит по объекту на
+каждую кампанию, давшую строки, и `day.upload_s3` увозит их последовательно, одной
+таской: рекламодатель на 70 кампаний — это 70 выгрузок в дне и около 2100 за
+тридцатидневный период. Считайте это, подбирая `execution_timeout`, и сужайте
+период, если день не укладывается.
+
 ## Формат коннекшена
 
 Один Airflow connection типа HTTP = один рекламодатель:
@@ -95,6 +107,12 @@ Clear нужного map index группы `day` вместе с задачам
 перетирает в S3 файлы тех кампаний, которые он собрал заново. Дни независимы, поэтому
 повтор одного не трогает файлы остальных, а кампания, не давшая за этот день строк,
 остаётся в витрине с прежними цифрами.
+
+День выгружается по кампании за раз и целым в S3 не появляется: отказ на середине
+оставляет в бакете свежие файлы кампаний, до которых цикл дошёл, и прежние — у
+остальных, и в самих данных этой разницы не видно. Повтор увозит день целиком заново,
+поэтому успевшие кампании оплачиваются вторично, а `replace=True` кладёт каждый файл
+на его собственный адрес, и после успешного повтора день в витрине сходится.
 
 `cleanup` стоит с `trigger_rule="none_failed"`: при `all_done` он сносил бы локальные
 файлы и после окончательного отказа выгрузки, и обычный ручной clear упавшей выгрузки
@@ -185,14 +203,6 @@ def build_dates(date_from: str, date_to: str) -> list[str]:
     return [(end - timedelta(days=offset)).isoformat() for offset in range((end - start).days + 1)]
 
 
-def find_record(records: Iterable[dict] | None, kind: str) -> dict | None:
-    """Вернуть первую запись вида `kind` или `None`, если её нет."""
-    for record in records or []:
-        if record["kind"] == kind:
-            return record
-    return None
-
-
 def select_records(records: Iterable[dict] | None, kind: str) -> list[dict]:
     """Вернуть все записи вида `kind` в порядке, в котором их отдал оператор.
 
@@ -209,11 +219,16 @@ def dictionary_record(mapped_results: Iterable[list[dict]] | None) -> dict | Non
     Снапшот один на прогон: путь и дата у него одни для всех дней, поэтому годится
     запись любого дня, который до него дошёл, а первая — это самый свежий день
     периода.
+
+    Обход останавливается на первой же найденной записи, поэтому из результата
+    прогона читается один день, а не все: день приходит записью на кампанию, и
+    период из тридцати дней по три сотни кампаний — это тысячи записей, из
+    которых нужна одна.
     """
     for day_results in mapped_results or []:
-        record = find_record(day_results, "dict")
-        if record is not None:
-            return record
+        for record in day_results or []:
+            if record["kind"] == "dict":
+                return record
     return None
 
 
@@ -327,17 +342,6 @@ def admetrica_to_s3():
             raise AirflowSkipException("в этом прогоне справочник не собран")
         return load_params(record)
 
-    def upload_to_s3(task_id: str, params) -> LocalFilesystemToS3Operator:
-        """Вернуть выгрузку файла в S3 по адресам из *params*."""
-        return LocalFilesystemToS3Operator(
-            task_id=task_id,
-            aws_conn_id=S3_CONN_ID,
-            dest_bucket=S3_BUCKET,
-            filename=params["src"],
-            dest_key=params["s3_key"],
-            replace=True,
-        )
-
     @task_group(group_id="day")
     def per_day(day: str):
         """Собрать день и увезти его файлы в S3.
@@ -362,10 +366,21 @@ def admetrica_to_s3():
 
     @task_group(group_id="dictionary")
     def per_run_dictionary(mapped_results) -> None:
-        """Увезти снапшот справочника прогона в S3 — один раз за прогон."""
+        """Увезти снапшот справочника прогона в S3 — один раз за прогон.
+
+        Запись одна на прогон, её адрес известен до запуска задачи, поэтому
+        выгрузка остаётся декларативным оператором переноса.
+        """
         params = dictionary_params.override(task_id="params")(mapped_results)
 
-        upload_to_s3("upload_s3", params)
+        LocalFilesystemToS3Operator(
+            task_id="upload_s3",
+            aws_conn_id=S3_CONN_ID,
+            dest_bucket=S3_BUCKET,
+            filename=params["src"],
+            dest_key=params["s3_key"],
+            replace=True,
+        )
 
     @task(trigger_rule="none_failed")
     def cleanup(**context) -> None:

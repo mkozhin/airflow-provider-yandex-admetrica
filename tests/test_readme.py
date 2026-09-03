@@ -9,12 +9,14 @@ claims that name something in the code are pinned here.
 from __future__ import annotations
 
 import ast
+import importlib
 import inspect
 import re
+from datetime import datetime
 from pathlib import Path
 
 import pytest
-from airflow.models import BaseOperator
+from airflow.models import DAG, BaseOperator
 
 from airflow_provider_yandex_admetrica.hooks.loki import LokiClient
 from airflow_provider_yandex_admetrica.hooks.yandex_admetrica import (
@@ -24,7 +26,12 @@ from airflow_provider_yandex_admetrica.hooks.yandex_admetrica import (
     AdmetricaHook,
     _normalize_name,
 )
-from airflow_provider_yandex_admetrica.operators.stats import YandexAdmetricaStatsOperator
+from airflow_provider_yandex_admetrica.operators.stats import (
+    DICT_CAMPAIGNS_PARTS,
+    STATS_PARTS,
+    YandexAdmetricaStatsOperator,
+    id_segment,
+)
 
 _ROOT = Path(__file__).resolve().parent.parent
 _READMES = {"README.md": _ROOT / "README.md", "README_RU.md": _ROOT / "README_RU.md"}
@@ -41,6 +48,59 @@ _DOCUMENTED_CALLABLES = {
     "AdmetricaHook": AdmetricaHook,
     "LokiClient": LokiClient,
 }
+
+
+#: The statistics file the layout section of a README is written about: one
+#: campaign of one day, with the identifiers the printed addresses spell out.
+_LAYOUT_RECORD = {
+    "kind": "stats",
+    "date": "2026-08-20",
+    "path": "/tmp/local.json",
+    "advertiser_id": 17004,
+    "campaign_id": 123456,
+}
+
+#: The snapshot of the campaign dictionary of the same run, dated the day the
+#: export runs rather than the day it reports on.
+_LAYOUT_DICT_RECORD = {
+    "kind": "dict",
+    "date": "2026-08-21",
+    "path": "/tmp/dict.json",
+    "advertiser_id": 17004,
+    "campaign_id": None,
+}
+
+#: The run whose addresses are compared, and the DAG that holds it.
+_LAYOUT_RUN_ID = "manual__2026-08-21T00:00:00+00:00"
+_LAYOUT_DAG_ID = "readme_layout"
+
+#: The example that builds the addresses of every destination a README names.
+_LAYOUT_EXAMPLE = "examples.admetrica_to_bq_and_s3_dag"
+
+
+def _layout_operator() -> YandexAdmetricaStatsOperator:
+    """Return the operator whose ``_build_path`` writes the local layout."""
+    with DAG(dag_id=_LAYOUT_DAG_ID, start_date=datetime(2026, 8, 1), schedule=None):
+        return YandexAdmetricaStatsOperator(
+            task_id="collect",
+            date=_LAYOUT_RECORD["date"],
+            dimensions=["am:e:placement"],
+            metrics=["am:e:renders"],
+            base_dir="/tmp/yandex_admetrica",
+        )
+
+
+def _layout_segments() -> dict[str, str]:
+    """Return the values a printed address leaves as placeholders."""
+    return {
+        "base_dir": "/tmp/yandex_admetrica",
+        "dag_segment": id_segment(_LAYOUT_DAG_ID),
+        "run_segment": id_segment(_LAYOUT_RUN_ID),
+        "advertiser_id": _LAYOUT_RECORD["advertiser_id"],
+        "date": _LAYOUT_RECORD["date"],
+        "campaign_id": _LAYOUT_RECORD["campaign_id"],
+        "snapshot_date": _LAYOUT_DICT_RECORD["date"],
+    }
 
 
 def _text(name: str) -> str:
@@ -173,3 +233,101 @@ class TestStructure:
     def test_documentation_links_are_the_yandex_ones(self, readme):
         assert "https://yandex.ru/dev/admetrica/doc/ru/attrandmetr/dim_all" in readme
         assert "https://yandex.ru/dev/admetrica/doc/ru/authorization" in readme
+
+
+class TestTheLayoutIsTheOneTheCodeBuilds:
+    """Every address the layout section prints is reproduced by the code.
+
+    The section is the branch's central claim — a campaign reaches an address of
+    its own in every destination — and prose cannot be trusted to have followed
+    the functions that build them, so each printed line is compared against the
+    string its own builder returns for one synthetic record.
+    """
+
+    def test_the_local_path_of_a_campaign(self, readme):
+        documented = (
+            "{base_dir}/{dag_segment}/{run_segment}/{advertiser_id}"
+            "/stats/{date}/{campaign_id}.json"
+        )
+        assert documented in readme
+        built = _layout_operator()._build_path(
+            _LAYOUT_RUN_ID,
+            _LAYOUT_RECORD["advertiser_id"],
+            STATS_PARTS,
+            _LAYOUT_RECORD["date"],
+            _LAYOUT_RECORD["campaign_id"],
+        )
+        assert built == documented.format(**_layout_segments())
+
+    def test_the_local_path_of_the_dictionary(self, readme):
+        documented = (
+            "{base_dir}/{dag_segment}/{run_segment}/{advertiser_id}"
+            "/dict/campaigns/{snapshot_date}.json"
+        )
+        assert documented in readme
+        built = _layout_operator()._build_path(
+            _LAYOUT_RUN_ID,
+            _LAYOUT_RECORD["advertiser_id"],
+            DICT_CAMPAIGNS_PARTS,
+            _LAYOUT_DICT_RECORD["date"],
+        )
+        assert built == documented.format(**_layout_segments())
+
+    def test_the_s3_key_of_a_campaign(self, readme):
+        documented = (
+            "{S3_PREFIX}/{advertiser_id}/stats/_year=2026/_month=08/_day=20"
+            "/_date=20260820/_campaign_id=123456/2026-08-20.json"
+        )
+        assert documented in readme
+        module = importlib.import_module(_LAYOUT_EXAMPLE)
+        assert module.s3_key(_LAYOUT_RECORD) == documented.format(
+            S3_PREFIX=module.S3_PREFIX, advertiser_id=_LAYOUT_RECORD["advertiser_id"]
+        )
+
+    def test_the_s3_key_of_the_dictionary(self, readme):
+        documented = (
+            "{S3_PREFIX}/{advertiser_id}/dict/campaigns/_year=2026/_month=08/_day=21"
+            "/_date=20260821/2026-08-21.json"
+        )
+        assert documented in readme
+        module = importlib.import_module(_LAYOUT_EXAMPLE)
+        assert module.s3_key(_LAYOUT_DICT_RECORD) == documented.format(
+            S3_PREFIX=module.S3_PREFIX, advertiser_id=_LAYOUT_RECORD["advertiser_id"]
+        )
+
+    def test_the_gcs_object_of_a_campaign(self, readme):
+        documented = (
+            "{GCS_PREFIX}/{dag_segment}/{run_segment}/{advertiser_id}"
+            "/stats/{date}/{campaign_id}.json"
+        )
+        assert documented in readme
+        module = importlib.import_module(_LAYOUT_EXAMPLE)
+        segments = {
+            **_layout_segments(),
+            "GCS_PREFIX": module.GCS_PREFIX,
+            "dag_segment": id_segment(module.DAG_ID),
+        }
+        assert module.gcs_object(_LAYOUT_RECORD, _LAYOUT_RUN_ID) == documented.format(**segments)
+
+    def test_the_gcs_object_of_the_dictionary(self, readme):
+        documented = (
+            "{GCS_PREFIX}/{dag_segment}/{run_segment}/{advertiser_id}"
+            "/dict/campaigns/{snapshot_date}.json"
+        )
+        assert documented in readme
+        module = importlib.import_module(_LAYOUT_EXAMPLE)
+        segments = {
+            **_layout_segments(),
+            "GCS_PREFIX": module.GCS_PREFIX,
+            "dag_segment": id_segment(module.DAG_ID),
+        }
+        built = module.gcs_object(_LAYOUT_DICT_RECORD, _LAYOUT_RUN_ID)
+        assert built == documented.format(**segments)
+
+    def test_the_bigquery_table_of_a_campaign(self, readme):
+        documented = "stats_{advertiser_id}_{campaign_id}"
+        assert f"`{documented}`" in readme
+        module = importlib.import_module(_LAYOUT_EXAMPLE)
+        table, _, partition = module.stats_table_id(_LAYOUT_RECORD).partition("$")
+        assert table == documented.format(**_layout_segments())
+        assert partition == _LAYOUT_RECORD["date"].replace("-", "")

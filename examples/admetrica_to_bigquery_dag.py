@@ -79,6 +79,27 @@ day, dictionary → cleanup
 таблицу целиком. Гранула перезаписи равна грануле выгрузки, поэтому загрузка части
 кампаний не может стереть данные остальных за те же дни.
 
+Датасет, в который этот DAG грузит впервые, требует уборки, если статистика в нём уже
+лежит одной таблицей на всех: читателей переводят на `stats_{advertiser_id}_*`, а
+прежнюю таблицу переливают в таблицы кампаний либо выводят из употребления — DAG в неё
+не пишет. Там же проверяют, что под `stats_*` не попадает ни одна вью: она ломает
+wildcard-запрос целиком.
+
+Декоратор адресует партицию таблицы, которая уже есть, поэтому таблицу кампании
+`day.load_bq` создаёт сам — пустой, с той же схемой и тем же партиционированием, —
+и только после этого грузит. Шаг идемпотентен, так что первый день новой кампании
+доезжает до витрины ровно как всякий следующий. Датасет при этом должен существовать
+заранее, а коннекшену нужно право создавать в нём таблицы.
+
+Цена такой гранулы — число job'ов загрузки. День стоит по объекту GCS и по load job на
+каждую кампанию, давшую строки, и `day.load_bq` проходит их последовательно, одной
+таской, дожидаясь каждого job'а: рекламодатель на 70 кампаний — это 70 загрузок в дне
+и около 2100 за тридцатидневный период. BigQuery считает load jobs и на таблицу
+(1500 в сутки — при таблице на кампанию недостижимо), и на проект (100 000 в сутки),
+поэтому в проектный лимит упирается длинный бэкфилл широкого кабинета: сверьте лимит
+перед перезаливом года и подбирайте `execution_timeout` под время целого дня, а не
+одного job'а.
+
 Схемы заданы явно, и `autodetect` выключен вслух в обеих загрузках: и в
 `GCSToBigQueryOperator`, которым грузится справочник, и в конфигурации job'а, которым
 грузится статистика. По умолчанию схема определяется сама, а определялась бы она по
@@ -89,6 +110,12 @@ day, dictionary → cleanup
 схемы всех таблиц обязаны совпадать до типов и партиционирования. Вью, чьё имя попадает
 под `stats_*`, ломает wildcard-запрос целиком, даже с условием на `_TABLE_SUFFIX`, —
 вью следующего слоя держите в другом датасете либо называйте не на `stats_`.
+
+Один запрос BigQuery ссылается не больше чем на 1000 таблиц после раскрытия шаблона, и
+таблица на кампанию делает этот потолок достижимым: пять рекламодателей по двести
+кампаний — уже он. Поэтому `stats_*` годится там, где кампаний в датасете немного, а
+устойчивый адрес чтения — `stats_{advertiser_id}_*`, с объединением по рекламодателям
+там, где нужен весь кабинет сразу.
 
 Промежуточный бакет GCS может быть общим: правило жизненного цикла, которое DAG на
 него вешает, ограничено префиксом `GCS_PREFIX` и встаёт рядом с теми правилами, что
@@ -112,6 +139,13 @@ Clear нужного map index группы `day` вместе с задачам
 перетирает партиции тех кампаний, которые он собрал заново. Дни независимы, поэтому
 повтор одного не трогает партиции остальных, а кампания, не давшая за этот день строк,
 остаётся в витрине с прежними цифрами.
+
+День грузится по кампании за раз и целым в витрине не появляется: отказ на середине
+оставляет свежими партиции тех кампаний, до которых цикл дошёл, и прежними — у
+остальных, и в самих данных эта разница ничем не помечена. Повтор грузит день целиком
+заново, поэтому успевшие кампании оплачиваются вторым job'ом, а `WRITE_TRUNCATE` в
+декоратор партиции делает это безобидным: после успешного повтора день в витрине
+сходится.
 
 `cleanup` стоит с `trigger_rule="none_failed"`: при `all_done` он сносил бы локальные
 файлы и после окончательного отказа загрузки, и обычный ручной clear упавшей загрузки
@@ -165,6 +199,10 @@ BQ_PROJECT     = "my-gcp-project"
 BQ_DATASET     = "yandex_admetrica"
 BQ_STATS_TABLE = "stats"
 BQ_DICT_TABLE  = "campaigns"
+# Регион датасета, в котором идут job'ы загрузки. `None` оставляет выбор BigQuery, что
+# верно для мультирегиона по умолчанию; датасет в конкретном регионе назовите здесь,
+# иначе job не найдёт таблицу назначения.
+BQ_LOCATION    = None
 
 MAX_ACTIVE_TASKS = 5
 
@@ -246,14 +284,6 @@ def build_dates(date_from: str, date_to: str) -> list[str]:
     return [(end - timedelta(days=offset)).isoformat() for offset in range((end - start).days + 1)]
 
 
-def find_record(records: Iterable[dict] | None, kind: str) -> dict | None:
-    """Вернуть первую запись вида `kind` или `None`, если её нет."""
-    for record in records or []:
-        if record["kind"] == kind:
-            return record
-    return None
-
-
 def select_records(records: Iterable[dict] | None, kind: str) -> list[dict]:
     """Вернуть все записи вида `kind` в порядке, в котором их отдал оператор.
 
@@ -270,11 +300,16 @@ def dictionary_record(mapped_results: Iterable[list[dict]] | None) -> dict | Non
     Снапшот один на прогон: путь и дата у него одни для всех дней, поэтому годится
     запись любого дня, который до него дошёл, а первая — это самый свежий день
     периода.
+
+    Обход останавливается на первой же найденной записи, поэтому из результата
+    прогона читается один день, а не все: день приходит записью на кампанию, и
+    период из тридцати дней по три сотни кампаний — это тысячи записей, из
+    которых нужна одна.
     """
     for day_results in mapped_results or []:
-        record = find_record(day_results, "dict")
-        if record is not None:
-            return record
+        for record in day_results or []:
+            if record["kind"] == "dict":
+                return record
     return None
 
 
@@ -301,32 +336,41 @@ def gcs_object(record: dict, run_id: str) -> str:
     )
 
 
-def bq_table(record: dict, table: str) -> str:
-    """Вернуть партицию таблицы, адресованную декоратором даты записи."""
-    return f"{BQ_PROJECT}.{BQ_DATASET}.{table}${record['date'].replace('-', '')}"
+def bq_dictionary_table(record: dict) -> str:
+    """Вернуть партицию таблицы справочника, адресованную декоратором даты снимка.
+
+    Имя полное: `GCSToBigQueryOperator` принимает адресата одной строкой
+    `{project}.{dataset}.{table}`.
+    """
+    return f"{BQ_PROJECT}.{BQ_DATASET}.{BQ_DICT_TABLE}${record['date'].replace('-', '')}"
 
 
-def stats_table_id(record: dict) -> str:
-    """Вернуть партицию таблицы кампании — голым идентификатором, без квалификации.
+def stats_table_name(record: dict) -> str:
+    """Вернуть таблицу кампании — голым идентификатором, без квалификации.
 
     Гранула перезаписи нужна двумерная, день и кампания, а BigQuery партиционирует
     по одному полю: второе измерение уходит в имя таблицы, и `WRITE_TRUNCATE`
     достаёт ровно до одного дня одной кампании — перезалив части кампаний не
     трогает партиции остальных.
 
-    Идентификатор голый: проект и датасет конфигурация `insert_job` называет
-    отдельными полями `projectId` и `datasetId`.
+    Идентификатор голый: проект и датасет и создание таблицы, и конфигурация
+    `insert_job` называют отдельными полями.
     """
-    day = record["date"].replace("-", "")
-    return f"{BQ_STATS_TABLE}_{record['advertiser_id']}_{record['campaign_id']}${day}"
+    return f"{BQ_STATS_TABLE}_{record['advertiser_id']}_{record['campaign_id']}"
 
 
-def load_params(record: dict, run_id: str, table: str) -> dict:
-    """Вернуть адреса, которыми грузится один файл: откуда, куда и в какую партицию."""
+def stats_table_id(record: dict) -> str:
+    """Вернуть партицию таблицы кампании — с декоратором дня отчёта."""
+    return f"{stats_table_name(record)}${record['date'].replace('-', '')}"
+
+
+def load_params(record: dict, run_id: str) -> dict:
+    """Вернуть адреса, которыми грузится снапшот справочника: откуда, куда и в
+    какую партицию."""
     return {
         "src": record["path"],
         "gcs_object": gcs_object(record, run_id),
-        "bq_table": bq_table(record, table),
+        "bq_table": bq_dictionary_table(record),
     }
 
 
@@ -437,7 +481,23 @@ def admetrica_to_bigquery():
                 object_name=object_name,
                 filename=record["path"],
             )
+            # Декоратор `$YYYYMMDD` адресует партицию существующей таблицы,
+            # поэтому таблица кампании заводится до загрузки — пустой, с той же
+            # схемой и тем же партиционированием. `exists_ok=True` делает шаг
+            # безобидным на каждом следующем дне той же кампании.
+            bigquery.create_table(
+                project_id=BQ_PROJECT,
+                dataset_id=BQ_DATASET,
+                table_id=stats_table_name(record),
+                table_resource={
+                    "timePartitioning": {"type": "DAY", "field": STATS_PARTITION_FIELD}
+                },
+                schema_fields=BQ_STATS_SCHEMA,
+                location=BQ_LOCATION,
+                exists_ok=True,
+            )
             bigquery.insert_job(
+                location=BQ_LOCATION,
                 configuration={
                     "load": {
                         "sourceUris": [f"gs://{GCS_BUCKET}/{object_name}"],
@@ -453,7 +513,7 @@ def admetrica_to_bigquery():
                         "createDisposition": "CREATE_IF_NEEDED",
                         "timePartitioning": {"type": "DAY", "field": STATS_PARTITION_FIELD},
                     }
-                }
+                },
             )
 
     @task(multiple_outputs=True, trigger_rule="all_done")
@@ -467,33 +527,7 @@ def admetrica_to_bigquery():
         record = dictionary_record(mapped_results)
         if record is None:
             raise AirflowSkipException("в этом прогоне справочник не собран")
-        return load_params(record, context["run_id"], BQ_DICT_TABLE)
-
-    def upload_to_gcs(task_id: str, params) -> LocalFilesystemToGCSOperator:
-        """Вернуть выгрузку файла в промежуточный бакет GCS по адресам из *params*."""
-        return LocalFilesystemToGCSOperator(
-            task_id=task_id,
-            gcp_conn_id=GCP_CONN_ID,
-            bucket=GCS_BUCKET,
-            src=params["src"],
-            dst=params["gcs_object"],
-        )
-
-    def load_to_bq(task_id: str, params, schema: list[dict], field: str) -> GCSToBigQueryOperator:
-        """Вернуть загрузку объекта GCS в партицию BigQuery по адресам из *params*."""
-        return GCSToBigQueryOperator(
-            task_id=task_id,
-            gcp_conn_id=GCP_CONN_ID,
-            bucket=GCS_BUCKET,
-            source_objects=[params["gcs_object"]],
-            destination_project_dataset_table=params["bq_table"],
-            schema_fields=schema,
-            autodetect=False,
-            source_format="NEWLINE_DELIMITED_JSON",
-            write_disposition="WRITE_TRUNCATE",
-            create_disposition="CREATE_IF_NEEDED",
-            time_partitioning={"type": "DAY", "field": field},
-        )
+        return load_params(record, context["run_id"])
 
     @task_group(group_id="day")
     def per_day(day: str):
@@ -519,11 +553,32 @@ def admetrica_to_bigquery():
 
     @task_group(group_id="dictionary")
     def per_run_dictionary(mapped_results) -> None:
-        """Увезти снапшот справочника прогона в BigQuery — один раз за прогон."""
+        """Загрузить снапшот справочника прогона в BigQuery — один раз за прогон.
+
+        Запись одна на прогон, её адрес известен до запуска задач, поэтому
+        выгрузка и загрузка остаются декларативными операторами переноса.
+        """
         params = dictionary_params.override(task_id="params")(mapped_results)
 
-        upload_to_gcs("upload_gcs", params) >> load_to_bq(
-            "load_bq", params, BQ_DICT_SCHEMA, DICT_PARTITION_FIELD
+        LocalFilesystemToGCSOperator(
+            task_id="upload_gcs",
+            gcp_conn_id=GCP_CONN_ID,
+            bucket=GCS_BUCKET,
+            src=params["src"],
+            dst=params["gcs_object"],
+        ) >> GCSToBigQueryOperator(
+            task_id="load_bq",
+            gcp_conn_id=GCP_CONN_ID,
+            bucket=GCS_BUCKET,
+            source_objects=[params["gcs_object"]],
+            destination_project_dataset_table=params["bq_table"],
+            schema_fields=BQ_DICT_SCHEMA,
+            autodetect=False,
+            source_format="NEWLINE_DELIMITED_JSON",
+            write_disposition="WRITE_TRUNCATE",
+            create_disposition="CREATE_IF_NEEDED",
+            time_partitioning={"type": "DAY", "field": DICT_PARTITION_FIELD},
+            location=BQ_LOCATION,
         )
 
     @task(trigger_rule="none_failed")

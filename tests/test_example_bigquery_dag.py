@@ -8,7 +8,11 @@ from types import SimpleNamespace
 
 import pytest
 from airflow.exceptions import AirflowSkipException
+from airflow.providers.google.cloud.hooks.bigquery import BigQueryHook
+from airflow.providers.google.cloud.hooks.gcs import GCSHook
 from airflow.utils.task_group import MappedTaskGroup
+
+from airflow_provider_yandex_admetrica.operators.stats import ExportRecord
 
 _MOD_NAME = "examples.admetrica_to_bigquery_dag"
 
@@ -52,37 +56,17 @@ def _day_of_two_campaigns(date="2026-08-20"):
     ]
 
 
-class _FakeGCSHook:
-    """Stand-in for the hook that records every upload it was asked for."""
-
-    calls: list[dict] = []
-    conn_ids: list[str] = []
-
-    def __init__(self, gcp_conn_id=None):
-        type(self).conn_ids.append(gcp_conn_id)
-
-    def upload(self, **kwargs):
-        type(self).calls.append(kwargs)
-
-
-class _FakeBigQueryHook:
-    """Stand-in for the hook that records every load job it was handed."""
-
-    calls: list[dict] = []
-    conn_ids: list[str] = []
-
-    def __init__(self, gcp_conn_id=None):
-        type(self).conn_ids.append(gcp_conn_id)
-
-    def insert_job(self, **kwargs):
-        type(self).calls.append(kwargs)
-
-
 @pytest.fixture
-def fake_cloud(dag_module, monkeypatch):
-    """Replace the hooks the module holds and hand back the record of their calls."""
-    gcs = type("_RecordingGCSHook", (_FakeGCSHook,), {"calls": [], "conn_ids": []})
-    bigquery = type("_RecordingBigQueryHook", (_FakeBigQueryHook,), {"calls": [], "conn_ids": []})
+def fake_cloud(dag_module, monkeypatch, recording_hook):
+    """Replace the hooks the module holds and hand back the record of their calls.
+
+    The stand-ins are held to the signatures of the real hooks, so a keyword the
+    provider would refuse fails the test rather than a live run.
+    """
+    gcs = recording_hook(GCSHook, "gcp_conn_id", calls="upload")
+    bigquery = recording_hook(
+        BigQueryHook, "gcp_conn_id", calls="insert_job", tables="create_table"
+    )
     monkeypatch.setattr(dag_module, "GCSHook", gcs)
     monkeypatch.setattr(dag_module, "BigQueryHook", bigquery)
     return SimpleNamespace(gcs=gcs, bigquery=bigquery)
@@ -139,6 +123,11 @@ class TestOneDayIsOneMapIndex:
     def test_collect_runs_one_day_at_a_time(self, dag_obj):
         assert dag_obj.get_task("day.collect").max_active_tis_per_dag == 1
 
+    def test_the_group_of_a_day_holds_exactly_its_chain(self, dag_obj):
+        """A day is the collection and the load — a task more is a task the map
+        index pays for on every day of the period."""
+        assert set(dag_obj.task_group_dict["day"].children) == set(_DAY_TASKS)
+
     def test_the_bucket_is_ready_before_the_first_day(self, dag_obj):
         assert "ensure_gcs_bucket" in dag_obj.get_task("day.collect").upstream_task_ids
 
@@ -181,6 +170,9 @@ class TestLoadOperators:
 
     def test_the_dictionary_load_overwrites_one_partition(self, dag_obj):
         assert dag_obj.get_task("dictionary.load_bq").write_disposition == "WRITE_TRUNCATE"
+
+    def test_the_dictionary_load_names_the_region_of_the_dataset(self, dag_obj, dag_module):
+        assert dag_obj.get_task("dictionary.load_bq").location == dag_module.BQ_LOCATION
 
 
 class TestTheDayLoadsEveryCampaign:
@@ -259,6 +251,51 @@ class TestTheDayLoadsEveryCampaign:
         assert config["createDisposition"] == "CREATE_IF_NEEDED"
         assert config["timePartitioning"] == {"type": "DAY", "field": "date"}
 
+    def test_the_table_of_every_campaign_is_created_before_its_partition_is_loaded(
+        self, dag_obj, dag_module, fake_cloud
+    ):
+        """A partition decorator addresses a partition of a table that exists,
+        so the first day of a campaign would fail without this step."""
+        records = _day_of_two_campaigns()
+        self._load(dag_obj)(records, run_id="run_a")
+
+        created = fake_cloud.bigquery.tables
+        assert [call["table_id"] for call in created] == [
+            dag_module.stats_table_name(record) for record in records
+        ]
+        assert [call["table_id"] for call in created] == ["stats_17004_1234", "stats_17004_5678"]
+        assert all(call["exists_ok"] is True for call in created)
+        assert all(call["schema_fields"] == dag_module.BQ_STATS_SCHEMA for call in created)
+        assert all(
+            call["table_resource"]["timePartitioning"] == {"type": "DAY", "field": "date"}
+            for call in created
+        )
+        assert all(call["project_id"] == dag_module.BQ_PROJECT for call in created)
+        assert all(call["dataset_id"] == dag_module.BQ_DATASET for call in created)
+
+    def test_the_table_is_created_without_the_partition_decorator(self, dag_obj, fake_cloud):
+        """A decorator names a partition, and a table is named without one."""
+        self._load(dag_obj)([_record()], run_id="run_a")
+
+        assert "$" not in fake_cloud.bigquery.tables[0]["table_id"]
+
+    def test_the_load_and_the_table_name_the_region_of_the_dataset(
+        self, dag_obj, dag_module, fake_cloud
+    ):
+        """A dataset outside the default multi-region is reached by naming it."""
+        self._load(dag_obj)([_record()], run_id="run_a")
+
+        assert fake_cloud.bigquery.calls[0]["location"] == dag_module.BQ_LOCATION
+        assert fake_cloud.bigquery.tables[0]["location"] == dag_module.BQ_LOCATION
+
+    def test_a_refused_load_fails_the_day(self, dag_obj, fake_cloud):
+        """A swallowed failure would ship a day quietly missing campaigns."""
+        fake_cloud.bigquery.fail_at["insert_job"] = 2
+        with pytest.raises(RuntimeError):
+            self._load(dag_obj)(_day_of_two_campaigns(), run_id="run_a")
+
+        assert len(fake_cloud.bigquery.calls) == 2
+
     def test_the_job_is_left_to_name_itself(self, dag_obj, fake_cloud):
         """An id of its own makes a retry a 409; the mixed-in microseconds do not."""
         self._load(dag_obj)([_record()], run_id="run_a")
@@ -287,6 +324,7 @@ class TestTheDayLoadsEveryCampaign:
 
         assert fake_cloud.gcs.calls == []
         assert fake_cloud.bigquery.calls == []
+        assert fake_cloud.bigquery.tables == []
 
     def test_a_day_that_wrote_nothing_at_all_skips(self, dag_obj, fake_cloud):
         with pytest.raises(AirflowSkipException):
@@ -358,19 +396,17 @@ class TestBuildDates:
 
         assert "date must be a day" in str(failure.value)
         assert "y0_secret" not in str(failure.value)
+class TestTheRecordIsTheOperators:
+    """The fixtures of this file describe what the operator really returns."""
+
+    def test_the_fixture_carries_every_key_of_an_export_record(self):
+        """A key added to the operator and not here would surface as a KeyError
+        on a live run, since the example builds every address out of the record."""
+        assert set(_record()) == set(ExportRecord.__annotations__)
+
+
 class TestFindingRecords:
-    """One record of a kind is taken out of a day, and one snapshot out of a run."""
-
-    def test_the_statistics_of_a_day(self, dag_module):
-        records = [_record(kind="dict", path="/tmp/d.json"), _record(path="/tmp/20.json")]
-        assert dag_module.find_record(records, "stats") == _record(path="/tmp/20.json")
-
-    def test_a_day_without_a_file_of_that_kind(self, dag_module):
-        assert dag_module.find_record([_record()], "dict") is None
-
-    def test_a_day_that_wrote_nothing(self, dag_module):
-        assert dag_module.find_record([], "stats") is None
-        assert dag_module.find_record(None, "stats") is None
+    """Records of a kind are taken out of a day, and one snapshot out of a run."""
 
     def test_the_snapshot_of_the_run_comes_from_the_first_day_that_has_it(self, dag_module):
         snapshot = _record(kind="dict", date="2026-08-21", path="/tmp/dict.json")
@@ -443,11 +479,11 @@ class TestKeys:
         assert dag_module.gcs_object(_record(), run_id) != mine
 
     def test_dictionary_partition_uses_the_snapshot_day(self, dag_module):
-        table = dag_module.bq_table(_record(kind="dict", date="2026-08-21"), "campaigns")
+        table = dag_module.bq_dictionary_table(_record(kind="dict", date="2026-08-21"))
         assert table.endswith(".campaigns$20260821")
 
     def test_the_dictionary_table_is_qualified_by_project_and_dataset(self, dag_module):
-        table = dag_module.bq_table(_record(kind="dict", date="2026-08-21"), "campaigns")
+        table = dag_module.bq_dictionary_table(_record(kind="dict", date="2026-08-21"))
         assert table == f"{dag_module.BQ_PROJECT}.{dag_module.BQ_DATASET}.campaigns$20260821"
 
     def test_the_statistics_table_names_the_advertiser_and_the_campaign(self, dag_module):
@@ -469,13 +505,20 @@ class TestKeys:
         near = dag_module.stats_table_id(_record(advertiser_id=1234, campaign_id=5))
         assert not near.startswith("stats_123_")
 
+    def test_the_table_of_a_campaign_is_named_without_a_partition(self, dag_module):
+        """The load addresses a partition, the creation of the table does not."""
+        assert dag_module.stats_table_name(_record()) == "stats_17004_1234"
+        assert dag_module.stats_table_id(_record()).startswith(
+            f"{dag_module.stats_table_name(_record())}$"
+        )
+
     def test_one_record_gives_every_address_of_its_load(self, dag_module):
         record = _record(kind="dict", date="2026-08-21", path="/tmp/d.json")
-        params = dag_module.load_params(record, "run_a", "campaigns")
+        params = dag_module.load_params(record, "run_a")
         assert params == {
             "src": "/tmp/d.json",
             "gcs_object": dag_module.gcs_object(record, "run_a"),
-            "bq_table": dag_module.bq_table(record, "campaigns"),
+            "bq_table": dag_module.bq_dictionary_table(record),
         }
 
 
@@ -531,7 +574,7 @@ class TestTaskCallables:
         params = dictionary_params(
             [[_record(path="/tmp/20.json"), snapshot], [dict(snapshot)]], run_id="run_a"
         )
-        assert params == dag_module.load_params(snapshot, "run_a", dag_module.BQ_DICT_TABLE)
+        assert params == dag_module.load_params(snapshot, "run_a")
 
     def test_a_run_without_a_snapshot_skips_the_dictionary(self, dag_obj):
         dictionary_params = dag_obj.get_task("dictionary.params").python_callable

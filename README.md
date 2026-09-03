@@ -208,7 +208,7 @@ Statistics, partitioned by `date`:
 
 Campaign dictionary, partitioned by `snapshot_date`: `snapshot_date` (DATE), `campaign_id` (INTEGER), `name`, `status`, `date_start`, `date_end` (STRING), `advertiser_id` (INTEGER), `advertiser_name` (STRING).
 
-Statistics go to a table per campaign, `stats_{advertiser_id}_{campaign_id}`, and the dictionary to a single `campaigns`. The grain that has to be overwritten is two-dimensional — a day and a campaign — while BigQuery partitions by one field, so the second dimension goes into the table name. Keeping it there is what keeps the load declarative: `WRITE_TRUNCATE` into a partition decorator is idempotent by itself, where a `DELETE` followed by an `INSERT` in one shared table would open a window in which the old rows are gone and the new ones have not arrived yet.
+Statistics go to a table per campaign, `stats_{advertiser_id}_{campaign_id}`, and the dictionary to a single `campaigns`. The grain that has to be overwritten is two-dimensional — a day and a campaign — while BigQuery partitions by one field, so the second dimension goes into the table name. Keeping it there is what makes a load idempotent on its own: `WRITE_TRUNCATE` into a partition decorator rewrites one day of one campaign in a single statement, where a `DELETE` followed by an `INSERT` in one shared table would open a window in which the old rows are gone and the new ones have not arrived yet.
 
 Addressing the partition with a `table$YYYYMMDD` decorator — `date` for statistics, `snapshot_date` for the dictionary — lets `WRITE_TRUNCATE` overwrite one day of one campaign and leave the rest of the table alone.
 
@@ -219,6 +219,8 @@ The mart is read through wildcard tables: `stats_*` is every advertiser, `stats_
 ## File layout
 
 **The grain of an overwrite is the grain of an export: a day of one campaign.** Every address a file reaches — the local path, the S3 key, the object in GCS, the table in BigQuery — is built from the campaign it holds, so a re-export rewrites exactly what it collected and cannot reach the data of a campaign it never asked for. Collecting part of a cabinet is safe by construction rather than by care.
+
+The grain has a price on the write side. A day costs one local file, one S3 object, one staging object in GCS and one BigQuery load job **per campaign that has rows**, and the dataset gains a table per campaign per advertiser: an advertiser of 70 campaigns is 70 uploads and 70 load jobs a day, some 2100 of each over a 30-day period. The example DAGs walk them sequentially inside one task per day and per direction, waiting for every load job, so size `execution_timeout` for a whole day rather than one job, and narrow the period when a day does not fit. A day is therefore not atomic in the mart either: a failure on campaign N leaves the campaigns before it refreshed and the rest holding their previous export, and the retry redoes the whole day.
 
 Locally, the run id isolates two runs exporting the same day from each other:
 
@@ -507,16 +509,19 @@ How the structured fields are built:
 
 ## Examples
 
-A full production example with S3 and BigQuery upload is in [`examples/`](examples/):
+Three production examples live in [`examples/`](examples/), one per destination. All three expand a period into a mapped task group, one map index per day: the collection of a day and everything done with it live inside the index, so a failed day never holds the others back and re-running a day is a clear of its map index with the tasks below it. The dictionary snapshot is loaded once per run, by a group of its own after the days.
 
-- [`admetrica_to_bq_and_s3_dag.py`](examples/admetrica_to_bq_and_s3_dag.py) — a period expanded into a mapped task group, one map index per day: the collection of a day, both uploads and the BigQuery load live inside the index, so a failed day never holds the others back and re-running a day is a clear of its map index with the tasks below it. The dictionary snapshot is loaded once per run, by a group of its own after the days
+- [`admetrica_to_s3_dag.py`](examples/admetrica_to_s3_dag.py) — S3 alone. The day's task walks its `kind="stats"` entries and uploads each under a key of its own; the dictionary goes up declaratively through `LocalFilesystemToS3Operator`
+- [`admetrica_to_bigquery_dag.py`](examples/admetrica_to_bigquery_dag.py) — BigQuery alone, staged through GCS. The day's task creates the campaign's table when it is missing and loads its partition; the dictionary travels through `LocalFilesystemToGCSOperator` and `GCSToBigQueryOperator`
+- [`admetrica_to_bq_and_s3_dag.py`](examples/admetrica_to_bq_and_s3_dag.py) — both at once. The two directions are parallel tasks off one `collect`, independent of each other, so a refusal on one side still lets the other reach its mart
 
-It needs more than this provider:
+They need more than this provider:
 
-- `apache-airflow-providers-google` and `apache-airflow-providers-amazon`, which this package installs only under its `dev` extra — a deployment running the DAG installs them itself
-- connections `yandex_admetrica_default`, `loki_default`, `google_cloud_default` and `aws_default`
-- a filesystem shared by every worker that runs the DAG's tasks, mounted at `BASE_DIR` on each of them. `collect` writes the day's files there and the two uploads and `cleanup` are separate task instances that read them, and Airflow promises no worker affinity inside a task group: under Celery or Kubernetes with worker-local disks the uploads fail on a missing file and the collected files stay behind on the worker that wrote them. A single-machine `LocalExecutor`, or a shared volume mounted at `BASE_DIR`, is what makes the layout hold
-- a GCS staging bucket, which the DAG's first task creates when it is missing: the BigQuery load reads from GCS, not from the worker's disk, so every file goes to the bucket first. What clears it afterwards is a one-day delete lifecycle rule the DAG adds beside the rules the bucket already carries, scoped by a `matchesPrefix` condition — the bucket may be a shared one, and the rule addresses this DAG's prefix and nothing else
+- `apache-airflow-providers-amazon` for the S3 destination and `apache-airflow-providers-google` for the BigQuery one, which this package installs only under its `dev` extra — a deployment running a DAG installs them itself
+- connections `yandex_admetrica_default` and `loki_default`, plus `aws_default` for the S3 destination and `google_cloud_default` for the BigQuery one
+- a filesystem shared by every worker that runs the DAG's tasks, mounted at `BASE_DIR` on each of them. `collect` writes the day's files there and the uploads and `cleanup` are separate task instances that read them, and Airflow promises no worker affinity inside a task group: under Celery or Kubernetes with worker-local disks the uploads fail on a missing file and the collected files stay behind on the worker that wrote them. A single-machine `LocalExecutor`, or a shared volume mounted at `BASE_DIR`, is what makes the layout hold
+- a GCS staging bucket for the two examples that load into BigQuery, which the DAG's first task creates when it is missing: the load reads from GCS, not from the worker's disk, so every file goes to the bucket first. What clears it afterwards is a one-day delete lifecycle rule the DAG adds beside the rules the bucket already carries, scoped by a `matchesPrefix` condition — the bucket may be a shared one, and the rule addresses this DAG's prefix and nothing else
+- a BigQuery dataset that already exists, for the same two: the campaign's table is created by the day's task, and the connection needs the right to create tables in the dataset
 
 ## License
 

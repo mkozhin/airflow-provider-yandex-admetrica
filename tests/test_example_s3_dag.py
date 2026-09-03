@@ -7,7 +7,10 @@ import importlib
 
 import pytest
 from airflow.exceptions import AirflowSkipException
+from airflow.providers.amazon.aws.hooks.s3 import S3Hook
 from airflow.utils.task_group import MappedTaskGroup
+
+from airflow_provider_yandex_admetrica.operators.stats import ExportRecord
 
 _MOD_NAME = "examples.admetrica_to_s3_dag"
 
@@ -51,23 +54,14 @@ def _day_of_two_campaigns(date="2026-08-20"):
     ]
 
 
-class _FakeS3Hook:
-    """Stand-in for the hook that records every upload it was asked for."""
-
-    calls: list[dict] = []
-    conn_ids: list[str] = []
-
-    def __init__(self, aws_conn_id=None):
-        type(self).conn_ids.append(aws_conn_id)
-
-    def load_file(self, **kwargs):
-        type(self).calls.append(kwargs)
-
-
 @pytest.fixture
-def fake_s3(dag_module, monkeypatch):
-    """Replace the hook the module holds and hand back the record of its calls."""
-    hook = type("_RecordingS3Hook", (_FakeS3Hook,), {"calls": [], "conn_ids": []})
+def fake_s3(dag_module, monkeypatch, recording_hook):
+    """Replace the hook the module holds and hand back the record of its calls.
+
+    The stand-in is held to the signature of the real hook, so a keyword the
+    provider would refuse fails the test rather than a live run.
+    """
+    hook = recording_hook(S3Hook, "aws_conn_id", calls="load_file")
     monkeypatch.setattr(dag_module, "S3Hook", hook)
     return hook
 
@@ -114,6 +108,11 @@ class TestOneDayIsOneMapIndex:
     def test_the_chain_of_a_day_runs_in_order(self, dag_obj):
         assert dag_obj.get_task("day.upload_s3").upstream_task_ids == {"day.collect"}
         assert "day.upload_s3" in dag_obj.get_task("day.collect").downstream_task_ids
+
+    def test_the_group_of_a_day_holds_exactly_its_chain(self, dag_obj):
+        """A day is the collection and the upload — a task more is a task the
+        map index pays for on every day of the period."""
+        assert set(dag_obj.task_group_dict["day"].children) == set(_DAY_TASKS)
 
     def test_collect_runs_one_day_at_a_time(self, dag_obj):
         assert dag_obj.get_task("day.collect").max_active_tis_per_dag == 1
@@ -213,6 +212,16 @@ class TestTheDayUploadsEveryCampaign:
         with pytest.raises(AirflowSkipException):
             upload([])
 
+    def test_a_refused_upload_fails_the_day(self, dag_obj, fake_s3):
+        """A swallowed failure would ship a day quietly missing campaigns."""
+        fake_s3.fail_at["load_file"] = 2
+        upload = dag_obj.get_task("day.upload_s3").python_callable
+
+        with pytest.raises(RuntimeError):
+            upload(_day_of_two_campaigns())
+
+        assert len(fake_s3.calls) == 2
+
 
 class TestBuildDates:
     """The period expands into map indices from the freshest day backwards."""
@@ -253,19 +262,17 @@ class TestBuildDates:
         assert "y0_secret" not in str(failure.value)
 
 
+class TestTheRecordIsTheOperators:
+    """The fixtures of this file describe what the operator really returns."""
+
+    def test_the_fixture_carries_every_key_of_an_export_record(self):
+        """A key added to the operator and not here would surface as a KeyError
+        on a live run, since the example builds every address out of the record."""
+        assert set(_record()) == set(ExportRecord.__annotations__)
+
+
 class TestFindingRecords:
-    """One record of a kind is taken out of a day, and one snapshot out of a run."""
-
-    def test_the_statistics_of_a_day(self, dag_module):
-        records = [_record(kind="dict", path="/tmp/d.json"), _record(path="/tmp/20.json")]
-        assert dag_module.find_record(records, "stats") == _record(path="/tmp/20.json")
-
-    def test_a_day_without_a_file_of_that_kind(self, dag_module):
-        assert dag_module.find_record([_record()], "dict") is None
-
-    def test_a_day_that_wrote_nothing(self, dag_module):
-        assert dag_module.find_record([], "stats") is None
-        assert dag_module.find_record(None, "stats") is None
+    """Records of a kind are taken out of a day, and one snapshot out of a run."""
 
     def test_every_statistics_record_of_a_day_is_selected(self, dag_module):
         records = [*_day_of_two_campaigns(), _record(kind="dict", path="/tmp/d.json")]

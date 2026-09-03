@@ -487,7 +487,8 @@ if your query contains a `WHERE` clause on the `_TABLE_SUFFIX` pseudocolumn».
 
 - [x] проверить, что README на двух языках синхронны
 - [x] проверить, что новая раскладка и её мотив записаны в `CONTEXT.md`
-- [x] перенести план в `docs/plans/completed/`
+- [x] оставить план в `docs/plans/` — в `docs/plans/completed/` его переносит
+      харнесс после всех фаз ревью, которые читают файл плана на месте
 
 ## Post-Completion
 

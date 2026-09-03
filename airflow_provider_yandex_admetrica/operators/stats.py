@@ -80,29 +80,6 @@ def id_segment(identifier: str) -> str:
     return f"{_fit_bytes(safe, _SEGMENT_BYTES - _DIGEST_LENGTH - 1)}-{digest}"
 
 
-def _by_campaign(rows: Sequence[dict]) -> dict[int, list[dict]]:
-    """Return *rows* split by the campaign each of them names.
-
-    The hook answers with one flat list for the day, because a row is a row
-    whatever campaign it came from and a caller wanting the day whole should not
-    have to stitch it back together.  Splitting it is the operator's business:
-    the operator is what turns rows into files, and a file is what carries an
-    address.
-
-    Every row names a campaign — the hook reads ``campaign_id`` as a positive
-    whole number for each of them and fails the export over one it could not —
-    so the key is taken outright rather than defended against.
-
-    A dictionary keeps insertion order, so the campaigns come out in the order
-    the hook walked them, which is the order the cabinet lists them in.  Reading
-    the result of a run then follows the same order as reading the cabinet.
-    """
-    grouped: dict[int, list[dict]] = {}
-    for row in rows:
-        grouped.setdefault(row["campaign_id"], []).append(row)
-    return grouped
-
-
 class ExportRecord(TypedDict):
     """One file this operator wrote, described for the tasks downstream.
 
@@ -237,14 +214,15 @@ class YandexAdmetricaStatsOperator(BaseOperator):
         addresses a directory under the base directory, spelled oddly, rather
         than a file anywhere on the worker.  The substitution holds wherever the
         day lands, the segment naming a directory as much as the one naming a
-        file.  The campaign takes no such treatment and needs none: it reaches
-        here from :func:`_campaign_record`, which has already read it as a
-        positive whole number, so the only source of that segment is trusted by
-        construction.
+        file.  The campaign asks for no substitution: it reaches here from
+        :func:`~airflow_provider_yandex_admetrica.hooks.yandex_admetrica._campaign_record`,
+        which has already read it as a positive whole number, and ``int`` spells
+        that shape out where the segment is built, so the invariant is held here
+        rather than only in the caller that supplies it.
         """
         safe_date = _UNSAFE_SEGMENT_RE.sub("_", date)
         tail = (
-            (safe_date, f"{campaign_id}.json")
+            (safe_date, f"{int(campaign_id)}.json")
             if campaign_id is not None
             else (f"{safe_date}.json",)
         )
@@ -389,25 +367,49 @@ class YandexAdmetricaStatsOperator(BaseOperator):
             lang=self.lang,
             extra_params=self.extra_params,
         )
-        for campaign_id, campaign_rows in _by_campaign(rows).items():
-            path = self._build_path(
-                run_id, advertiser_id, STATS_PARTS, self.date, campaign_id
-            )
-            self._write(campaign_rows, path)
-            result.append(
-                ExportRecord(
-                    kind="stats",
-                    date=self.date,
-                    path=path,
-                    advertiser_id=advertiser_id,
-                    campaign_id=campaign_id,
-                )
-            )
-        if not rows:
+        # The hook answers with the day whole, because a row is a row whatever
+        # campaign it came from.  Turning rows into files is the operator's
+        # business and a file is what carries an address, so the split happens
+        # here.  Every row names a campaign — the hook reads ``campaign_id`` as a
+        # positive whole number for each of them and fails the export over one it
+        # could not — so the key is taken outright rather than defended against.
+        # A dictionary keeps insertion order, so the campaigns come out in the
+        # order the cabinet lists them in.
+        by_campaign: dict[int, list[dict]] = {}
+        for row in rows:
+            by_campaign.setdefault(row["campaign_id"], []).append(row)
+
+        if not by_campaign:
             self.log.info(
                 "AdMetrica returned no rows for advertiser %s on %s; no file written.",
                 advertiser_id,
                 self.date,
+            )
+        else:
+            for campaign_id, campaign_rows in by_campaign.items():
+                path = self._build_path(
+                    run_id, advertiser_id, STATS_PARTS, self.date, campaign_id
+                )
+                self._write(campaign_rows, path)
+                result.append(
+                    ExportRecord(
+                        kind="stats",
+                        date=self.date,
+                        path=path,
+                        advertiser_id=advertiser_id,
+                        campaign_id=campaign_id,
+                    )
+                )
+            # A file per campaign makes "does this day hold the campaigns it
+            # should" a question about the export, and the task log is where it
+            # is answered: the line names every campaign a file was written for.
+            self.log.info(
+                "Wrote %s rows of %s campaigns for advertiser %s on %s: %s.",
+                len(rows),
+                len(by_campaign),
+                advertiser_id,
+                self.date,
+                ", ".join(str(campaign_id) for campaign_id in by_campaign),
             )
 
         if self.collect_dictionaries:
