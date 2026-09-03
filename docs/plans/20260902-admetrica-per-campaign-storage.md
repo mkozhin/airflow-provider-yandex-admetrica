@@ -184,15 +184,20 @@ class ExportRecord(TypedDict):
 configuration={"load": {
     "sourceUris": [f"gs://{GCS_BUCKET}/{gcs_object}"],
     "destinationTable": {"projectId": BQ_PROJECT, "datasetId": BQ_DATASET,
-                         "tableId": stats_table_id(record)},   # голый id, без квалификации
+                         "tableId": stats_table_partition(record)},  # голый id
     "schema": {"fields": BQ_STATS_SCHEMA},
     "autodetect": False,
     "sourceFormat": "NEWLINE_DELIMITED_JSON",
     "writeDisposition": "WRITE_TRUNCATE",
-    "createDisposition": "CREATE_IF_NEEDED",
     "timePartitioning": {"type": "DAY", "field": "date"},
 }}
 ```
+
+Таблицу кампании заводит сама таска, `BigQueryHook.create_table(..., exists_ok=True)`
+перед загрузкой: декоратор `$YYYYMMDD` адресует партицию существующей таблицы, а у
+первого дня новой кампании таблицы ещё нет. `createDisposition` поэтому в
+конфигурации не стоит — создать таблицу по адресу с декоратором она всё равно не
+может.
 
 `job_id` не задаётся: `insert_job` подмешивает микросекунды, поэтому ретрай не
 упирается в 409, и идемпотентность держится на этом вместе с `WRITE_TRUNCATE`.
@@ -215,9 +220,10 @@ configuration={"load": {
 декларативным оператором — запись там одна на прогон.
 
 `find_record(records, "stats")` больше не годится для статистики: записей
-несколько. Рядом заводится отбор всех записей вида — по одинаковой чистой
-функции в каждом из трёх примеров, по существующей конвенции самодостаточности
-примеров. Для словаря `find_record` остаётся.
+несколько. Его место занимает `select_records(records, kind)` — отбор всех
+записей вида, по одинаковой чистой функции в каждом из трёх примеров, по
+существующей конвенции самодостаточности примеров. Словарю отдельная функция
+поиска не нужна: `dictionary_record()` перебирает результаты дней сама.
 
 Группа дня отдаёт наверх весь список записей, как и сейчас, а
 `dictionary_record()` находит в нём снапшот справочника. Значение XCom одного
@@ -289,6 +295,9 @@ if your query contains a `WHERE` clause on the `_TABLE_SUFFIX` pseudocolumn».
 - [x] в `execute()` сгруппировать строки `hook.get_stats(...)` по
       `row["campaign_id"]` и записать по файлу на кампанию, вернув по записи на
       каждую; кампания без строк не пишет ничего и записи не возвращает
+- [x] ➕ группировка строк по кампании остаётся локальным словарём внутри
+      `execute()`: она читается на месте разом с записью файлов, и отдельная
+      функция модуля добавила бы шов там, где нечего переиспользовать
 - [x] дополнить докстроку класса абзацем о грануле «день × кампания»: что
       адресуется кампанией, что нет и почему запись без строк не создаётся
 - [x] обновить существующие утверждения о пути в `tests/test_operator.py`:
@@ -317,7 +326,9 @@ if your query contains a `WHERE` clause on the `_TABLE_SUFFIX` pseudocolumn».
 
 - [x] добавить в `s3_key()` партицию `_campaign_id=<id>` последней в иерархии —
       только для `kind="stats"`; ключ словаря оставить прежним
-- [x] завести чистую функцию отбора всех записей вида рядом с `find_record`
+- [x] завести чистую функцию `select_records` — отбор всех записей вида
+- [x] ➕ `find_record` удалён: `select_records` покрывает статистику, а поиск
+      единственной записи словаря переехал внутрь `dictionary_record`
 - [x] заменить в группе `day` пару «`params` + `upload_s3`» на одну таску,
       которая перебирает записи `kind="stats"` и грузит каждую через
       `S3Hook.load_file(..., replace=True)`; пустой список записей поднимает
@@ -352,24 +363,42 @@ if your query contains a `WHERE` clause on the `_TABLE_SUFFIX` pseudocolumn».
 - [x] добавить `campaign_id` в `gcs_object()` для `kind="stats"`: сейчас объект
       адресуется днём, и два файла кампаний одного дня затрут друг друга **до**
       того, как доедут до BigQuery
-- [x] завести `stats_table_id(record)` →
+- [x] завести `stats_table_partition(record)` →
       `f"{BQ_STATS_TABLE}_{advertiser_id}_{campaign_id}${YYYYMMDD}"` — **голый**
       идентификатор без квалификации, его берёт `tableId` конфигурации
       `insert_job`, где проект и датасет идут отдельными полями. Это
       единственный адрес, по которому грузится статистика
-- [x] `bq_table()` **не трогать**: он остаётся квалифицированным
+- [x] адрес словаря остаётся квалифицированным
       `f"{BQ_PROJECT}.{BQ_DATASET}.{table}${YYYYMMDD}"` и обслуживает только
       словарь. Ветки для статистики в нём заводить не нужно — `load_params()`
       зовут ровно два места (`:364` со `BQ_STATS_TABLE` и `:377` со
       `BQ_DICT_TABLE`), и первое эта задача удаляет вместе с `day_params`, так
-      что статистика через `bq_table()` больше не проходит вовсе. По той же
-      причине `test_one_record_gives_every_address_of_its_load` (:267)
-      перенастраивается на словарь, а не на статистику
+      что статистика через него больше не проходит вовсе. По той же причине
+      `test_one_record_gives_every_address_of_its_load` (:267) перенастраивается
+      на словарь, а не на статистику
+- [x] ➕ раз функция обслуживает один словарь, это сказано именем:
+      `bq_table()` → `bq_dictionary_table()`, `load_params()` →
+      `dictionary_load_params()`. Голый идентификатор и декорированный тоже
+      названы по различию: `stats_table()` и `stats_table_partition()`
 - [x] заменить в группе `day` цепочку «`params` + `upload_gcs` + `load_bq`» на
       одну таску, которая перебирает записи `kind="stats"`, кладёт каждую через
       `GCSHook.upload` и грузит `BigQueryHook.insert_job` с конфигурацией из
       Technical Details; пустой список — `AirflowSkipException`
 - [x] импортировать `BigQueryHook` на уровне модуля рядом с `GCSHook`
+- [x] ➕ заводить таблицу кампании до загрузки:
+      `BigQueryHook.create_table(..., exists_ok=True)` с той же схемой и тем же
+      партиционированием. Декоратор `$YYYYMMDD` адресует партицию существующей
+      таблицы, поэтому первый день новой кампании иначе падал бы на несуществующей
+- [x] ➕ назвать регион датасета: `BQ_LOCATION` рядом с `BQ_PROJECT` и
+      `BQ_DATASET`, `location=` у `create_table` и у `insert_job`
+- [x] ➕ вынести конфигурацию job'а в чистую `stats_load_configuration(record,
+      object_name)` рядом с остальными строителями адресов
+- [x] ⚠️ `BigQueryHook.create_table` появляется в
+      `apache-airflow-providers-google` 13.0.0, а constraint-набор Airflow 2.9.1
+      — нижней границы поддержки этого пакета — прибивает 10.17.0. Нижняя
+      граница `>=13.0.0` записана в `pyproject.toml`, обоих README, `CONTEXT.md`
+      и doc_md обоих примеров с BigQuery; согласованность держит
+      `tests/test_readme.py::TestGoogleProviderFloor`
 - [x] обновить `doc_md`: «## Структура» (:15-21), «## Формат результата
       оператора» (:44-51), **«## Раскладка» (:59-75)** — раскладка GCS,
       «статистика и справочник живут в разных таблицах», декоратор `table$…`;
@@ -397,8 +426,8 @@ if your query contains a `WHERE` clause on the `_TABLE_SUFFIX` pseudocolumn».
       галочке приёмки
 - [x] написать тесты: таблица словаря не изменилась и осталась квалифицированной
       проектом и датасетом, объект GCS различает кампании одного дня,
-      конфигурация job'а несёт прежние схему, `writeDisposition`,
-      `createDisposition` и партиционирование
+      конфигурация job'а несёт прежние схему, `writeDisposition` и
+      партиционирование, а таблица кампании заводится до загрузки
 - [x] написать замок против потери кампаний: таска дня зовёт `GCSHook.upload` и
       `BigQueryHook.insert_job` столько раз, сколько в результате дня записей
       `kind="stats"`, и адреса вызовов различаются кампанией. Тест на
@@ -414,9 +443,9 @@ if your query contains a `WHERE` clause on the `_TABLE_SUFFIX` pseudocolumn».
 - Modify: `examples/admetrica_to_bq_and_s3_dag.py`
 - Modify: `tests/test_example_dag.py`
 
-- [x] перенести изменения задач 2 и 3: ключ S3, объект GCS, `stats_table_id()`
-      рядом с нетронутым `bq_table()`, отбор записей вида, импорты хуков на
-      уровне модуля
+- [x] перенести изменения задач 2 и 3: ключ S3, объект GCS, `stats_table()` и
+      `stats_table_partition()` рядом с `bq_dictionary_table()`, отбор записей
+      вида, импорты хуков на уровне модуля, создание таблицы кампании до загрузки
 - [x] завести в группе дня **две** таски — цикл S3 и цикл GCS+BQ, — параллельные
       друг другу, как сейчас `upload_s3` и `upload_gcs >> load_bq` (:458-461):
       упавшее направление не должно мешать второму
@@ -461,6 +490,10 @@ if your query contains a `WHERE` clause on the `_TABLE_SUFFIX` pseudocolumn».
       (двумерная гранула против одномерного партиционирования BigQuery; почему
       имя таблицы, а не DML) и записать, что кампания без строк не создаёт ни
       файла, ни записи, а её прежние данные в витрине остаются
+- [x] ➕ записать в обоих README, в `CONTEXT.md` и в `CHANGELOG.md` нижнюю
+      границу `apache-airflow-providers-google>=13.0.0` с её мотивом: таблицу
+      кампании заводит `BigQueryHook.create_table`, которого нет в 10.17.0 из
+      constraint-набора Airflow 2.9.1
 - [x] добавить запись `0.3.0` в `CHANGELOG.md` — смена раскладки, ключей и имён
       таблиц. Этот план идёт первым, поэтому `0.3.0` принадлежит ему, а отбор
       кампаний становится `0.4.0`
@@ -475,7 +508,7 @@ if your query contains a `WHERE` clause on the `_TABLE_SUFFIX` pseudocolumn».
 - [x] объект GCS различает кампании одного дня
 - [x] статистика адресуется в `stats_<adv>_<campaign>` с декоратором партиции и
       `WRITE_TRUNCATE`, словарь — в прежнюю `campaigns`
-- [x] запись словаря несёт `campaign_id=None`, и `find_record(records, "dict")`
+- [x] запись словаря несёт `campaign_id=None`, и `dictionary_record()`
       по-прежнему находит ровно одну
 - [x] группа дня сохранена как `MappedTaskGroup`, направления в совмещённом
       примере независимы

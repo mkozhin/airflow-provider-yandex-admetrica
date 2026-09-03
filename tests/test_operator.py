@@ -730,6 +730,12 @@ class TestTheDayIsHeldToItsFormat:
         )
         assert os.path.normpath(path).startswith(str(tmp_path) + os.sep)
 
+    def test_a_campaign_that_is_not_a_number_names_no_file(self, tmp_path):
+        """The segment is spelled as a whole number where it is built."""
+        op = _operator(base_dir=str(tmp_path))
+        with pytest.raises(ValueError):
+            op._build_path(RUN_ID, ADVERTISER_ID, ("stats",), DATE, "../..")
+
 
 class TestFailureLeavesNoFile:
     def test_a_day_the_hook_could_not_read_writes_nothing(self, tmp_path):

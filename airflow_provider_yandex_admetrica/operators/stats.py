@@ -379,13 +379,7 @@ class YandexAdmetricaStatsOperator(BaseOperator):
         for row in rows:
             by_campaign.setdefault(row["campaign_id"], []).append(row)
 
-        if not by_campaign:
-            self.log.info(
-                "AdMetrica returned no rows for advertiser %s on %s; no file written.",
-                advertiser_id,
-                self.date,
-            )
-        else:
+        if by_campaign:
             for campaign_id, campaign_rows in by_campaign.items():
                 path = self._build_path(
                     run_id, advertiser_id, STATS_PARTS, self.date, campaign_id
@@ -410,6 +404,12 @@ class YandexAdmetricaStatsOperator(BaseOperator):
                 advertiser_id,
                 self.date,
                 ", ".join(str(campaign_id) for campaign_id in by_campaign),
+            )
+        else:
+            self.log.info(
+                "AdMetrica returned no rows for advertiser %s on %s; no file written.",
+                advertiser_id,
+                self.date,
             )
 
         if self.collect_dictionaries:

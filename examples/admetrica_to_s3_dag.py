@@ -4,11 +4,6 @@ DAG: статистика медийных кампаний AdMetrica за пе�
 Пример, а не боевой DAG: он показывает, как связать оператор провайдера с
 витриной, и рассчитан на то, что его скопируют и подгонят под себя.
 
-Рядом лежит `admetrica_to_bigquery_dag.py` — тот же сбор, но выгрузка в
-BigQuery. DAG'и независимы: каждый ходит в API сам за себя, поэтому запуск обоих
-за один период удваивает число запросов к AdMetrica. Возьмите тот, который нужен,
-либо допишите вторую выгрузку в один DAG.
-
 ## Структура
 
 ```
@@ -254,8 +249,8 @@ def s3_key(record: dict) -> str:
     )
 
 
-def load_params(record: dict) -> dict:
-    """Вернуть адреса, которыми выгружается один файл: откуда и куда."""
+def dictionary_load_params(record: dict) -> dict:
+    """Вернуть адреса, которыми выгружается снапшот справочника: откуда и куда."""
     return {
         "src": record["path"],
         "s3_key": s3_key(record),
@@ -340,7 +335,7 @@ def admetrica_to_s3():
         record = dictionary_record(mapped_results)
         if record is None:
             raise AirflowSkipException("в этом прогоне справочник не собран")
-        return load_params(record)
+        return dictionary_load_params(record)
 
     @task_group(group_id="day")
     def per_day(day: str):

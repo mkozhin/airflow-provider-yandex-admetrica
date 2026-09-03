@@ -4,11 +4,6 @@ DAG: статистика медийных кампаний AdMetrica за пе�
 Пример, а не боевой DAG: он показывает, как связать оператор провайдера с
 витриной, и рассчитан на то, что его скопируют и подгонят под себя.
 
-Рядом лежит `admetrica_to_s3_dag.py` — тот же сбор, но выгрузка в S3. DAG'и
-независимы: каждый ходит в API сам за себя, поэтому запуск обоих за один период
-удваивает число запросов к AdMetrica. Возьмите тот, который нужен, либо допишите
-вторую выгрузку в один DAG.
-
 ## Структура
 
 ```
@@ -38,6 +33,12 @@ day, dictionary → cleanup
 видит. Раскладка держится либо на однохостовом `LocalExecutor`, либо на общем томе
 (NFS, PVC с `ReadWriteMany`), примонтированном в `BASE_DIR` на каждом воркере, который
 берёт задачи этого DAG.
+
+Таблицу кампании заводит `BigQueryHook.create_table`, которого у
+`apache-airflow-providers-google` нет до 13.0.0, поэтому DAG требует
+`apache-airflow-providers-google>=13.0.0`. Constraint-набор Airflow 2.9.1 прибивает
+10.17.0, так что на такой инсталляции google-провайдер ставится выше её собственных
+constraints — иначе `load_bq` падает на первой кампании первого дня.
 
 ## Формат результата оператора
 
@@ -345,7 +346,7 @@ def bq_dictionary_table(record: dict) -> str:
     return f"{BQ_PROJECT}.{BQ_DATASET}.{BQ_DICT_TABLE}${record['date'].replace('-', '')}"
 
 
-def stats_table_name(record: dict) -> str:
+def stats_table(record: dict) -> str:
     """Вернуть таблицу кампании — голым идентификатором, без квалификации.
 
     Гранула перезаписи нужна двумерная, день и кампания, а BigQuery партиционирует
@@ -359,14 +360,37 @@ def stats_table_name(record: dict) -> str:
     return f"{BQ_STATS_TABLE}_{record['advertiser_id']}_{record['campaign_id']}"
 
 
-def stats_table_id(record: dict) -> str:
+def stats_table_partition(record: dict) -> str:
     """Вернуть партицию таблицы кампании — с декоратором дня отчёта."""
-    return f"{stats_table_name(record)}${record['date'].replace('-', '')}"
+    return f"{stats_table(record)}${record['date'].replace('-', '')}"
 
 
-def load_params(record: dict, run_id: str) -> dict:
-    """Вернуть адреса, которыми грузится снапшот справочника: откуда, куда и в
-    какую партицию."""
+def stats_load_configuration(record: dict, object_name: str) -> dict:
+    """Вернуть конфигурацию job'а, которым партиция кампании грузится из GCS.
+
+    Схема задана явно, а `autodetect` выключен вслух: по умолчанию схема
+    определялась бы по вложенным полям начала файла и теряла бы те, что
+    встречаются дальше.
+    """
+    return {
+        "load": {
+            "sourceUris": [f"gs://{GCS_BUCKET}/{object_name}"],
+            "destinationTable": {
+                "projectId": BQ_PROJECT,
+                "datasetId": BQ_DATASET,
+                "tableId": stats_table_partition(record),
+            },
+            "schema": {"fields": BQ_STATS_SCHEMA},
+            "autodetect": False,
+            "sourceFormat": "NEWLINE_DELIMITED_JSON",
+            "writeDisposition": "WRITE_TRUNCATE",
+            "timePartitioning": {"type": "DAY", "field": STATS_PARTITION_FIELD},
+        }
+    }
+
+
+def dictionary_load_params(record: dict, run_id: str) -> dict:
+    """Вернуть адреса загрузки снапшота справочника: откуда, куда и в какую партицию."""
     return {
         "src": record["path"],
         "gcs_object": gcs_object(record, run_id),
@@ -488,7 +512,7 @@ def admetrica_to_bigquery():
             bigquery.create_table(
                 project_id=BQ_PROJECT,
                 dataset_id=BQ_DATASET,
-                table_id=stats_table_name(record),
+                table_id=stats_table(record),
                 table_resource={
                     "timePartitioning": {"type": "DAY", "field": STATS_PARTITION_FIELD}
                 },
@@ -498,22 +522,7 @@ def admetrica_to_bigquery():
             )
             bigquery.insert_job(
                 location=BQ_LOCATION,
-                configuration={
-                    "load": {
-                        "sourceUris": [f"gs://{GCS_BUCKET}/{object_name}"],
-                        "destinationTable": {
-                            "projectId": BQ_PROJECT,
-                            "datasetId": BQ_DATASET,
-                            "tableId": stats_table_id(record),
-                        },
-                        "schema": {"fields": BQ_STATS_SCHEMA},
-                        "autodetect": False,
-                        "sourceFormat": "NEWLINE_DELIMITED_JSON",
-                        "writeDisposition": "WRITE_TRUNCATE",
-                        "createDisposition": "CREATE_IF_NEEDED",
-                        "timePartitioning": {"type": "DAY", "field": STATS_PARTITION_FIELD},
-                    }
-                },
+                configuration=stats_load_configuration(record, object_name),
             )
 
     @task(multiple_outputs=True, trigger_rule="all_done")
@@ -527,7 +536,7 @@ def admetrica_to_bigquery():
         record = dictionary_record(mapped_results)
         if record is None:
             raise AirflowSkipException("в этом прогоне справочник не собран")
-        return load_params(record, context["run_id"])
+        return dictionary_load_params(record, context["run_id"])
 
     @task_group(group_id="day")
     def per_day(day: str):

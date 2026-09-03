@@ -4,6 +4,10 @@ A README is the package's public contract on PyPI, so what it claims is checked
 against the operator's own signature, the naming rule the hook applies and the
 code blocks it offers to copy. Prose and layout are the writer's; only the
 claims that name something in the code are pinned here.
+
+A requirement stated in prose is held the same way: the floor on the google
+provider is a claim the examples, the READMEs and the `dev` extra all make, and
+it holds only while every one of them names the same version.
 """
 
 from __future__ import annotations
@@ -17,6 +21,7 @@ from pathlib import Path
 
 import pytest
 from airflow.models import DAG, BaseOperator
+from airflow.providers.google.cloud.hooks.bigquery import BigQueryHook
 
 from airflow_provider_yandex_admetrica.hooks.loki import LokiClient
 from airflow_provider_yandex_admetrica.hooks.yandex_admetrica import (
@@ -76,6 +81,22 @@ _LAYOUT_DAG_ID = "readme_layout"
 
 #: The example that builds the addresses of every destination a README names.
 _LAYOUT_EXAMPLE = "examples.admetrica_to_bq_and_s3_dag"
+
+#: The google provider release that carries `BigQueryHook.create_table`, and
+#: with it the floor every place naming the requirement has to spell.
+_GOOGLE_FLOOR = "apache-airflow-providers-google>=13.0.0"
+
+#: The files that name the floor: the extra that installs it, the prose a reader
+#: of either BigQuery example meets before copying it, and the document that
+#: carries the decision behind it.
+_FLOOR_IS_WRITTEN_IN = (
+    "pyproject.toml",
+    "README.md",
+    "README_RU.md",
+    "CONTEXT.md",
+    "examples/admetrica_to_bigquery_dag.py",
+    "examples/admetrica_to_bq_and_s3_dag.py",
+)
 
 
 def _layout_operator() -> YandexAdmetricaStatsOperator:
@@ -328,6 +349,21 @@ class TestTheLayoutIsTheOneTheCodeBuilds:
         documented = "stats_{advertiser_id}_{campaign_id}"
         assert f"`{documented}`" in readme
         module = importlib.import_module(_LAYOUT_EXAMPLE)
-        table, _, partition = module.stats_table_id(_LAYOUT_RECORD).partition("$")
+        table, _, partition = module.stats_table_partition(_LAYOUT_RECORD).partition("$")
         assert table == documented.format(**_layout_segments())
         assert partition == _LAYOUT_RECORD["date"].replace("-", "")
+
+
+class TestGoogleProviderFloor:
+    """The day's load creates the campaign's table through a method the google
+    provider grew in 13.0.0, and the constraint set of Airflow 2.9.1 — the oldest
+    Airflow this package supports — pins 10.17.0, where the method is absent. The
+    floor is therefore a requirement of the examples rather than a preference, and
+    it holds only while every place that states it agrees."""
+
+    def test_the_hook_carries_the_method_the_examples_call(self):
+        assert hasattr(BigQueryHook, "create_table")
+
+    @pytest.mark.parametrize("relative", _FLOOR_IS_WRITTEN_IN)
+    def test_every_place_that_states_the_requirement_names_the_same_floor(self, relative):
+        assert _GOOGLE_FLOOR in (_ROOT / relative).read_text(encoding="utf-8")

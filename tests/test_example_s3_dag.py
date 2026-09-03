@@ -212,6 +212,8 @@ class TestTheDayUploadsEveryCampaign:
         with pytest.raises(AirflowSkipException):
             upload([])
 
+        assert fake_s3.calls == []
+
     def test_a_refused_upload_fails_the_day(self, dag_obj, fake_s3):
         """A swallowed failure would ship a day quietly missing campaigns."""
         fake_s3.fail_at["load_file"] = 2
@@ -347,7 +349,7 @@ class TestKeys:
 
     def test_one_record_gives_every_address_of_its_upload(self, dag_module):
         record = _record(kind="dict", date="2026-08-21", path="/tmp/d.json")
-        assert dag_module.load_params(record) == {
+        assert dag_module.dictionary_load_params(record) == {
             "src": "/tmp/d.json",
             "s3_key": dag_module.s3_key(record),
         }
@@ -365,7 +367,7 @@ class TestTaskCallables:
         dictionary_params = dag_obj.get_task("dictionary.params").python_callable
         snapshot = _record(kind="dict", date="2026-08-21", path="/tmp/d.json")
         params = dictionary_params([[_record(path="/tmp/20.json"), snapshot], [dict(snapshot)]])
-        assert params == dag_module.load_params(snapshot)
+        assert params == dag_module.dictionary_load_params(snapshot)
 
     def test_a_run_without_a_snapshot_skips_the_dictionary(self, dag_obj):
         dictionary_params = dag_obj.get_task("dictionary.params").python_callable

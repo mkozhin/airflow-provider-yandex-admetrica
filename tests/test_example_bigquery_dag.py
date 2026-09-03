@@ -214,7 +214,7 @@ class TestTheDayLoadsEveryCampaign:
         self._load(dag_obj)(records, run_id="run_a")
 
         tables = [config["destinationTable"]["tableId"] for config in _load_configs(fake_cloud)]
-        assert tables == [dag_module.stats_table_id(record) for record in records]
+        assert tables == [dag_module.stats_table_partition(record) for record in records]
         assert tables == ["stats_17004_1234$20260820", "stats_17004_5678$20260820"]
 
     def test_every_job_reads_the_object_that_was_just_uploaded(self, dag_obj, dag_module, fake_cloud):
@@ -238,7 +238,7 @@ class TestTheDayLoadsEveryCampaign:
             "tableId": "stats_17004_1234$20260820",
         }
 
-    def test_the_job_declares_schema_partition_and_dispositions(
+    def test_the_job_declares_schema_partition_and_write_disposition(
         self, dag_obj, dag_module, fake_cloud
     ):
         self._load(dag_obj)([_record()], run_id="run_a")
@@ -248,7 +248,6 @@ class TestTheDayLoadsEveryCampaign:
         assert config["autodetect"] is False
         assert config["sourceFormat"] == "NEWLINE_DELIMITED_JSON"
         assert config["writeDisposition"] == "WRITE_TRUNCATE"
-        assert config["createDisposition"] == "CREATE_IF_NEEDED"
         assert config["timePartitioning"] == {"type": "DAY", "field": "date"}
 
     def test_the_table_of_every_campaign_is_created_before_its_partition_is_loaded(
@@ -261,7 +260,7 @@ class TestTheDayLoadsEveryCampaign:
 
         created = fake_cloud.bigquery.tables
         assert [call["table_id"] for call in created] == [
-            dag_module.stats_table_name(record) for record in records
+            dag_module.stats_table(record) for record in records
         ]
         assert [call["table_id"] for call in created] == ["stats_17004_1234", "stats_17004_5678"]
         assert all(call["exists_ok"] is True for call in created)
@@ -330,6 +329,10 @@ class TestTheDayLoadsEveryCampaign:
         with pytest.raises(AirflowSkipException):
             self._load(dag_obj)([], run_id="run_a")
 
+        assert fake_cloud.gcs.calls == []
+        assert fake_cloud.bigquery.calls == []
+        assert fake_cloud.bigquery.tables == []
+
 
 class TestSchemas:
     """The declared schemas match the records the operator writes."""
@@ -359,6 +362,8 @@ class TestSchemas:
 
     def test_tables_are_separate(self, dag_module):
         assert dag_module.BQ_STATS_TABLE != dag_module.BQ_DICT_TABLE
+
+
 class TestBuildDates:
     """The period expands into map indices from the freshest day backwards."""
 
@@ -396,6 +401,8 @@ class TestBuildDates:
 
         assert "date must be a day" in str(failure.value)
         assert "y0_secret" not in str(failure.value)
+
+
 class TestTheRecordIsTheOperators:
     """The fixtures of this file describe what the operator really returns."""
 
@@ -487,34 +494,34 @@ class TestKeys:
         assert table == f"{dag_module.BQ_PROJECT}.{dag_module.BQ_DATASET}.campaigns$20260821"
 
     def test_the_statistics_table_names_the_advertiser_and_the_campaign(self, dag_module):
-        table = dag_module.stats_table_id(_record(date="2026-08-20", campaign_id=5678))
+        table = dag_module.stats_table_partition(_record(date="2026-08-20", campaign_id=5678))
         assert table == f"{dag_module.BQ_STATS_TABLE}_17004_5678$20260820"
 
     def test_the_statistics_table_is_a_bare_identifier(self, dag_module):
         """`insert_job` names the project and the dataset in fields of its own."""
-        table = dag_module.stats_table_id(_record())
+        table = dag_module.stats_table_partition(_record())
         assert dag_module.BQ_PROJECT not in table
         assert not table.startswith(f"{dag_module.BQ_DATASET}.")
 
     def test_two_campaigns_of_one_day_land_in_different_tables(self, dag_module):
-        tables = {dag_module.stats_table_id(record) for record in _day_of_two_campaigns()}
+        tables = {dag_module.stats_table_partition(record) for record in _day_of_two_campaigns()}
         assert len(tables) == 2
 
     def test_a_prefix_of_another_advertiser_is_not_matched_by_a_wildcard(self, dag_module):
         """`stats_123_*` must not reach the tables of advertiser 1234."""
-        near = dag_module.stats_table_id(_record(advertiser_id=1234, campaign_id=5))
+        near = dag_module.stats_table_partition(_record(advertiser_id=1234, campaign_id=5))
         assert not near.startswith("stats_123_")
 
     def test_the_table_of_a_campaign_is_named_without_a_partition(self, dag_module):
         """The load addresses a partition, the creation of the table does not."""
-        assert dag_module.stats_table_name(_record()) == "stats_17004_1234"
-        assert dag_module.stats_table_id(_record()).startswith(
-            f"{dag_module.stats_table_name(_record())}$"
+        assert dag_module.stats_table(_record()) == "stats_17004_1234"
+        assert dag_module.stats_table_partition(_record()).startswith(
+            f"{dag_module.stats_table(_record())}$"
         )
 
     def test_one_record_gives_every_address_of_its_load(self, dag_module):
         record = _record(kind="dict", date="2026-08-21", path="/tmp/d.json")
-        params = dag_module.load_params(record, "run_a")
+        params = dag_module.dictionary_load_params(record, "run_a")
         assert params == {
             "src": "/tmp/d.json",
             "gcs_object": dag_module.gcs_object(record, "run_a"),
@@ -560,6 +567,8 @@ class TestStagingLifecycleRule:
             }
         ]
         assert dag_module.staging_rule_present(rules) is False
+
+
 class TestTaskCallables:
     """The functions the tasks run, called directly through ``.python_callable``."""
 
@@ -574,7 +583,7 @@ class TestTaskCallables:
         params = dictionary_params(
             [[_record(path="/tmp/20.json"), snapshot], [dict(snapshot)]], run_id="run_a"
         )
-        assert params == dag_module.load_params(snapshot, "run_a")
+        assert params == dag_module.dictionary_load_params(snapshot, "run_a")
 
     def test_a_run_without_a_snapshot_skips_the_dictionary(self, dag_obj):
         dictionary_params = dag_obj.get_task("dictionary.params").python_callable
@@ -656,6 +665,8 @@ class TestEnsureBucket:
         self._run(dag_obj, dag_module, monkeypatch, bucket)
         assert bucket.lifecycle_rules == [dag_module.STAGING_LIFECYCLE_RULE]
         assert bucket.patched is True
+
+
 class TestCleanup:
     """The task deletes this run's directory and leaves every other one alone."""
 

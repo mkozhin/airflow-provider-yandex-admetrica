@@ -32,7 +32,7 @@ dev = [
     "pytest>=7.0",
     "pyyaml",
     "apache-airflow-providers-amazon",
-    "apache-airflow-providers-google",
+    "apache-airflow-providers-google>=13.0.0",
 ]
 
 [project.urls]
