@@ -485,9 +485,9 @@ if your query contains a `WHERE` clause on the `_TABLE_SUFFIX` pseudocolumn».
 
 ### Task 7: [Final] Update documentation
 
-- [ ] проверить, что README на двух языках синхронны
-- [ ] проверить, что новая раскладка и её мотив записаны в `CONTEXT.md`
-- [ ] перенести план в `docs/plans/completed/`
+- [x] проверить, что README на двух языках синхронны
+- [x] проверить, что новая раскладка и её мотив записаны в `CONTEXT.md`
+- [x] перенести план в `docs/plans/completed/`
 
 ## Post-Completion
 
