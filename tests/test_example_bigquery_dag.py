@@ -20,7 +20,12 @@ _MOD_NAME = "examples.admetrica_to_bigquery_dag"
 _DAY_TASKS = ("day.collect", "day.load_bq")
 
 #: The chain the snapshot of the campaign dictionary travels, once per run.
-_DICTIONARY_TASKS = ("dictionary.params", "dictionary.upload_gcs", "dictionary.load_bq")
+_DICTIONARY_TASKS = (
+    "dictionary.params",
+    "dictionary.upload_gcs",
+    "dictionary.create_table",
+    "dictionary.load_bq",
+)
 
 
 @pytest.fixture(scope="module")
@@ -200,6 +205,35 @@ class TestLoadOperators:
 
     def test_the_dictionary_load_names_the_region_of_the_dataset(self, dag_obj, dag_module):
         assert dag_obj.get_task("dictionary.load_bq").location == dag_module.BQ_LOCATION
+
+    def test_the_table_of_the_dictionary_is_created_before_its_partition_is_loaded(
+        self, dag_obj, dag_module
+    ):
+        """A partition decorator addresses a partition of a table that exists, so a
+        run against a dataset without `campaigns` would fail without this step."""
+        create = dag_obj.get_task("dictionary.create_table")
+        assert create.project_id == dag_module.BQ_PROJECT
+        assert create.dataset_id == dag_module.BQ_DATASET
+        assert create.table_id == dag_module.BQ_DICT_TABLE
+        assert create.table_resource == {
+            "schema": {"fields": dag_module.BQ_DICT_SCHEMA},
+            "timePartitioning": {"type": "DAY", "field": "snapshot_date"},
+        }
+        assert create.location == dag_module.BQ_LOCATION
+        assert "dictionary.create_table" in dag_obj.get_task("dictionary.load_bq").upstream_task_ids
+
+    def test_the_dictionary_table_is_created_without_the_partition_decorator(self, dag_obj):
+        """A decorator names a partition, and a table is named without one."""
+        assert "$" not in dag_obj.get_task("dictionary.create_table").table_id
+
+    def test_a_dictionary_table_that_is_already_there_is_left_alone(self, dag_obj):
+        """Every run after the first meets the table the run before it created."""
+        assert dag_obj.get_task("dictionary.create_table").if_exists.value == "ignore"
+
+    def test_the_dictionary_table_is_created_only_for_a_run_that_has_a_snapshot(self, dag_obj):
+        """`params` skips a run without a snapshot, and the create step skips with it."""
+        create = dag_obj.get_task("dictionary.create_table")
+        assert create.upstream_task_ids == {"dictionary.params"}
 
 
 class TestTheDayLoadsEveryCampaign:

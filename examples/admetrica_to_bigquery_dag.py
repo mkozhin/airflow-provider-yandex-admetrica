@@ -11,7 +11,8 @@ get_dates ─────────┐
                    ├─→ day[<дата>]: collect → load_bq
 ensure_gcs_bucket ─┘
 
-day ─→ dictionary: params → upload_gcs → load_bq
+day ─→ dictionary: params ─┬─→ upload_gcs ──┐
+                           └─→ create_table ┴─→ load_bq
 
 day, dictionary → cleanup
 ```
@@ -34,11 +35,13 @@ day, dictionary → cleanup
 (NFS, PVC с `ReadWriteMany`), примонтированном в `BASE_DIR` на каждом воркере, который
 берёт задачи этого DAG.
 
-Таблицу кампании заводит `BigQueryHook.create_table`, а самый ранний доступный на PyPI
-релиз с этим методом — 14.0.0, поэтому DAG требует
+Таблицы DAG заводит сам: таблицу кампании — `BigQueryHook.create_table`, таблицу
+справочника — `BigQueryCreateTableOperator`. Самый ранний доступный на PyPI релиз
+google-провайдера с ними — 14.0.0, поэтому DAG требует
 `apache-airflow-providers-google>=14.0.0`. Constraint-набор Airflow 2.9.1 прибивает
 10.17.0, так что на такой инсталляции google-провайдер ставится выше её собственных
-constraints — иначе `load_bq` падает на первой кампании первого дня.
+constraints — иначе загрузка падает на первой кампании первого дня и на первом
+справочнике в пустом датасете.
 
 ## Формат результата оператора
 
@@ -86,11 +89,13 @@ constraints — иначе `load_bq` падает на первой кампан
 не пишет. Там же проверяют, что под `stats_*` не попадает ни одна вью: она ломает
 wildcard-запрос целиком.
 
-Декоратор адресует партицию таблицы, которая уже есть, поэтому таблицу кампании
-`day.load_bq` создаёт сам — пустой, с той же схемой и тем же партиционированием, —
-и только после этого грузит. Шаг идемпотентен, так что первый день новой кампании
-доезжает до витрины ровно как всякий следующий. Датасет при этом должен существовать
-заранее, а коннекшену нужно право создавать в нём таблицы.
+Декоратор адресует партицию таблицы, которая уже есть, поэтому обе таблицы DAG
+создаёт сам — пустыми, с той же схемой и тем же партиционированием, — и только после
+этого грузит: таблицу кампании заводит `day.load_bq` перед её загрузкой, таблицу
+справочника — `dictionary.create_table`. Оба шага идемпотентны, так что первый день
+новой кампании и первый прогон в пустом датасете доезжают до витрины ровно как всякий
+следующий. Датасет при этом должен существовать заранее, а коннекшену нужно право
+создавать в нём таблицы.
 
 Цена такой гранулы — число job'ов загрузки. День стоит по объекту GCS и по load job на
 каждую кампанию, давшую строки, и `day.load_bq` проходит их последовательно, одной
@@ -183,6 +188,7 @@ from airflow.exceptions import AirflowSkipException
 from airflow.models.param import Param
 from airflow.providers.google.cloud.hooks.bigquery import BigQueryHook
 from airflow.providers.google.cloud.hooks.gcs import GCSHook
+from airflow.providers.google.cloud.operators.bigquery import BigQueryCreateTableOperator
 from airflow.providers.google.cloud.transfers.gcs_to_bigquery import GCSToBigQueryOperator
 from airflow.providers.google.cloud.transfers.local_to_gcs import LocalFilesystemToGCSOperator
 
@@ -609,17 +615,35 @@ def admetrica_to_bigquery():
         """Загрузить снапшот справочника прогона в BigQuery — один раз за прогон.
 
         Запись одна на прогон, её адрес известен до запуска задач, поэтому
-        выгрузка и загрузка остаются декларативными операторами переноса.
+        выгрузка, создание таблицы и загрузка остаются декларативными операторами.
         """
         params = dictionary_params.override(task_id="params")(mapped_results)
 
-        LocalFilesystemToGCSOperator(
+        upload_gcs = LocalFilesystemToGCSOperator(
             task_id="upload_gcs",
             gcp_conn_id=GCP_CONN_ID,
             bucket=GCS_BUCKET,
             src=params["src"],
             dst=params["gcs_object"],
-        ) >> GCSToBigQueryOperator(
+        )
+        # Декоратор `$YYYYMMDD` адресует партицию существующей таблицы, поэтому
+        # таблица справочника заводится до загрузки — пустой, с той же схемой и тем
+        # же партиционированием. `if_exists="ignore"` делает шаг безобидным на
+        # каждом следующем прогоне.
+        create_table = BigQueryCreateTableOperator(
+            task_id="create_table",
+            gcp_conn_id=GCP_CONN_ID,
+            project_id=BQ_PROJECT,
+            dataset_id=BQ_DATASET,
+            table_id=BQ_DICT_TABLE,
+            table_resource={
+                "schema": {"fields": BQ_DICT_SCHEMA},
+                "timePartitioning": {"type": "DAY", "field": DICT_PARTITION_FIELD},
+            },
+            if_exists="ignore",
+            location=BQ_LOCATION,
+        )
+        load_bq = GCSToBigQueryOperator(
             task_id="load_bq",
             gcp_conn_id=GCP_CONN_ID,
             bucket=GCS_BUCKET,
@@ -633,6 +657,9 @@ def admetrica_to_bigquery():
             time_partitioning={"type": "DAY", "field": DICT_PARTITION_FIELD},
             location=BQ_LOCATION,
         )
+
+        params >> create_table
+        [upload_gcs, create_table] >> load_bq
 
     @task(trigger_rule="none_failed")
     def cleanup(**context) -> None:

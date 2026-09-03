@@ -22,6 +22,7 @@ from pathlib import Path
 import pytest
 from airflow.models import DAG, BaseOperator
 from airflow.providers.google.cloud.hooks.bigquery import BigQueryHook
+from airflow.providers.google.cloud.operators.bigquery import BigQueryCreateTableOperator
 
 from airflow_provider_yandex_admetrica.hooks.loki import LokiClient
 from airflow_provider_yandex_admetrica.hooks.yandex_admetrica import (
@@ -82,8 +83,8 @@ _LAYOUT_DAG_ID = "readme_layout"
 #: The example that builds the addresses of every destination a README names.
 _LAYOUT_EXAMPLE = "examples.admetrica_to_bq_and_s3_dag"
 
-#: The google provider release that carries `BigQueryHook.create_table`, and
-#: with it the floor every place naming the requirement has to spell.
+#: The google provider release that carries the two ways the examples create a
+#: table, and with it the floor every place naming the requirement has to spell.
 _GOOGLE_FLOOR = "apache-airflow-providers-google>=14.0.0"
 
 #: The files that name the floor: the extra that installs it, the prose a reader
@@ -355,14 +356,21 @@ class TestTheLayoutIsTheOneTheCodeBuilds:
 
 
 class TestGoogleProviderFloor:
-    """The day's load creates the campaign's table through a method whose earliest
-    release on PyPI is google provider 14.0.0, while the constraint set of Airflow
-    2.9.1 — the oldest Airflow this package supports — pins 10.17.0, where the
-    method is absent. The floor is therefore a requirement of the examples rather
-    than a preference, and it holds only while every place that states it agrees."""
+    """The examples create the table every partition decorator addresses: the day's
+    load through a hook method, the dictionary through an operator. The earliest
+    release on PyPI carrying either is google provider 14.0.0, while the constraint
+    set of Airflow 2.9.1 — the oldest Airflow this package supports — pins 10.17.0,
+    where both are absent. The floor is therefore a requirement of the examples
+    rather than a preference, and it holds only while every place that states it
+    agrees."""
 
     def test_the_hook_carries_the_method_the_examples_call(self):
         assert hasattr(BigQueryHook, "create_table")
+
+    def test_the_provider_carries_the_operator_the_examples_declare(self):
+        """The dictionary's table is created declaratively, by this operator."""
+        parameters = inspect.signature(BigQueryCreateTableOperator.__init__).parameters
+        assert {"dataset_id", "table_id", "table_resource", "if_exists"} <= set(parameters)
 
     @pytest.mark.parametrize("relative", _FLOOR_IS_WRITTEN_IN)
     def test_every_place_that_states_the_requirement_names_the_same_floor(self, relative):
