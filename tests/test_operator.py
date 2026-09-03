@@ -29,6 +29,14 @@ ADVERTISER_ID = 17004
 
 DATE = "2026-08-20"
 
+#: The campaign every row of the fixtures belongs to unless told otherwise.
+CAMPAIGN_ID = 123456
+
+#: A second campaign of the same advertiser, so a day of rows has something to
+#: be split by: with one campaign a per-campaign layout and a per-day one look
+#: exactly alike.
+OTHER_CAMPAIGN_ID = 654321
+
 RUN_ID = "manual__2026-08-21T00:00:00+00:00"
 
 #: The run directory segment for :data:`RUN_ID`, spelled out rather than built
@@ -83,7 +91,7 @@ def _connection(advertiser_id: object = ADVERTISER_ID) -> Connection:
     )
 
 
-def _campaign(campaign_id: int = 123456, name: str = "Летняя кампания") -> dict:
+def _campaign(campaign_id: int = CAMPAIGN_ID, name: str = "Летняя кампания") -> dict:
     return {
         "campaign_id": campaign_id,
         "name": name,
@@ -95,11 +103,13 @@ def _campaign(campaign_id: int = 123456, name: str = "Летняя кампан�
     }
 
 
-def _row(placement_id: int = 55, renders: int = 12345) -> dict:
+def _row(
+    placement_id: int = 55, renders: int = 12345, campaign_id: int = CAMPAIGN_ID
+) -> dict:
     return {
         "date": DATE,
         "advertiser_id": ADVERTISER_ID,
-        "campaign_id": 123456,
+        "campaign_id": campaign_id,
         "dimensions": {
             "placement": {"name": "Главная страница", "id": placement_id},
             "device_type": {"name": "mobile"},
@@ -159,7 +169,7 @@ def _read(path: str) -> list[str]:
 
 
 class TestPath:
-    def test_names_the_day_under_the_advertiser(self, tmp_path):
+    def test_names_the_campaign_under_the_day_of_the_advertiser(self, tmp_path):
         op = _operator(base_dir=str(tmp_path))
         with _Run([_row()]):
             result = op.execute(_context())
@@ -169,20 +179,23 @@ class TestPath:
             RUN_SEGMENT,
             str(ADVERTISER_ID),
             "stats",
-            f"{DATE}.json",
+            DATE,
+            f"{CAMPAIGN_ID}.json",
         )
 
     def test_sanitizes_the_run_id(self, tmp_path):
         op = _operator(base_dir=str(tmp_path))
-        path = op._build_path("scheduled__2026-08-21T00:00:00+00:00", 17004, ("stats",), DATE)
+        path = op._build_path(
+            "scheduled__2026-08-21T00:00:00+00:00", 17004, ("stats",), DATE, CAMPAIGN_ID
+        )
         assert "scheduled__2026-08-21T00_00_00_00_00" in path
         assert ":" not in os.path.relpath(path, str(tmp_path))
         assert "+" not in os.path.relpath(path, str(tmp_path))
 
     def test_two_runs_do_not_share_a_file(self, tmp_path):
         op = _operator(base_dir=str(tmp_path))
-        first = op._build_path("run_a", ADVERTISER_ID, ("stats",), DATE)
-        second = op._build_path("run_b", ADVERTISER_ID, ("stats",), DATE)
+        first = op._build_path("run_a", ADVERTISER_ID, ("stats",), DATE, CAMPAIGN_ID)
+        second = op._build_path("run_b", ADVERTISER_ID, ("stats",), DATE, CAMPAIGN_ID)
         assert first != second
 
     def test_two_dags_sharing_a_base_dir_do_not_share_a_run_directory(self, tmp_path):
@@ -194,8 +207,12 @@ class TestPath:
         with DAG("advertiser_b", start_date=RUN_START):
             second = _operator(base_dir=str(tmp_path))
         run_id = "scheduled__2026-08-21T00:00:00+00:00"
-        first_path = first._build_path(run_id, ADVERTISER_ID, ("stats",), DATE)
-        second_path = second._build_path(run_id, ADVERTISER_ID, ("stats",), DATE)
+        first_path = first._build_path(
+            run_id, ADVERTISER_ID, ("stats",), DATE, CAMPAIGN_ID
+        )
+        second_path = second._build_path(
+            run_id, ADVERTISER_ID, ("stats",), DATE, CAMPAIGN_ID
+        )
         assert first_path != second_path
         assert os.path.commonpath([first_path, second_path]) == str(tmp_path)
 
@@ -210,7 +227,7 @@ class TestPath:
         # Airflow holds a dag_id and a run_id of up to 250 characters, and a
         # directory name is bounded in bytes rather than characters.
         op = _operator(base_dir=str(tmp_path))
-        path = op._build_path(identifier, ADVERTISER_ID, ("stats",), DATE)
+        path = op._build_path(identifier, ADVERTISER_ID, ("stats",), DATE, CAMPAIGN_ID)
         for segment in os.path.relpath(path, str(tmp_path)).split(os.sep):
             assert len(segment.encode("utf-8")) <= 255
         op._write([_row()], path)
@@ -220,16 +237,20 @@ class TestPath:
         # The cut takes the tail that would have told them apart, so what does
         # it instead is the digest, which is taken from the whole identifier.
         op = _operator(base_dir=str(tmp_path))
-        first = op._build_path("c" * 250 + "first", ADVERTISER_ID, ("stats",), DATE)
-        second = op._build_path("c" * 250 + "second", ADVERTISER_ID, ("stats",), DATE)
+        first = op._build_path(
+            "c" * 250 + "first", ADVERTISER_ID, ("stats",), DATE, CAMPAIGN_ID
+        )
+        second = op._build_path(
+            "c" * 250 + "second", ADVERTISER_ID, ("stats",), DATE, CAMPAIGN_ID
+        )
         assert first != second
 
     def test_run_ids_that_sanitise_alike_stay_apart(self, tmp_path):
         # The substitution that makes a directory name of a run id maps several
         # run ids onto one name; the digest beside it is what tells them apart.
         op = _operator(base_dir=str(tmp_path))
-        first = op._build_path("manual:a", ADVERTISER_ID, ("stats",), DATE)
-        second = op._build_path("manual/a", ADVERTISER_ID, ("stats",), DATE)
+        first = op._build_path("manual:a", ADVERTISER_ID, ("stats",), DATE, CAMPAIGN_ID)
+        second = op._build_path("manual/a", ADVERTISER_ID, ("stats",), DATE, CAMPAIGN_ID)
         assert first != second
         assert "manual_a-" in first
         assert "manual_a-" in second
@@ -291,6 +312,105 @@ class TestWrittenFile:
         with _Run([]):
             result = op.execute(_context())
         assert [record["kind"] for record in result] == ["dict"]
+
+
+class TestTheGrainIsADayOfACampaign:
+    """One file and one record per campaign, so an address reaches one campaign."""
+
+    def test_a_day_of_several_campaigns_gives_a_file_and_a_record_each(self, tmp_path):
+        op = _operator(base_dir=str(tmp_path), collect_dictionaries=False)
+        rows = [
+            _row(55, 1),
+            _row(56, 2, campaign_id=OTHER_CAMPAIGN_ID),
+            _row(57, 3),
+        ]
+        with _Run(rows):
+            result = op.execute(_context())
+        assert [record["campaign_id"] for record in result] == [
+            CAMPAIGN_ID,
+            OTHER_CAMPAIGN_ID,
+        ]
+        first, second = (record["path"] for record in result)
+        assert first != second
+        assert [json.loads(line) for line in _read(first)] == [rows[0], rows[2]]
+        assert [json.loads(line) for line in _read(second)] == [rows[1]]
+
+    def test_the_path_names_the_campaign_inside_the_directory_of_the_day(self, tmp_path):
+        op = _operator(base_dir=str(tmp_path), collect_dictionaries=False)
+        with _Run([_row(campaign_id=OTHER_CAMPAIGN_ID)]):
+            (record,) = op.execute(_context())
+        assert record["path"].endswith(
+            os.path.join("stats", DATE, f"{OTHER_CAMPAIGN_ID}.json")
+        )
+
+    def test_two_campaigns_of_one_day_land_in_the_directory_of_that_day(self, tmp_path):
+        op = _operator(base_dir=str(tmp_path), collect_dictionaries=False)
+        with _Run([_row(), _row(campaign_id=OTHER_CAMPAIGN_ID)]):
+            first, second = (record["path"] for record in op.execute(_context()))
+        assert os.path.dirname(first) == os.path.dirname(second)
+        assert os.path.basename(os.path.dirname(first)) == DATE
+
+    def test_a_campaign_the_day_holds_no_rows_for_writes_nothing(self, tmp_path):
+        # The cabinet lists both campaigns; only one of them ran that day, and
+        # the other keeps whatever an earlier export left in the warehouse.
+        op = _operator(base_dir=str(tmp_path), collect_dictionaries=False)
+        with _Run(
+            [_row()], campaigns=[_campaign(CAMPAIGN_ID), _campaign(OTHER_CAMPAIGN_ID)]
+        ):
+            result = op.execute(_context())
+        assert [record["campaign_id"] for record in result] == [CAMPAIGN_ID]
+        day_dir = (
+            tmp_path / DAG_SEGMENT / RUN_SEGMENT / str(ADVERTISER_ID) / "stats" / DATE
+        )
+        assert [entry.name for entry in day_dir.iterdir()] == [f"{CAMPAIGN_ID}.json"]
+
+    def test_a_day_without_rows_addresses_no_statistics_at_all(self, tmp_path):
+        op = _operator(base_dir=str(tmp_path))
+        with _Run([]):
+            result = op.execute(_context())
+        assert [record["kind"] for record in result] == ["dict"]
+        stats_dir = tmp_path / DAG_SEGMENT / RUN_SEGMENT / str(ADVERTISER_ID) / "stats"
+        assert not stats_dir.exists()
+
+    def test_the_records_follow_the_order_the_cabinet_lists_the_campaigns(self, tmp_path):
+        # The hook walks the cabinet in order and the rows arrive in that order,
+        # so reading a result follows the same order as reading the cabinet.
+        op = _operator(base_dir=str(tmp_path), collect_dictionaries=False)
+        rows = [_row(campaign_id=OTHER_CAMPAIGN_ID), _row(campaign_id=CAMPAIGN_ID)]
+        with _Run(rows):
+            result = op.execute(_context())
+        assert [record["campaign_id"] for record in result] == [
+            OTHER_CAMPAIGN_ID,
+            CAMPAIGN_ID,
+        ]
+
+    def test_the_dictionary_stays_one_file_addressed_by_the_day_alone(self, tmp_path):
+        op = _operator(base_dir=str(tmp_path))
+        with _Run([_row(), _row(campaign_id=OTHER_CAMPAIGN_ID)]):
+            result = op.execute(_context())
+        (record,) = [r for r in result if r["kind"] == "dict"]
+        assert record["campaign_id"] is None
+        assert record["path"] == os.path.join(
+            str(tmp_path),
+            DAG_SEGMENT,
+            RUN_SEGMENT,
+            str(ADVERTISER_ID),
+            "dict",
+            "campaigns",
+            f"{SNAPSHOT_DATE}.json",
+        )
+
+    def test_every_record_of_a_full_run_carries_the_campaign_key(self, tmp_path):
+        """A DAG walks the whole list, so a missing key would fail it on the dict."""
+        op = _operator(base_dir=str(tmp_path))
+        with _Run([_row(), _row(campaign_id=OTHER_CAMPAIGN_ID)]):
+            result = op.execute(_context())
+        assert [record["kind"] for record in result] == ["stats", "stats", "dict"]
+        assert [record["campaign_id"] for record in result] == [
+            CAMPAIGN_ID,
+            OTHER_CAMPAIGN_ID,
+            None,
+        ]
 
 
 class TestResult:
@@ -585,7 +705,9 @@ class TestTheDayIsHeldToItsFormat:
     def test_a_day_can_name_nothing_outside_the_base_directory(self, tmp_path):
         """Even reached directly, the path stays under the base directory."""
         op = _operator(base_dir=str(tmp_path))
-        path = op._build_path(RUN_ID, ADVERTISER_ID, ("stats",), "../../../../tmp/pwned")
+        path = op._build_path(
+            RUN_ID, ADVERTISER_ID, ("stats",), "../../../../tmp/pwned", CAMPAIGN_ID
+        )
         assert os.path.normpath(path).startswith(str(tmp_path) + os.sep)
 
 
@@ -604,7 +726,7 @@ class TestTheWriteIsAtomic:
 
     def test_the_path_never_holds_a_half_written_file(self, tmp_path):
         op = _operator(base_dir=str(tmp_path))
-        path = op._build_path(RUN_ID, ADVERTISER_ID, ("stats",), DATE)
+        path = op._build_path(RUN_ID, ADVERTISER_ID, ("stats",), DATE, CAMPAIGN_ID)
         op._write([_row(55)], path)
 
         with pytest.raises(TypeError):

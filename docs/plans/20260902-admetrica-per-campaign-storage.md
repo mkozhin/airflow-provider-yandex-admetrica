@@ -278,20 +278,20 @@ if your query contains a `WHERE` clause on the `_TABLE_SUFFIX` pseudocolumn».
 - Modify: `airflow_provider_yandex_admetrica/operators/stats.py`
 - Modify: `tests/test_operator.py`
 
-- [ ] добавить `campaign_id: int | None` в `ExportRecord` с докстрокой о том,
+- [x] добавить `campaign_id: int | None` в `ExportRecord` с докстрокой о том,
       почему у словаря он `None`, и класть его в запись словаря **явно**
-- [ ] научить `_build_path` адресовать файл кампании внутри каталога дня;
+- [x] научить `_build_path` адресовать файл кампании внутри каталога дня;
       путь словаря не менять; в докстроке сказать, что санация дня остаётся в
       силе для сегмента каталога, а `campaign_id` доверенный по построению, и
       выправить придаточное «the S3 key addresses a day of an advertiser and
       nothing else» (`operators/stats.py:171-174`) — ключ адресует день и
       кампанию
-- [ ] в `execute()` сгруппировать строки `hook.get_stats(...)` по
+- [x] в `execute()` сгруппировать строки `hook.get_stats(...)` по
       `row["campaign_id"]` и записать по файлу на кампанию, вернув по записи на
       каждую; кампания без строк не пишет ничего и записи не возвращает
-- [ ] дополнить докстроку класса абзацем о грануле «день × кампания»: что
+- [x] дополнить докстроку класса абзацем о грануле «день × кампания»: что
       адресуется кампанией, что нет и почему запись без строк не создаётся
-- [ ] обновить существующие утверждения о пути в `tests/test_operator.py`:
+- [x] обновить существующие утверждения о пути в `tests/test_operator.py`:
       `TestPath.test_names_the_day_under_the_advertiser` (:162),
       `test_two_runs_do_not_share_a_file`, `TestWrittenFile` (:238-294),
       `TestResult` (:296-331), `TestTheWriteIsAtomic` (:602); хелпер `_row()`
@@ -302,12 +302,12 @@ if your query contains a `WHERE` clause on the `_TABLE_SUFFIX` pseudocolumn».
       (:213), `test_long_run_ids_sharing_their_start_stay_apart` (:223-224),
       `test_run_ids_that_sanitise_alike_stay_apart` (:231-232),
       `test_a_day_can_name_nothing_outside_the_base_directory` (:588)
-- [ ] написать тесты: день с несколькими кампаниями даёт несколько файлов и
+- [x] написать тесты: день с несколькими кампаниями даёт несколько файлов и
       несколько записей; путь содержит `campaign_id`; кампания без строк не даёт
       ни файла, ни записи; день без строк вовсе не даёт ни одной записи `stats`;
       словарь по-прежнему один, его путь не изменился и он несёт
       `campaign_id=None`
-- [ ] запустить `.venv/bin/pytest tests/test_operator.py` — должно пройти
+- [x] запустить `.venv/bin/pytest tests/test_operator.py` — должно пройти
 
 ### Task 2: Пример выгрузки в S3
 

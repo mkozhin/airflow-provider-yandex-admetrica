@@ -80,18 +80,50 @@ def id_segment(identifier: str) -> str:
     return f"{_fit_bytes(safe, _SEGMENT_BYTES - _DIGEST_LENGTH - 1)}-{digest}"
 
 
+def _by_campaign(rows: Sequence[dict]) -> dict[int, list[dict]]:
+    """Return *rows* split by the campaign each of them names.
+
+    The hook answers with one flat list for the day, because a row is a row
+    whatever campaign it came from and a caller wanting the day whole should not
+    have to stitch it back together.  Splitting it is the operator's business:
+    the operator is what turns rows into files, and a file is what carries an
+    address.
+
+    Every row names a campaign — the hook reads ``campaign_id`` as a positive
+    whole number for each of them and fails the export over one it could not —
+    so the key is taken outright rather than defended against.
+
+    A dictionary keeps insertion order, so the campaigns come out in the order
+    the hook walked them, which is the order the cabinet lists them in.  Reading
+    the result of a run then follows the same order as reading the cabinet.
+    """
+    grouped: dict[int, list[dict]] = {}
+    for row in rows:
+        grouped.setdefault(row["campaign_id"], []).append(row)
+    return grouped
+
+
 class ExportRecord(TypedDict):
     """One file this operator wrote, described for the tasks downstream.
 
     ``advertiser_id`` travels with the record because the DAG builds the S3 key
     and the table name from it and has nowhere else to read it: the advertiser
     is named in the connection, which only the hook opens.
+
+    ``campaign_id`` names the campaign whose rows the file holds, and it is what
+    lets an address reach one campaign of one day rather than the whole day.
+    The dictionary is a snapshot of the cabinet and belongs to no single
+    campaign, so its record carries ``None``.  The key is spelled out on both
+    kinds because this ``TypedDict`` is total: a DAG walking a mixed list and
+    reading ``record["campaign_id"]`` would otherwise meet a ``KeyError`` on the
+    dictionary, and only on a live run.
     """
 
     kind: str
     date: str
     path: str
     advertiser_id: int
+    campaign_id: int | None
 
 
 class YandexAdmetricaStatsOperator(BaseOperator):
@@ -105,8 +137,18 @@ class YandexAdmetricaStatsOperator(BaseOperator):
     known from the request — the groupings and metrics of a record are nested
     objects whose fields come from the answer and may differ between rows.
 
-    A day with no rows writes no file and adds nothing to the result, so a
-    previously exported copy of that day stays where it is.
+    The grain of an export is a day of one campaign.  The rows of the day are
+    split by the campaign they belong to and written a file each, and the result
+    holds one record per campaign, so every address downstream — the local file,
+    the S3 key, the object in GCS, the table in BigQuery — reaches the one
+    campaign it was built from.  That is what makes collecting part of a cabinet
+    safe: what a re-export rewrites is exactly what it collected, and a task
+    cannot reach the data of a campaign it never asked for.
+
+    A campaign with no rows for the day writes no file and adds no record, and a
+    day with no rows at all adds no statistics record whatsoever.  A copy
+    exported earlier stays where it is, holding the last figures known for that
+    campaign and day.
 
     ``include_undefined`` goes out as the flag the API spells it in: ``True``
     keeps the rows whose first grouping has no value, ``False`` asks the API to
@@ -116,7 +158,9 @@ class YandexAdmetricaStatsOperator(BaseOperator):
     Beside the statistics the task exports the dictionary of campaigns, unless
     ``collect_dictionaries`` turns it off.  The dictionary is a snapshot of the
     day the export runs rather than of the day it reports on, because the
-    management API answers with the state the campaigns are in right now.
+    management API answers with the state the campaigns are in right now.  It is
+    addressed by that day alone: it describes the cabinet whole, so rewriting it
+    whole is what a re-export of it means.
     """
 
     template_fields = ("date", "admetrica_conn_id", "loki_conn_id", "base_dir")
@@ -165,16 +209,22 @@ class YandexAdmetricaStatsOperator(BaseOperator):
         advertiser_id: int,
         parts: Sequence[str],
         date: str,
+        campaign_id: int | None = None,
     ) -> str:
         """Return the local file for *date* under *parts* of this advertiser.
 
+        Given a *campaign_id* the day becomes a directory and the campaign names
+        the file inside it, so one file holds the rows of one campaign of one
+        day.  Left out, the day names the file itself, which is what the
+        dictionary wants: a snapshot of the whole cabinet answers to no campaign.
+
         The DAG and the run sit in the path so two exports of the same day never
         write the same file; both stay local, since the S3 key addresses a day
-        of an advertiser and nothing else.  It takes the two of them: Airflow
-        holds a run id unique within its DAG and nothing wider, while one
-        connection names one advertiser, so serving several advertisers means
-        several DAGs — and they share ``base_dir`` unless each is given its own.
-        Two of them on the same schedule are handed the same
+        and a campaign of an advertiser and nothing else.  It takes the two of
+        them: Airflow holds a run id unique within its DAG and nothing wider,
+        while one connection names one advertiser, so serving several
+        advertisers means several DAGs — and they share ``base_dir`` unless each
+        is given its own.  Two of them on the same schedule are handed the same
         ``scheduled__<logical_date>``, and a run directory named by that alone
         would be one directory two DAGs collect into and either one deletes.
 
@@ -184,17 +234,27 @@ class YandexAdmetricaStatsOperator(BaseOperator):
         The day is a template field a DAG parameter fills in, so every character
         outside the letters, digits, underscore and hyphen a directory name is
         allowed to hold becomes an underscore: a day written as ``../../etc``
-        addresses a file under the base directory, spelled oddly, rather than a
-        file anywhere on the worker.
+        addresses a directory under the base directory, spelled oddly, rather
+        than a file anywhere on the worker.  The substitution holds wherever the
+        day lands, the segment naming a directory as much as the one naming a
+        file.  The campaign takes no such treatment and needs none: it reaches
+        here from :func:`_campaign_record`, which has already read it as a
+        positive whole number, so the only source of that segment is trusted by
+        construction.
         """
         safe_date = _UNSAFE_SEGMENT_RE.sub("_", date)
+        tail = (
+            (safe_date, f"{campaign_id}.json")
+            if campaign_id is not None
+            else (f"{safe_date}.json",)
+        )
         return os.path.join(
             self.base_dir,
             id_segment(self.dag_id),
             id_segment(run_id),
             str(advertiser_id),
             *parts,
-            f"{safe_date}.json",
+            *tail,
         )
 
     def _write(self, records: Sequence[dict], path: str) -> None:
@@ -300,6 +360,7 @@ class YandexAdmetricaStatsOperator(BaseOperator):
             date=snapshot_date,
             path=path,
             advertiser_id=advertiser_id,
+            campaign_id=None,
         )
 
     def execute(self, context) -> list[ExportRecord]:
@@ -328,18 +389,21 @@ class YandexAdmetricaStatsOperator(BaseOperator):
             lang=self.lang,
             extra_params=self.extra_params,
         )
-        if rows:
-            path = self._build_path(run_id, advertiser_id, STATS_PARTS, self.date)
-            self._write(rows, path)
+        for campaign_id, campaign_rows in _by_campaign(rows).items():
+            path = self._build_path(
+                run_id, advertiser_id, STATS_PARTS, self.date, campaign_id
+            )
+            self._write(campaign_rows, path)
             result.append(
                 ExportRecord(
                     kind="stats",
                     date=self.date,
                     path=path,
                     advertiser_id=advertiser_id,
+                    campaign_id=campaign_id,
                 )
             )
-        else:
+        if not rows:
             self.log.info(
                 "AdMetrica returned no rows for advertiser %s on %s; no file written.",
                 advertiser_id,
