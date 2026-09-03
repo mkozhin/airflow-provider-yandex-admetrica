@@ -12,7 +12,7 @@ BigQuery. DAG'и независимы: каждый ходит в API сам з�
 ## Структура
 
 ```
-get_dates ─→ day[<дата>]: collect → params → upload_s3
+get_dates ─→ day[<дата>]: collect → upload_s3
 
 day ─→ dictionary: params → upload_s3
 
@@ -29,8 +29,8 @@ API шли последовательно; `max_active_runs=1` не даёт д�
 ## Требования к развёртыванию
 
 Всем задачам прогона нужна одна и та же файловая система по пути `BASE_DIR`. `collect`
-пишет туда файл дня, а `upload_s3` и `cleanup` — отдельные экземпляры задач, которые
-этот файл читают, тогда как привязки к воркеру внутри task group Airflow не обещает.
+пишет туда файлы дня, а `upload_s3` и `cleanup` — отдельные экземпляры задач, которые
+эти файлы читают, тогда как привязки к воркеру внутри task group Airflow не обещает.
 На Celery или Kubernetes с локальными дисками воркеров выгрузка падает на отсутствующем
 файле, а собранные файлы остаются на том воркере, который их написал, — `cleanup` их не
 видит. Раскладка держится либо на однохостовом `LocalExecutor`, либо на общем томе
@@ -39,13 +39,15 @@ API шли последовательно; `max_active_runs=1` не даёт д�
 
 ## Формат результата оператора
 
-Оператор возвращает список записей `{kind, date, path, advertiser_id}`: `kind="stats"`
-для файла статистики дня и `kind="dict"` для снапшота справочника кампаний.
-`advertiser_id` берётся из записи — рекламодатель назван в коннекшене, и DAG узнаёт
-его только отсюда.
+Оператор возвращает список записей `{kind, date, path, advertiser_id, campaign_id}`:
+`kind="stats"` — файл одной кампании за день, и таких записей в дне столько, сколько
+кампаний дали строки; `kind="dict"` — снапшот справочника кампаний, у него
+`campaign_id=None`, потому что он описывает кабинет целиком. `advertiser_id` берётся
+из записи — рекламодатель назван в коннекшене, и DAG узнаёт его только отсюда.
 
-`day.params` собирает адрес выгрузки из записи `kind="stats"` своего дня. День, за
-который API не отдал ни строки, файла не пишет: `params` такого дня поднимает
+`day.upload_s3` перебирает записи `kind="stats"` своего дня и увозит каждую по её
+собственному ключу. Кампания, не отдавшая за день ни строки, файла не пишет, и грузить
+за неё нечего; день, в котором таких записей не оказалось вовсе, поднимает
 `AirflowSkipException`, и выгрузка пропускается вместе с ним.
 
 Снапшот справочника один на прогон, а пишет его каждый день, в один и тот же файл.
@@ -60,12 +62,20 @@ API шли последовательно; `max_active_runs=1` не даёт д�
 и удаляются задачей `cleanup`. DAG в пути потому, что `run_id` уникален только внутри
 своего DAG, а рекламодателей обслуживают несколько DAG'ов на общем `BASE_DIR`.
 
-В S3 ни DAG, ни прогон в ключ не входят, день перетирается:
+Локально день статистики — каталог, а файл внутри назван кампанией:
+`…/{advertiser_id}/stats/{дата}/{campaign_id}.json`.
+
+В S3 ни DAG, ни прогон в ключ не входят; перетирается день одной кампании:
 
 ```
-{S3_PREFIX}/{advertiser_id}/stats/_year=2026/_month=08/_day=20/_date=20260820/2026-08-20.json
+{S3_PREFIX}/{advertiser_id}/stats/_year=2026/_month=08/_day=20/_date=20260820/_campaign_id=1234/2026-08-20.json
 {S3_PREFIX}/{advertiser_id}/dict/campaigns/_year=2026/_month=08/_day=21/_date=20260821/2026-08-21.json
 ```
+
+`_campaign_id` стоит последним уровнем иерархии: датой отбирают диапазон, кампанией
+сужают внутри него. Гранула перезаписи равна грануле выгрузки, поэтому выгрузка части
+кампаний не может стереть данные остальных за те же дни. Справочник кампанией не
+адресуется: он снимок кабинета целиком, и переписывается целиком.
 
 ## Формат коннекшена
 
@@ -82,14 +92,16 @@ extra:    {"advertiser_id": 17004}
 ## Перезапуск отдельного дня
 
 Clear нужного map index группы `day` вместе с задачами ниже перевыкачивает день и
-перетирает его файл в S3. Дни независимы, поэтому повтор одного не трогает файлы
-остальных.
+перетирает в S3 файлы тех кампаний, которые он собрал заново. Дни независимы, поэтому
+повтор одного не трогает файлы остальных, а кампания, не давшая за этот день строк,
+остаётся в витрине с прежними цифрами.
 
 `cleanup` стоит с `trigger_rule="none_failed"`: при `all_done` он сносил бы локальные
 файлы и после окончательного отказа выгрузки, и обычный ручной clear упавшей выгрузки
 повторить её уже не смог бы — день пришлось бы выкачивать из API заново. Правило
-`none_failed`, а не `all_success`, потому что пропуск — штатный исход: день без строк
-пропускает свою выгрузку, а прогон без справочника — всю группу `dictionary`.
+`none_failed`, а не `all_success`, потому что пропуск — штатный исход: день без файлов
+статистики пропускает свою выгрузку, а прогон без справочника — всю группу
+`dictionary`.
 """
 
 import os
@@ -100,6 +112,7 @@ from datetime import date, timedelta
 from airflow.decorators import dag, task, task_group
 from airflow.exceptions import AirflowSkipException
 from airflow.models.param import Param
+from airflow.providers.amazon.aws.hooks.s3 import S3Hook
 from airflow.providers.amazon.aws.transfers.local_to_s3 import LocalFilesystemToS3Operator
 
 from airflow_provider_yandex_admetrica.hooks.yandex_admetrica import check_date
@@ -180,6 +193,16 @@ def find_record(records: Iterable[dict] | None, kind: str) -> dict | None:
     return None
 
 
+def select_records(records: Iterable[dict] | None, kind: str) -> list[dict]:
+    """Вернуть все записи вида `kind` в порядке, в котором их отдал оператор.
+
+    Статистика дня приходит записью на кампанию, и выгрузке нужны все до одной:
+    взять одну — значит молча оставить остальные кампании дня незагруженными.
+    Порядок — тот же, в котором кабинет перечисляет кампании.
+    """
+    return [record for record in records or [] if record["kind"] == kind]
+
+
 def dictionary_record(mapped_results: Iterable[list[dict]] | None) -> dict | None:
     """Вернуть снапшот справочника прогона из результатов дней.
 
@@ -197,15 +220,22 @@ def dictionary_record(mapped_results: Iterable[list[dict]] | None) -> dict | Non
 def s3_key(record: dict) -> str:
     """Вернуть ключ S3 с hive-партициями для записи.
 
-    `run_id` в ключ не входит: день перетирается, история не хранится.
+    `run_id` в ключ не входит: история не хранится, адрес перетирается.
+
+    У статистики последним уровнем иерархии идёт `_campaign_id`: датой отбирают
+    диапазон, кампанией сужают внутри него. Он же и делает адрес ровно таким,
+    какова гранула выгрузки, — перезалив части кампаний не достаёт до данных
+    остальных за те же дни. Справочник этого уровня не получает: он снимок
+    кабинета целиком, и адресуется одной только датой снимка.
     """
     day = record["date"]
     year, month, date_of_month = day.split("-")
     parts = "/".join(KEY_PARTS[record["kind"]])
+    campaign = f"/_campaign_id={record['campaign_id']}" if record["kind"] == "stats" else ""
     return (
         f"{S3_PREFIX}/{record['advertiser_id']}/{parts}"
         f"/_year={year}/_month={month}/_day={date_of_month}"
-        f"/_date={day.replace('-', '')}/{day}.json"
+        f"/_date={day.replace('-', '')}{campaign}/{day}.json"
     )
 
 
@@ -260,17 +290,29 @@ def admetrica_to_s3():
         params = context["params"]
         return build_dates(params["date_from"], params["date_to"])
 
-    @task(multiple_outputs=True)
-    def day_params(records: list[dict], **context) -> dict:
-        """Вернуть адреса выгрузки дня, собранные из его записи статистики.
+    @task
+    def day_upload(records: list[dict]) -> None:
+        """Увезти в S3 все файлы статистики дня — по файлу на кампанию.
 
-        День, за который API не отдал ни строки, файла не пишет, и грузить нечего:
-        такой день пропускается вместе с задачами ниже.
+        Цикл, а не оператор на запись: число кампаний за день известно только
+        после сбора, а маппинг внутри mapped-группы Airflow не поддерживает.
+        Выгрузки идут последовательно, и первая же неудача роняет таску, оставляя
+        clear этого map index как повтор дня целиком.
+
+        День, за который ни одна кампания не отдала строк, файлов не пишет, и
+        грузить нечего: такой день пропускается вместе с задачами ниже.
         """
-        record = find_record(records, "stats")
-        if record is None:
-            raise AirflowSkipException("за этот день файла статистики нет")
-        return load_params(record)
+        stats = select_records(records, "stats")
+        if not stats:
+            raise AirflowSkipException("за этот день файлов статистики нет")
+        hook = S3Hook(aws_conn_id=S3_CONN_ID)
+        for record in stats:
+            hook.load_file(
+                filename=record["path"],
+                key=s3_key(record),
+                bucket_name=S3_BUCKET,
+                replace=True,
+            )
 
     @task(multiple_outputs=True, trigger_rule="all_done")
     def dictionary_params(mapped_results) -> dict:
@@ -298,7 +340,7 @@ def admetrica_to_s3():
 
     @task_group(group_id="day")
     def per_day(day: str):
-        """Собрать день и увезти его файл в S3.
+        """Собрать день и увезти его файлы в S3.
 
         Всё, что делается с днём, лежит внутри группы, поэтому map index — это день
         целиком: упавший день останавливает только свою цепочку, а clear его map
@@ -315,9 +357,7 @@ def admetrica_to_s3():
             collect_dictionaries=True,
             max_active_tis_per_dag=1,
         ).output
-        params = day_params.override(task_id="params")(records)
-
-        upload_to_s3("upload_s3", params)
+        day_upload.override(task_id="upload_s3")(records)
         return records
 
     @task_group(group_id="dictionary")
