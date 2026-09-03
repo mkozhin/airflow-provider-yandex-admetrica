@@ -73,12 +73,18 @@ The operator writes JSONL files and returns a `list[dict]`, one entry per file w
 
 ```python
 [
-    {"kind": "stats", "date": "2026-08-20", "path": "/tmp/…/stats/2026-08-20.json", "advertiser_id": 17004},
-    {"kind": "dict",  "date": "2026-08-21", "path": "/tmp/…/dict/campaigns/2026-08-21.json", "advertiser_id": 17004},
+    {"kind": "stats", "date": "2026-08-20", "path": "/tmp/…/stats/2026-08-20/123456.json",
+     "advertiser_id": 17004, "campaign_id": 123456},
+    {"kind": "stats", "date": "2026-08-20", "path": "/tmp/…/stats/2026-08-20/123457.json",
+     "advertiser_id": 17004, "campaign_id": 123457},
+    {"kind": "dict",  "date": "2026-08-21", "path": "/tmp/…/dict/campaigns/2026-08-21.json",
+     "advertiser_id": 17004, "campaign_id": None},
 ]
 ```
 
-`advertiser_id` travels with every entry because the tasks downstream build the S3 key and the table name from it and have nowhere else to read it: the advertiser is named in the connection, which only the hook opens.
+**A file is a day of one campaign.** The rows of a day are split by the campaign they belong to and written a file each, so the day carries as many `kind="stats"` entries as it has campaigns with rows. The dictionary is one snapshot per run whatever the number of campaigns.
+
+`advertiser_id` travels with every entry because the tasks downstream build the S3 key and the table name from it and have nowhere else to read it: the advertiser is named in the connection, which only the hook opens. `campaign_id` names the campaign whose rows the file holds, and it is what lets an address reach one campaign of one day. The dictionary describes the cabinet whole and belongs to no single campaign, so its entry carries `None` — the key is spelled out on both kinds, so a DAG walking a mixed list and reading `record["campaign_id"]` never meets a `KeyError`.
 
 **Plan for a long task.** A day is one request per campaign, plus one page more for every full page a campaign fills, plus the walk over the campaign list. An advertiser with 70 campaigns therefore costs about 70 requests for a day of ordinary volume, each spaced by `request_delay` and bounded by a 30 s timeout. A storm of retries adds up to 7 s of backoff to any one of them when the ladder decides the wait — but a server that sends `Retry-After` names the wait itself, and each of the three rungs then costs up to 300 s, so one request can hold the task for 15 minutes. A 400 the API words as `query_error` walks a ladder of its own: 65 s of pauses plus four requests, each bounded by the same 30 s timeout, so such a request holds the task for at most 185 s. A refusal that clears on a repeat is the case to size for: it costs the rung plus one further request, some 15 s where the second attempt brings the page back, and an endpoint refusing a third of the requests of a 300-campaign day therefore adds tens of minutes to it rather than seconds. Walking the ladder to its end costs nearer 105 s at the 10 s the refusal empirically takes, and happens once in a run, because the attempt after it is the one that ends the day. Size `execution_timeout` for the number of days a run exports — the example DAG allows two hours.
 
@@ -104,7 +110,7 @@ The operator writes JSONL files and returns a `list[dict]`, one entry per file w
 
 `date`, `admetrica_conn_id`, `loki_conn_id` and `base_dir` are template fields.
 
-The request is checked before it goes out, so a report configured wrongly costs nothing. `ValueError` answers an empty `metrics`, more than 20 metrics, more than 10 dimensions and a `limit` outside 1…100 000, naming what is wrong. `date` is held to `YYYY-MM-DD` by the hook itself, so a DAG calling `get_stats` directly is answered the same way: it is the day the API is asked for, the day stamped onto every record and the day that names the file, and it arrives rendered from a template.
+The request is checked before it goes out, so a report configured wrongly costs nothing. `ValueError` answers an empty `metrics`, more than 20 metrics, more than 10 dimensions and a `limit` outside 1…100 000, naming what is wrong. `date` is held to `YYYY-MM-DD` by the hook itself, so a DAG calling `get_stats` directly is answered the same way: it is the day the API is asked for, the day stamped onto every record and the day that names the directory the files land in, and it arrives rendered from a template.
 
 #### Reserved parameters
 
@@ -188,7 +194,7 @@ The measures the answer carries beside these fields — spend, impressions, days
 
 ### BigQuery schema
 
-Both tables are declared explicitly. `autodetect` would read the nested fields off the beginning of a file and lose the ones that appear further down.
+Both schemas are declared explicitly. `autodetect` would read the nested fields off the beginning of a file and lose the ones that appear further down.
 
 Statistics, partitioned by `date`:
 
@@ -202,37 +208,58 @@ Statistics, partitioned by `date`:
 
 Campaign dictionary, partitioned by `snapshot_date`: `snapshot_date` (DATE), `campaign_id` (INTEGER), `name`, `status`, `date_start`, `date_end` (STRING), `advertiser_id` (INTEGER), `advertiser_name` (STRING).
 
-Addressing the partition with a `table$YYYYMMDD` decorator lets `WRITE_TRUNCATE` overwrite one day and leave the rest of the table alone.
+Statistics go to a table per campaign, `stats_{advertiser_id}_{campaign_id}`, and the dictionary to a single `campaigns`. The grain that has to be overwritten is two-dimensional — a day and a campaign — while BigQuery partitions by one field, so the second dimension goes into the table name. Keeping it there is what keeps the load declarative: `WRITE_TRUNCATE` into a partition decorator is idempotent by itself, where a `DELETE` followed by an `INSERT` in one shared table would open a window in which the old rows are gone and the new ones have not arrived yet.
+
+Addressing the partition with a `table$YYYYMMDD` decorator — `date` for statistics, `snapshot_date` for the dictionary — lets `WRITE_TRUNCATE` overwrite one day of one campaign and leave the rest of the table alone.
+
+The mart is read through wildcard tables: `stats_*` is every advertiser, `stats_{advertiser_id}_*` is one, and `_TABLE_SUFFIX` tells the tables apart inside a query. The price of that is worth knowing before choosing the readers: a wildcard query has no result cache, so a repeat of the same query is paid for again, it is not served by BI Engine, and the schemas of all matched tables must agree down to their types and partitioning. The schema of five columns is stable by construction — a new grouping or metric lives inside the `dimensions` and `metrics` JSON and changes nothing — so the readers this suits are the next layer of a pipeline rather than dashboards.
+
+**A view whose name falls under `stats_*` breaks such a query outright**, even one carrying a condition on `_TABLE_SUFFIX`. Keep the views of the next layer in another dataset, or name them something other than `stats_`. Table prefixes themselves do not collide: `stats_1234_5` does not fall under `stats_123_*`, because what follows `123` is a `4` and not an `_`.
 
 ## File layout
+
+**The grain of an overwrite is the grain of an export: a day of one campaign.** Every address a file reaches — the local path, the S3 key, the object in GCS, the table in BigQuery — is built from the campaign it holds, so a re-export rewrites exactly what it collected and cannot reach the data of a campaign it never asked for. Collecting part of a cabinet is safe by construction rather than by care.
 
 Locally, the run id isolates two runs exporting the same day from each other:
 
 ```
-{base_dir}/{dag_segment}/{run_segment}/{advertiser_id}/stats/{date}.json
+{base_dir}/{dag_segment}/{run_segment}/{advertiser_id}/stats/{date}/{campaign_id}.json
 {base_dir}/{dag_segment}/{run_segment}/{advertiser_id}/dict/campaigns/{snapshot_date}.json
 ```
+
+The day of statistics names a directory and the campaign names the file inside it. The dictionary gets no such level: it is a snapshot of the whole cabinet, addressed by the date of the snapshot alone.
 
 `dag_segment` and `run_segment` name the DAG and the run: the identifier with every character outside `[\w-]` — letters, digits, underscore and hyphen — replaced by an underscore, so a run id carrying a timestamp with colons and a plus sign still names a directory on every filesystem, followed by a hyphen and the first eight characters of its SHA-1. The digest is what keeps two identifiers apart after the substitution has made them look alike, as `manual:a` and `manual/a` do. The readable part is cut to what 255 bytes leave after the digest, so the segment names a directory on every filesystem: Airflow accepts a `dag_id` and a `run_id` of up to 250 characters, and a character outside ASCII takes more than one byte. The cut costs nothing, since the digest is taken from the whole identifier.
 
 It takes the DAG as well as the run because Airflow holds a run id unique inside its DAG and nothing wider. One connection names one advertiser, so several advertisers are served by several DAGs, and two of them on the same schedule are handed the same `scheduled__<logical_date>`: on a shared `base_dir` a run directory named by the run alone would be one directory they both collect into, and the example DAG's `cleanup` deletes the whole of it.
 
-The day is sanitised by the substitution alone, so nothing rendered into `date` can address a file outside `base_dir`.
+The day is sanitised by the substitution alone, so nothing rendered into `date` can address a file outside `base_dir`. The campaign takes no such treatment and needs none: it reaches the path from the campaign list, where it has already been read as a positive whole number, so the only source of that segment is trusted by construction.
 
-In S3 the run id is absent and the day is overwritten — no history is kept:
+In S3 the run id is absent and a day of one campaign is overwritten — no history is kept:
 
 ```
-{S3_PREFIX}/{advertiser_id}/stats/_year=2026/_month=08/_day=20/_date=20260820/2026-08-20.json
+{S3_PREFIX}/{advertiser_id}/stats/_year=2026/_month=08/_day=20/_date=20260820/_campaign_id=123456/2026-08-20.json
 {S3_PREFIX}/{advertiser_id}/dict/campaigns/_year=2026/_month=08/_day=21/_date=20260821/2026-08-21.json
 ```
 
+`_campaign_id` is the last level of the hierarchy, because a date is what a reader selects a range by and a campaign is what narrows it inside that range. The key is written in hive style throughout, so the campaign continues a convention the other levels already follow. The dictionary gets no such partition.
+
+A DAG loading into BigQuery stages the files in GCS on the way, under the DAG and the run — the object lives for the length of a run, and a shared bucket must not hand two runs one name:
+
+```
+{GCS_PREFIX}/{dag_segment}/{run_segment}/{advertiser_id}/stats/{date}/{campaign_id}.json
+{GCS_PREFIX}/{dag_segment}/{run_segment}/{advertiser_id}/dict/campaigns/{snapshot_date}.json
+```
+
+The campaign names the staging object as well, so two campaigns of one day do not overwrite each other on the way to BigQuery.
+
 The files are JSONL — one JSON object per line, UTF-8, written with `ensure_ascii=False` so placement and campaign names stay readable in the file itself. JSONL is the only format offered: the set of columns does not follow from the request and can differ between two rows of the same day.
 
-### A day with no rows
+### A campaign with no rows
 
-A day the API returns no rows for **writes no file** and adds nothing to the operator's result. The task stays green — a campaign with no impressions on a day is the ordinary state of most of an advertiser's campaigns.
+A campaign the API returns no rows for on a day **writes no file** and adds nothing to the operator's result; a day no campaign has rows for adds no `kind="stats"` entry at all, and the example DAGs skip the uploads of such a day. The task stays green — a campaign with no impressions on a day is the ordinary state of most of an advertiser's campaigns.
 
-The consequence is worth spelling out: **a file already in S3 for that day stays exactly as it was.** Re-exporting a day that has since become empty does not clear it. Removing such a day is a manual operation on the bucket and on the BigQuery partition.
+The consequence is worth spelling out: **whatever S3 and BigQuery already hold for that campaign and that day stays exactly as it was.** Those are the last figures known for it, so leaving them is the right reading of silence rather than a leftover. Re-exporting a day a campaign has since gone quiet on does not clear it, and clearing it is a manual operation on the bucket and on the BigQuery partition.
 
 The same holds for the dictionary: an advertiser whose campaign list comes back empty writes no dictionary file. Otherwise the dictionary is exported even on a day with no statistics — the campaign list does not depend on impressions.
 
@@ -488,7 +515,7 @@ It needs more than this provider:
 
 - `apache-airflow-providers-google` and `apache-airflow-providers-amazon`, which this package installs only under its `dev` extra — a deployment running the DAG installs them itself
 - connections `yandex_admetrica_default`, `loki_default`, `google_cloud_default` and `aws_default`
-- a filesystem shared by every worker that runs the DAG's tasks, mounted at `BASE_DIR` on each of them. `collect` writes the day's file there and the two uploads and `cleanup` are separate task instances that read it, and Airflow promises no worker affinity inside a task group: under Celery or Kubernetes with worker-local disks the uploads fail on a missing file and the collected files stay behind on the worker that wrote them. A single-machine `LocalExecutor`, or a shared volume mounted at `BASE_DIR`, is what makes the layout hold
+- a filesystem shared by every worker that runs the DAG's tasks, mounted at `BASE_DIR` on each of them. `collect` writes the day's files there and the two uploads and `cleanup` are separate task instances that read them, and Airflow promises no worker affinity inside a task group: under Celery or Kubernetes with worker-local disks the uploads fail on a missing file and the collected files stay behind on the worker that wrote them. A single-machine `LocalExecutor`, or a shared volume mounted at `BASE_DIR`, is what makes the layout hold
 - a GCS staging bucket, which the DAG's first task creates when it is missing: the BigQuery load reads from GCS, not from the worker's disk, so every file goes to the bucket first. What clears it afterwards is a one-day delete lifecycle rule the DAG adds beside the rules the bucket already carries, scoped by a `matchesPrefix` condition — the bucket may be a shared one, and the rule addresses this DAG's prefix and nothing else
 
 ## License
