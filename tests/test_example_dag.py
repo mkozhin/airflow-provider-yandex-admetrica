@@ -4,6 +4,7 @@ pure functions behind its tasks build the dates, the snapshot and the keys."""
 from __future__ import annotations
 
 import importlib
+from types import SimpleNamespace
 
 import pytest
 from airflow.exceptions import AirflowSkipException
@@ -11,8 +12,8 @@ from airflow.utils.task_group import MappedTaskGroup
 
 _MOD_NAME = "examples.admetrica_to_bq_and_s3_dag"
 
-#: Everything that happens to one day, in the order it happens.
-_DAY_TASKS = ("day.collect", "day.params", "day.upload_gcs", "day.upload_s3", "day.load_bq")
+#: Everything that happens to one day: the collection and the two directions it feeds.
+_DAY_TASKS = ("day.collect", "day.upload_s3", "day.load_bq")
 
 #: The chain the snapshot of the campaign dictionary travels, once per run.
 _DICTIONARY_TASKS = (
@@ -36,8 +37,80 @@ def dag_obj(dag_module):
     return factory.dag if hasattr(factory, "dag") else factory()
 
 
-def _record(kind="stats", date="2026-08-20", path="/tmp/f.json", advertiser_id=17004):
-    return {"kind": kind, "date": date, "path": path, "advertiser_id": advertiser_id}
+def _record(
+    kind="stats", date="2026-08-20", path="/tmp/f.json", advertiser_id=17004, campaign_id=1234
+):
+    return {
+        "kind": kind,
+        "date": date,
+        "path": path,
+        "advertiser_id": advertiser_id,
+        "campaign_id": None if kind == "dict" else campaign_id,
+    }
+
+
+def _day_of_two_campaigns(date="2026-08-20"):
+    """Return the statistics records of a day that two campaigns had rows for."""
+    return [
+        _record(date=date, path="/tmp/1234.json", campaign_id=1234),
+        _record(date=date, path="/tmp/5678.json", campaign_id=5678),
+    ]
+
+
+class _FakeS3Hook:
+    """Stand-in for the hook that records every upload it was asked for."""
+
+    calls: list[dict] = []
+    conn_ids: list[str] = []
+
+    def __init__(self, aws_conn_id=None):
+        type(self).conn_ids.append(aws_conn_id)
+
+    def load_file(self, **kwargs):
+        type(self).calls.append(kwargs)
+
+
+class _FakeGCSHook:
+    """Stand-in for the hook that records every upload it was asked for."""
+
+    calls: list[dict] = []
+    conn_ids: list[str] = []
+
+    def __init__(self, gcp_conn_id=None):
+        type(self).conn_ids.append(gcp_conn_id)
+
+    def upload(self, **kwargs):
+        type(self).calls.append(kwargs)
+
+
+class _FakeBigQueryHook:
+    """Stand-in for the hook that records every load job it was handed."""
+
+    calls: list[dict] = []
+    conn_ids: list[str] = []
+
+    def __init__(self, gcp_conn_id=None):
+        type(self).conn_ids.append(gcp_conn_id)
+
+    def insert_job(self, **kwargs):
+        type(self).calls.append(kwargs)
+
+
+@pytest.fixture
+def fake_cloud(dag_module, monkeypatch):
+    """Replace the hooks the module holds and hand back the record of their calls."""
+    s3 = type("_RecordingS3Hook", (_FakeS3Hook,), {"calls": [], "conn_ids": []})
+    gcs = type("_RecordingGCSHook", (_FakeGCSHook,), {"calls": [], "conn_ids": []})
+    bigquery = type("_RecordingBigQueryHook", (_FakeBigQueryHook,), {"calls": [], "conn_ids": []})
+    monkeypatch.setattr(dag_module, "S3Hook", s3)
+    monkeypatch.setattr(dag_module, "GCSHook", gcs)
+    monkeypatch.setattr(dag_module, "BigQueryHook", bigquery)
+    return SimpleNamespace(s3=s3, gcs=gcs, bigquery=bigquery)
+
+
+def _load_configs(fake_cloud):
+    """Return the ``load`` section of every job the day handed to BigQuery."""
+    return [call["configuration"]["load"] for call in fake_cloud.bigquery.calls]
 
 
 class TestImport:
@@ -66,26 +139,58 @@ class TestOneDayIsOneMapIndex:
         assert "day" in group._expand_input.value
 
     def test_every_task_of_a_day_belongs_to_the_mapped_group(self, dag_obj):
-        """The whole day rides one map index: collection, both uploads and the load."""
+        """The whole day rides one map index: the collection and both directions."""
         for task_id in _DAY_TASKS:
             assert dag_obj.get_task(task_id).task_group.group_id == "day"
 
-    def test_the_day_reaches_bigquery_without_waiting_for_another_day(self, dag_obj):
+    def test_the_day_reaches_both_destinations_without_waiting_for_another_day(self, dag_obj):
         """Everything a load of a day waits for is that same day: no reduction between."""
-        for task_id in ("day.params", "day.upload_gcs", "day.upload_s3", "day.load_bq"):
+        for task_id in ("day.upload_s3", "day.load_bq"):
             upstream = dag_obj.get_task(task_id).upstream_task_ids
             assert all(t.startswith("day.") for t in upstream)
 
     def test_the_chain_of_a_day_runs_in_order(self, dag_obj):
-        assert dag_obj.get_task("day.params").upstream_task_ids == {"day.collect"}
-        assert {"day.upload_gcs", "day.upload_s3"} <= dag_obj.get_task("day.params").downstream_task_ids
-        assert "day.upload_gcs" in dag_obj.get_task("day.load_bq").upstream_task_ids
+        for task_id in ("day.upload_s3", "day.load_bq"):
+            assert dag_obj.get_task(task_id).upstream_task_ids == {"day.collect"}
+            assert task_id in dag_obj.get_task("day.collect").downstream_task_ids
 
     def test_collect_runs_one_day_at_a_time(self, dag_obj):
         assert dag_obj.get_task("day.collect").max_active_tis_per_dag == 1
 
     def test_the_bucket_is_ready_before_the_first_day(self, dag_obj):
         assert "ensure_gcs_bucket" in dag_obj.get_task("day.collect").upstream_task_ids
+
+
+class TestTheTwoDirectionsAreIndependent:
+    """S3 and BigQuery are two tasks of one day, and neither waits for the other."""
+
+    def test_neither_direction_is_upstream_of_the_other(self, dag_obj):
+        """A failure of one destination must leave the other free to reach its mart."""
+        s3 = dag_obj.get_task("day.upload_s3")
+        bq = dag_obj.get_task("day.load_bq")
+        assert "day.load_bq" not in s3.upstream_task_ids | s3.downstream_task_ids
+        assert "day.upload_s3" not in bq.upstream_task_ids | bq.downstream_task_ids
+
+    def test_both_directions_hang_off_the_collection_of_the_day(self, dag_obj):
+        downstream = dag_obj.get_task("day.collect").downstream_task_ids
+        assert {"day.upload_s3", "day.load_bq"} <= downstream
+
+    def test_each_direction_reads_the_files_of_the_day_itself(self, dag_obj, fake_cloud):
+        """No shared params task between them: each takes the records of the day."""
+        records = _day_of_two_campaigns()
+        dag_obj.get_task("day.upload_s3").python_callable(records)
+        dag_obj.get_task("day.load_bq").python_callable(records, run_id="run_a")
+
+        assert len(fake_cloud.s3.calls) == 2
+        assert len(fake_cloud.gcs.calls) == 2
+
+    def test_one_direction_carries_a_day_the_other_never_touched(self, dag_obj, fake_cloud):
+        """The S3 upload of a day stands on its own: nothing of BigQuery ran before it."""
+        dag_obj.get_task("day.upload_s3").python_callable(_day_of_two_campaigns())
+
+        assert len(fake_cloud.s3.calls) == 2
+        assert fake_cloud.gcs.calls == []
+        assert fake_cloud.bigquery.calls == []
 
 
 class TestTheDictionaryOfTheRun:
@@ -100,6 +205,11 @@ class TestTheDictionaryOfTheRun:
             assert dag_obj.get_task(task_id).task_group.group_id == "dictionary"
             assert not dag_obj.get_task(task_id).get_needs_expansion()
 
+    def test_the_snapshot_travels_both_directions_of_its_group(self, dag_obj):
+        params = dag_obj.get_task("dictionary.params")
+        assert {"dictionary.upload_gcs", "dictionary.upload_s3"} <= params.downstream_task_ids
+        assert "dictionary.upload_gcs" in dag_obj.get_task("dictionary.load_bq").upstream_task_ids
+
 
 class TestTheEndOfTheRun:
     """Cleanup waits for every load and tolerates a day that had nothing to load."""
@@ -109,32 +219,203 @@ class TestTheEndOfTheRun:
 
     def test_cleanup_runs_after_every_load(self, dag_obj):
         upstream = dag_obj.get_task("cleanup").upstream_task_ids
-        assert {"day.load_bq", "day.upload_s3", "dictionary.load_bq", "dictionary.upload_s3"} <= upstream
+        assert {
+            "day.load_bq",
+            "day.upload_s3",
+            "dictionary.load_bq",
+            "dictionary.upload_s3",
+        } <= upstream
 
 
 class TestLoadOperators:
-    """The uploads replace, and both loads read the schema they are given."""
+    """The dictionary rides declarative loads: one record per run, one table each."""
 
-    def test_uploads_replace_existing_keys(self, dag_obj):
-        assert dag_obj.get_task("day.upload_s3").replace is True
+    def test_the_snapshot_replaces_the_key_it_lands_on(self, dag_obj):
         assert dag_obj.get_task("dictionary.upload_s3").replace is True
 
-    def test_bq_loads_declare_schema_and_partition(self, dag_obj, dag_module):
-        stats = dag_obj.get_task("day.load_bq")
+    def test_the_dictionary_load_declares_schema_and_partition(self, dag_obj, dag_module):
         campaigns = dag_obj.get_task("dictionary.load_bq")
-        assert stats.schema_fields == dag_module.BQ_STATS_SCHEMA
         assert campaigns.schema_fields == dag_module.BQ_DICT_SCHEMA
-        assert stats.time_partitioning == {"type": "DAY", "field": "date"}
         assert campaigns.time_partitioning == {"type": "DAY", "field": "snapshot_date"}
 
     def test_bq_loads_turn_autodetection_off(self, dag_obj):
         """The operator detects the schema by default, and a nested field is what it loses."""
-        assert dag_obj.get_task("day.load_bq").autodetect is False
         assert dag_obj.get_task("dictionary.load_bq").autodetect is False
 
-    def test_bq_loads_overwrite_one_partition(self, dag_obj):
-        for task_id in ("day.load_bq", "dictionary.load_bq"):
-            assert dag_obj.get_task(task_id).write_disposition == "WRITE_TRUNCATE"
+    def test_the_dictionary_load_overwrites_one_partition(self, dag_obj):
+        assert dag_obj.get_task("dictionary.load_bq").write_disposition == "WRITE_TRUNCATE"
+
+
+class TestTheDayUploadsEveryCampaign:
+    """A day reaches S3 whole: as many files as campaigns that had rows."""
+
+    def _upload(self, dag_obj):
+        return dag_obj.get_task("day.upload_s3").python_callable
+
+    def test_one_upload_per_statistics_record(self, dag_obj, fake_cloud):
+        """Uploading only the first record would lose every other campaign in silence."""
+        self._upload(dag_obj)([*_day_of_two_campaigns(), _record(kind="dict", path="/tmp/d.json")])
+
+        assert len(fake_cloud.s3.calls) == 2
+
+    def test_each_campaign_travels_from_its_own_file_to_its_own_key(
+        self, dag_obj, dag_module, fake_cloud
+    ):
+        records = _day_of_two_campaigns()
+        self._upload(dag_obj)(records)
+
+        calls = fake_cloud.s3.calls
+        assert [call["filename"] for call in calls] == ["/tmp/1234.json", "/tmp/5678.json"]
+        assert [call["key"] for call in calls] == [dag_module.s3_key(r) for r in records]
+
+    def test_the_keys_of_one_day_differ_by_campaign(self, dag_obj, fake_cloud):
+        self._upload(dag_obj)(_day_of_two_campaigns())
+
+        keys = [call["key"] for call in fake_cloud.s3.calls]
+        assert keys[0] != keys[1]
+        assert "_campaign_id=1234" in keys[0]
+        assert "_campaign_id=5678" in keys[1]
+
+    def test_every_file_of_a_day_replaces_the_key_it_lands_on(self, dag_obj, fake_cloud):
+        self._upload(dag_obj)(_day_of_two_campaigns())
+
+        assert [call["replace"] for call in fake_cloud.s3.calls] == [True, True]
+
+    def test_the_uploads_of_a_day_go_through_the_configured_connection(
+        self, dag_obj, dag_module, fake_cloud
+    ):
+        self._upload(dag_obj)(_day_of_two_campaigns())
+
+        assert fake_cloud.s3.conn_ids == [dag_module.S3_CONN_ID]
+        assert {call["bucket_name"] for call in fake_cloud.s3.calls} == {dag_module.S3_BUCKET}
+
+    def test_the_snapshot_of_the_dictionary_is_not_uploaded_by_the_day(self, dag_obj, fake_cloud):
+        """The dictionary is one per run and rides its own group."""
+        self._upload(dag_obj)([*_day_of_two_campaigns(), _record(kind="dict", path="/tmp/d.json")])
+
+        assert "/tmp/d.json" not in [call["filename"] for call in fake_cloud.s3.calls]
+
+    def test_a_day_without_statistics_uploads_nothing_and_skips(self, dag_obj, fake_cloud):
+        with pytest.raises(AirflowSkipException):
+            self._upload(dag_obj)([_record(kind="dict", path="/tmp/d.json")])
+
+        assert fake_cloud.s3.calls == []
+
+    def test_a_day_that_wrote_nothing_at_all_skips(self, dag_obj, fake_cloud):
+        with pytest.raises(AirflowSkipException):
+            self._upload(dag_obj)([])
+
+
+class TestTheDayLoadsEveryCampaign:
+    """A day reaches BigQuery whole: as many jobs as campaigns that had rows."""
+
+    def _load(self, dag_obj):
+        return dag_obj.get_task("day.load_bq").python_callable
+
+    def test_one_upload_and_one_job_per_statistics_record(self, dag_obj, fake_cloud):
+        """Loading only the first record would lose every other campaign in silence."""
+        records = [*_day_of_two_campaigns(), _record(kind="dict", path="/tmp/d.json")]
+        self._load(dag_obj)(records, run_id="run_a")
+
+        assert len(fake_cloud.gcs.calls) == 2
+        assert len(fake_cloud.bigquery.calls) == 2
+
+    def test_each_campaign_travels_from_its_own_file_to_its_own_object(
+        self, dag_obj, dag_module, fake_cloud
+    ):
+        records = _day_of_two_campaigns()
+        self._load(dag_obj)(records, run_id="run_a")
+
+        uploads = fake_cloud.gcs.calls
+        assert [call["filename"] for call in uploads] == ["/tmp/1234.json", "/tmp/5678.json"]
+        assert [call["object_name"] for call in uploads] == [
+            dag_module.gcs_object(record, "run_a") for record in records
+        ]
+
+    def test_the_objects_of_one_day_differ_by_campaign(self, dag_obj, fake_cloud):
+        self._load(dag_obj)(_day_of_two_campaigns(), run_id="run_a")
+
+        objects = [call["object_name"] for call in fake_cloud.gcs.calls]
+        assert objects[0] != objects[1]
+        assert objects[0].endswith("/2026-08-20/1234.json")
+        assert objects[1].endswith("/2026-08-20/5678.json")
+
+    def test_each_campaign_lands_in_its_own_table(self, dag_obj, dag_module, fake_cloud):
+        records = _day_of_two_campaigns()
+        self._load(dag_obj)(records, run_id="run_a")
+
+        tables = [config["destinationTable"]["tableId"] for config in _load_configs(fake_cloud)]
+        assert tables == [dag_module.stats_table_id(record) for record in records]
+        assert tables == ["stats_17004_1234$20260820", "stats_17004_5678$20260820"]
+
+    def test_every_job_reads_the_object_that_was_just_uploaded(
+        self, dag_obj, dag_module, fake_cloud
+    ):
+        self._load(dag_obj)(_day_of_two_campaigns(), run_id="run_a")
+
+        objects = [call["object_name"] for call in fake_cloud.gcs.calls]
+        assert [config["sourceUris"] for config in _load_configs(fake_cloud)] == [
+            [f"gs://{dag_module.GCS_BUCKET}/{name}"] for name in objects
+        ]
+
+    def test_the_job_names_the_project_and_the_dataset_beside_the_table(
+        self, dag_obj, dag_module, fake_cloud
+    ):
+        """`insert_job` takes the three apart, so the table id carries no qualification."""
+        self._load(dag_obj)([_record()], run_id="run_a")
+
+        destination = _load_configs(fake_cloud)[0]["destinationTable"]
+        assert destination == {
+            "projectId": dag_module.BQ_PROJECT,
+            "datasetId": dag_module.BQ_DATASET,
+            "tableId": "stats_17004_1234$20260820",
+        }
+
+    def test_the_job_declares_schema_partition_and_dispositions(
+        self, dag_obj, dag_module, fake_cloud
+    ):
+        self._load(dag_obj)([_record()], run_id="run_a")
+
+        config = _load_configs(fake_cloud)[0]
+        assert config["schema"] == {"fields": dag_module.BQ_STATS_SCHEMA}
+        assert config["autodetect"] is False
+        assert config["sourceFormat"] == "NEWLINE_DELIMITED_JSON"
+        assert config["writeDisposition"] == "WRITE_TRUNCATE"
+        assert config["createDisposition"] == "CREATE_IF_NEEDED"
+        assert config["timePartitioning"] == {"type": "DAY", "field": "date"}
+
+    def test_the_job_is_left_to_name_itself(self, dag_obj, fake_cloud):
+        """An id of its own makes a retry a 409; the mixed-in microseconds do not."""
+        self._load(dag_obj)([_record()], run_id="run_a")
+
+        assert "job_id" not in fake_cloud.bigquery.calls[0]
+
+    def test_the_loads_of_a_day_go_through_the_configured_connection(
+        self, dag_obj, dag_module, fake_cloud
+    ):
+        self._load(dag_obj)(_day_of_two_campaigns(), run_id="run_a")
+
+        assert fake_cloud.gcs.conn_ids == [dag_module.GCP_CONN_ID]
+        assert fake_cloud.bigquery.conn_ids == [dag_module.GCP_CONN_ID]
+        assert {call["bucket_name"] for call in fake_cloud.gcs.calls} == {dag_module.GCS_BUCKET}
+
+    def test_the_snapshot_of_the_dictionary_is_not_loaded_by_the_day(self, dag_obj, fake_cloud):
+        """The dictionary is one per run and rides its own group."""
+        records = [*_day_of_two_campaigns(), _record(kind="dict", path="/tmp/d.json")]
+        self._load(dag_obj)(records, run_id="run_a")
+
+        assert "/tmp/d.json" not in [call["filename"] for call in fake_cloud.gcs.calls]
+
+    def test_a_day_without_statistics_loads_nothing_and_skips(self, dag_obj, fake_cloud):
+        with pytest.raises(AirflowSkipException):
+            self._load(dag_obj)([_record(kind="dict", path="/tmp/d.json")], run_id="run_a")
+
+        assert fake_cloud.gcs.calls == []
+        assert fake_cloud.bigquery.calls == []
+
+    def test_a_day_that_wrote_nothing_at_all_skips(self, dag_obj, fake_cloud):
+        with pytest.raises(AirflowSkipException):
+            self._load(dag_obj)([], run_id="run_a")
 
 
 class TestSchemas:
@@ -220,6 +501,20 @@ class TestFindingRecords:
         assert dag_module.find_record([], "stats") is None
         assert dag_module.find_record(None, "stats") is None
 
+    def test_every_statistics_record_of_a_day_is_selected(self, dag_module):
+        records = [*_day_of_two_campaigns(), _record(kind="dict", path="/tmp/d.json")]
+        assert dag_module.select_records(records, "stats") == _day_of_two_campaigns()
+
+    def test_the_selection_keeps_the_order_the_operator_returned(self, dag_module):
+        records = _day_of_two_campaigns()
+        selected = dag_module.select_records(list(reversed(records)), "stats")
+        assert [r["campaign_id"] for r in selected] == [5678, 1234]
+
+    def test_a_day_with_no_record_of_that_kind_selects_nothing(self, dag_module):
+        assert dag_module.select_records([_record()], "dict") == []
+        assert dag_module.select_records([], "stats") == []
+        assert dag_module.select_records(None, "stats") == []
+
     def test_the_snapshot_of_the_run_comes_from_the_first_day_that_has_it(self, dag_module):
         snapshot = _record(kind="dict", date="2026-08-21", path="/tmp/dict.json")
         mapped = [
@@ -243,11 +538,25 @@ class TestKeys:
     """Keys are built from the record, so the advertiser of the connection owns them."""
 
     def test_stats_key(self, dag_module):
-        key = dag_module.s3_key(_record(kind="stats", date="2026-08-20"))
+        key = dag_module.s3_key(_record(kind="stats", date="2026-08-20", campaign_id=1234))
         assert key == (
             f"{dag_module.S3_PREFIX}/17004/stats"
-            "/_year=2026/_month=08/_day=20/_date=20260820/2026-08-20.json"
+            "/_year=2026/_month=08/_day=20/_date=20260820/_campaign_id=1234/2026-08-20.json"
         )
+
+    def test_the_campaign_is_the_last_partition_of_a_stats_key(self, dag_module):
+        """A range is picked by date and narrowed by campaign, so the date comes first."""
+        key = dag_module.s3_key(_record(campaign_id=5678))
+        partitions = [part for part in key.split("/") if part.startswith("_")]
+        assert partitions[-1] == "_campaign_id=5678"
+
+    def test_two_campaigns_of_one_day_land_on_different_keys(self, dag_module):
+        keys = {dag_module.s3_key(record) for record in _day_of_two_campaigns()}
+        assert len(keys) == 2
+
+    def test_the_dictionary_key_carries_no_campaign(self, dag_module):
+        """The snapshot describes the whole cabinet, so no campaign addresses it."""
+        assert "_campaign_id" not in dag_module.s3_key(_record(kind="dict", date="2026-08-21"))
 
     def test_dictionary_key(self, dag_module):
         key = dag_module.s3_key(_record(kind="dict", date="2026-08-21"))
@@ -268,8 +577,17 @@ class TestKeys:
         assert obj == (
             f"{dag_module.GCS_PREFIX}/admetrica_to_bq_and_s3-415827a2"
             "/manual__2026-08-21T00_00_00_00_00-f3d888b4"
-            "/17004/stats/2026-08-20.json"
+            "/17004/stats/2026-08-20/1234.json"
         )
+
+    def test_two_campaigns_of_one_day_land_on_different_objects(self, dag_module):
+        """One object per day would let the second campaign overwrite the first."""
+        objects = {dag_module.gcs_object(record, "run_a") for record in _day_of_two_campaigns()}
+        assert len(objects) == 2
+
+    def test_the_dictionary_object_carries_no_campaign(self, dag_module):
+        obj = dag_module.gcs_object(_record(kind="dict", date="2026-08-21"), "run_a")
+        assert obj.endswith("/17004/dict/campaigns/2026-08-21.json")
 
     def test_two_dags_sharing_the_bucket_do_not_share_a_gcs_object(
         self, dag_module, monkeypatch
@@ -281,22 +599,41 @@ class TestKeys:
         monkeypatch.setattr(dag_module, "DAG_ID", "admetrica_other_advertiser")
         assert dag_module.gcs_object(_record(), run_id) != mine
 
-    def test_partition_decorator_addresses_the_day(self, dag_module):
-        table = dag_module.bq_table(_record(date="2026-08-20"), "stats")
-        assert table.endswith(".stats$20260820")
-
     def test_dictionary_partition_uses_the_snapshot_day(self, dag_module):
         table = dag_module.bq_table(_record(kind="dict", date="2026-08-21"), "campaigns")
         assert table.endswith(".campaigns$20260821")
 
+    def test_the_dictionary_table_is_qualified_by_project_and_dataset(self, dag_module):
+        table = dag_module.bq_table(_record(kind="dict", date="2026-08-21"), "campaigns")
+        assert table == f"{dag_module.BQ_PROJECT}.{dag_module.BQ_DATASET}.campaigns$20260821"
+
+    def test_the_statistics_table_names_the_advertiser_and_the_campaign(self, dag_module):
+        table = dag_module.stats_table_id(_record(date="2026-08-20", campaign_id=5678))
+        assert table == f"{dag_module.BQ_STATS_TABLE}_17004_5678$20260820"
+
+    def test_the_statistics_table_is_a_bare_identifier(self, dag_module):
+        """`insert_job` names the project and the dataset in fields of its own."""
+        table = dag_module.stats_table_id(_record())
+        assert dag_module.BQ_PROJECT not in table
+        assert not table.startswith(f"{dag_module.BQ_DATASET}.")
+
+    def test_two_campaigns_of_one_day_land_in_different_tables(self, dag_module):
+        tables = {dag_module.stats_table_id(record) for record in _day_of_two_campaigns()}
+        assert len(tables) == 2
+
+    def test_a_prefix_of_another_advertiser_is_not_matched_by_a_wildcard(self, dag_module):
+        """`stats_123_*` must not reach the tables of advertiser 1234."""
+        near = dag_module.stats_table_id(_record(advertiser_id=1234, campaign_id=5))
+        assert not near.startswith("stats_123_")
+
     def test_one_record_gives_every_address_of_its_load(self, dag_module):
-        record = _record(date="2026-08-20", path="/tmp/20.json")
-        params = dag_module.load_params(record, "run_a", "stats")
+        record = _record(kind="dict", date="2026-08-21", path="/tmp/d.json")
+        params = dag_module.load_params(record, "run_a", "campaigns")
         assert params == {
-            "src": "/tmp/20.json",
+            "src": "/tmp/d.json",
             "gcs_object": dag_module.gcs_object(record, "run_a"),
             "s3_key": dag_module.s3_key(record),
-            "bq_table": dag_module.bq_table(record, "stats"),
+            "bq_table": dag_module.bq_table(record, "campaigns"),
         }
 
 
@@ -347,18 +684,6 @@ class TestTaskCallables:
         get_dates = dag_obj.get_task("get_dates").python_callable
         dates = get_dates(params={"date_from": "2026-08-19", "date_to": "2026-08-21"})
         assert dates == ["2026-08-21", "2026-08-20", "2026-08-19"]
-
-    def test_the_day_loads_its_own_file_into_its_own_partition(self, dag_obj, dag_module):
-        day_params = dag_obj.get_task("day.params").python_callable
-        record = _record(date="2026-08-20", path="/tmp/20.json")
-        params = day_params([record, _record(kind="dict", path="/tmp/d.json")], run_id="run_a")
-        assert params == dag_module.load_params(record, "run_a", dag_module.BQ_STATS_TABLE)
-
-    def test_a_day_without_rows_skips_its_loads(self, dag_obj):
-        """No file was written, so there is nothing for the uploads to carry."""
-        day_params = dag_obj.get_task("day.params").python_callable
-        with pytest.raises(AirflowSkipException):
-            day_params([_record(kind="dict", path="/tmp/d.json")], run_id="run_a")
 
     def test_the_snapshot_is_loaded_into_the_dictionary_table(self, dag_obj, dag_module):
         dictionary_params = dag_obj.get_task("dictionary.params").python_callable
@@ -455,8 +780,9 @@ class TestCleanup:
 
     def _run_dir(self, dag_module, tmp_path, run_id: str):
         run_dir = tmp_path / dag_module.id_segment(dag_module.DAG_ID) / dag_module.id_segment(run_id)
-        (run_dir / "17004" / "stats").mkdir(parents=True)
-        (run_dir / "17004" / "stats" / "2026-08-20.json").write_text("{}", encoding="utf-8")
+        day = run_dir / "17004" / "stats" / "2026-08-20"
+        day.mkdir(parents=True)
+        (day / "1234.json").write_text("{}", encoding="utf-8")
         return run_dir
 
     def test_deletes_this_run_and_leaves_a_sibling_run_alone(
@@ -470,7 +796,7 @@ class TestCleanup:
         cleanup(run_id="manual__2026-08-21T00:00:00+00:00")
 
         assert not mine.exists()
-        assert (other / "17004" / "stats" / "2026-08-20.json").is_file()
+        assert (other / "17004" / "stats" / "2026-08-20" / "1234.json").is_file()
 
     def test_a_run_that_wrote_nothing_is_no_failure(self, dag_obj, dag_module, tmp_path, monkeypatch):
         monkeypatch.setattr(dag_module, "BASE_DIR", str(tmp_path))
