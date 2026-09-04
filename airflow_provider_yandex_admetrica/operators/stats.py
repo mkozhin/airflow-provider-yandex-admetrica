@@ -604,22 +604,22 @@ class YandexAdmetricaStatsOperator(BaseOperator):
 
         A walk that quietly grew shorter is the risk this selection carries, so
         every run says how many campaigns were skipped and which statuses those
-        campaigns carried.  The vocabulary of the ``status`` field is documented
-        nowhere: a cabinet wording a running campaign as something other than
-        "active" would be collected short under the default, and the statuses
-        named here are what shows it — on the ordinary run, where most of the
-        cabinet is archived history, as much as on the cabinet that matches
-        nothing at all.
+        campaigns carried.  The management API words that field ``"active"`` or
+        ``"archived"``, and the statuses named here are what shows an answer
+        departing from those two: a cabinet wording a running campaign
+        otherwise would be collected short under the default.  They are named on
+        the ordinary run, where most of the cabinet is archived history, as much
+        as on the cabinet that matches nothing at all.
 
         An empty selection made by the scope alone is never a failure — an
         advertiser whose campaigns have all been archived is an ordinary
-        advertiser — but it is always a warning, and the warning reads the two
-        cases apart itself: a cabinet with an unfamiliar word for "running" is
-        the likelier of them, and it is the one that costs a day of data, so the
-        line names it, quotes the statuses it did meet and says what collects the
-        day anyway.  An advertiser with no campaigns at all is a case of its own:
-        nothing was narrowed and no status was read, so the line says the list
-        itself was empty.
+        advertiser — but it is always a warning, and the warning holds both
+        readings up: the ordinary one, and an answer wording a running campaign
+        outside the two documented values, which is the one that costs a day of
+        data.  It quotes the statuses it did meet, which tell the two apart, and
+        says what collects the day anyway.  An advertiser with no campaigns at
+        all is a case of its own: nothing was narrowed and no status was read,
+        so the line says the list itself was empty.
         """
         if not campaigns:
             self.log.warning(
@@ -647,12 +647,12 @@ class YandexAdmetricaStatsOperator(BaseOperator):
         if not selected:
             self.log.warning(
                 "No campaign of the %s listed matches campaign_scope=%s "
-                "(statuses seen: %s); no statistics requested. The likelier "
-                "reading of this line is that the cabinet words a running "
-                'campaign as something other than "%s" rather than that every '
-                "campaign of the advertiser is over: compare the statuses named "
-                "here with what the interface shows, and collect the day with "
-                "campaign_scope=%s or by naming the campaigns in campaign_ids.",
+                "(statuses seen: %s); no statistics requested. Either every "
+                "campaign of the advertiser is over, or the answer words a "
+                'running campaign as something other than "%s": compare the '
+                "statuses named here with what the interface shows, and collect "
+                "the day with campaign_scope=%s or by naming the campaigns in "
+                "campaign_ids.",
                 len(campaigns),
                 selection.scope,
                 statuses,

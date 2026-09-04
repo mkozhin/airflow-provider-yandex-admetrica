@@ -34,8 +34,10 @@ SCOPE_ACTIVE = "active"
 SCOPE_ALL = "all"
 
 #: The value of a campaign's ``status`` field that :data:`SCOPE_ACTIVE` keeps.
-#: The API documents no vocabulary for this field, so the comparison is written
-#: down once, here, and made forgiving about case and surrounding space.
+#: The management API documents two words for that field, ``"active"`` and
+#: ``"archived"``, so this one keeps the campaigns that are still running.  The
+#: comparison is written down once, here, and made forgiving about case and
+#: surrounding space, which is what an answer wording it otherwise would need.
 ACTIVE_STATUS = "active"
 
 #: The scopes :meth:`CampaignSelection.parse` accepts, in the spelling a
@@ -503,12 +505,12 @@ def _has_selected_id(campaign: dict, ids: frozenset[int]) -> bool:
 def _is_active(campaign: dict) -> bool:
     """Whether the cabinet calls this campaign active.
 
-    The comparison drops surrounding space and case because the vocabulary of
-    the ``status`` field is documented nowhere: ``"Active"`` and ``"active "``
-    say the same thing about a campaign, and a scope that read one and not the
-    other would silently collect an empty day.  A status that is not text says
-    nothing about the campaign, and a campaign nothing is known about is not
-    walked under a scope that asks for the running ones.
+    The management API words this field ``"active"`` or ``"archived"``, and the
+    comparison drops surrounding space and case on top of that: ``"Active"`` and
+    ``"active "`` say the same thing about a campaign, and a scope that read one
+    and not the other would silently collect an empty day.  A status that is not
+    text says nothing about the campaign, and a campaign nothing is known about
+    is not walked under a scope that asks for the running ones.
     """
     status = campaign.get("status")
     return type(status) is str and status.strip().lower() == ACTIVE_STATUS
