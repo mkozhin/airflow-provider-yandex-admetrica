@@ -1417,3 +1417,106 @@ class TestANativeDagRendersTheSelectionAsText:
         op.render_template_fields({"params": {}, "ds": DATE})
 
         assert op.date == DATE
+
+
+class TestAMappedTaskRendersTheSelectionAsText:
+    """The environment a mapped task renders in is built by its DAG.
+
+    ``MappedOperator.render_template_fields`` builds the environment itself and
+    hands it down to the expanded task, so a DAG declared with
+    ``render_template_as_native_obj=True`` hands down a native one.  These say
+    the fields of this operator render as text through that door as well.
+    """
+
+    @staticmethod
+    def _rendered(tmp_path, params, **fields):
+        with DAG(
+            "native",
+            schedule=None,
+            start_date=RUN_START,
+            render_template_as_native_obj=True,
+        ) as dag:
+            op = _operator(base_dir=str(tmp_path), **fields)
+        op.render_template_fields({"params": params}, jinja_env=dag.get_template_env())
+        return op
+
+    @pytest.mark.parametrize(
+        ("value", "expected"),
+        [
+            ([123, 534], "[123, 534]"),
+            (("Лето",), "('Лето',)"),
+            (123, "123"),
+            (12.5, "12.5"),
+            (None, "None"),
+        ],
+    )
+    def test_a_param_renders_as_the_characters_it_is_written_in(
+        self, tmp_path, value, expected
+    ):
+        # A native template yields the object the expression evaluated to, of
+        # whatever type; the characters are what a selection is read out of.
+        op = self._rendered(tmp_path, {"ids": value}, campaign_ids="{{ params.ids }}")
+
+        assert op.campaign_ids == expected
+
+    def test_a_list_param_names_the_campaigns_it_holds(self, tmp_path):
+        op = self._rendered(
+            tmp_path, {"ids": [123, 534]}, campaign_ids="{{ params.ids }}"
+        )
+
+        with _Run([_row()]) as run:
+            op.execute(_context())
+        assert _selection(run).ids == frozenset({123, 534})
+
+    @pytest.mark.parametrize("typed", ["1_2", "+999", "0x0c"])
+    def test_an_id_that_reads_as_a_literal_is_still_refused(self, tmp_path, typed):
+        op = self._rendered(tmp_path, {"ids": typed}, campaign_ids="{{ params.ids }}")
+
+        assert op.campaign_ids == typed
+        with _Run([_row()]) as run:
+            with pytest.raises(ValueError, match="campaign_ids"):
+                op.execute(_context())
+        run.get_campaigns.assert_not_called()
+
+    @pytest.mark.parametrize("typed", ["None", "123", "False"])
+    def test_a_name_that_reads_as_a_literal_stays_a_name(self, tmp_path, typed):
+        op = self._rendered(
+            tmp_path, {"names": typed}, campaign_names="{{ params.names }}"
+        )
+
+        assert op.campaign_names == typed
+        with _Run([_row()]) as run:
+            op.execute(_context())
+        assert _selection(run).names == frozenset({typed})
+
+    def test_the_day_is_rendered_as_the_day_it_names(self, tmp_path):
+        with DAG(
+            "native",
+            schedule=None,
+            start_date=RUN_START,
+            render_template_as_native_obj=True,
+        ) as dag:
+            op = _operator(base_dir=str(tmp_path), date="{{ ds }}")
+        op.render_template_fields(
+            {"params": {}, "ds": DATE}, jinja_env=dag.get_template_env()
+        )
+
+        assert op.date == DATE
+
+    def test_an_environment_that_renders_text_is_used_as_it_came(self, tmp_path):
+        # A sandboxed environment already renders text, and rendering in the one
+        # handed down is what keeps the macros of a DAG reachable from a field.
+        with DAG(
+            "macros",
+            schedule=None,
+            start_date=RUN_START,
+            user_defined_macros={"season": lambda: "Лето"},
+        ) as dag:
+            pass
+        op = _operator(base_dir=str(tmp_path))
+
+        rendered = op.render_template(
+            "{{ season() }}", {}, dag.get_template_env(force_sandboxed=True)
+        )
+
+        assert rendered == "Лето"

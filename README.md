@@ -116,7 +116,7 @@ The operator writes JSONL files and returns a `list[dict]`, one entry per file w
 | `on_missing_campaign` | `"warn"` | What a named campaign the cabinet does not list is answered with: `"warn"` names it in the log and collects the rest, `"fail"` refuses the task with `ValueError` |
 | `loki_conn_id` | `None` | Connection for [request diagnostics](#request-diagnostics-in-loki-loki_conn_id). Without it nothing is constructed and nothing is sent |
 
-`date`, `admetrica_conn_id`, `loki_conn_id`, `base_dir`, `campaign_scope`, `campaign_ids`, `campaign_names` and `on_missing_campaign` are template fields. They render as text, including in a DAG declared with `render_template_as_native_obj=True`: that setting finishes a render by reading the rendered characters as a Python literal, which turns `1_2` typed into `campaign_ids` into the number twelve and `None` typed into `campaign_names` into no name at all, and the operator renders its own fields as the characters that were typed instead.
+`date`, `admetrica_conn_id`, `loki_conn_id`, `base_dir`, `campaign_scope`, `campaign_ids`, `campaign_names` and `on_missing_campaign` are template fields. They render as text, including in a DAG declared with `render_template_as_native_obj=True`: that setting finishes a render by reading the rendered characters as a Python literal, which turns `1_2` typed into `campaign_ids` into the number twelve and `None` typed into `campaign_names` into no name at all, and the operator renders its own fields as the characters that were typed instead. That holds however the task is written, `partial(...).expand(...)` included: a mapped task is handed an environment built by its DAG, and the operator answers a native one with a sandboxed environment of its own.
 
 The request is checked before it goes out, so a report configured wrongly costs nothing. `ValueError` answers an empty `metrics`, more than 20 metrics, more than 10 dimensions and a `limit` outside 1…100 000, naming what is wrong. `date` is held to `YYYY-MM-DD` by the hook itself, so a DAG calling `get_stats` directly is answered the same way: it is the day the API is asked for, the day stamped onto every record and the day that names the directory the files land in, and it arrives rendered from a template.
 
@@ -126,7 +126,7 @@ The request is checked before it goes out, so a report configured wrongly costs 
 
 All three are template fields, so the value reaches them from `params` of a manual run. A collection is taken as it is — a list, a tuple, a set, a `range` of ids — and a string is read like this:
 
-- empty, or blank once trimmed — nothing was named, and `campaign_scope` decides. This is what a `{{ params.campaign_ids }}` left blank in the run form renders to;
+- empty, or blank once trimmed — nothing was named, and `campaign_scope` decides. This is what a `{{ params.campaign_ids }}` left blank in the run form renders to, and so is an empty container written out — `[]`, `()` — which is what a `Param(type="array")` left empty renders to;
 - opening `[`, `{` or `(` — a container written out: `[123, 534]`, `['Summer campaign']`, `{123, 534}` and `('Summer campaign',)` alike, which is the shape Jinja renders a `Param(type="array")` and a tuple in, as well as the JSON one with double quotes. A mapping is refused: it names no campaign;
 - anything else — comma-separated, surrounding space dropped: `"123, 534"`, `"Summer campaign, Winter campaign"`.
 

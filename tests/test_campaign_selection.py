@@ -164,6 +164,15 @@ class TestParseIds:
         (parsed,) = CampaignSelection.parse(ids=given).ids
         assert str(parsed) == str(given).strip()
 
+    @pytest.mark.parametrize("given", ["[]", "()", "[ ]", "(  )"])
+    def test_a_container_written_out_empty_names_no_id(self, given):
+        # An array parameter left empty renders this way, and it names nothing:
+        # the selection stays the scope's rather than becoming an explicit one
+        # matching no campaign.
+        selection = CampaignSelection.parse(ids=given)
+        assert selection.ids == frozenset()
+        assert selection.is_explicit is False
+
 
 class TestParseNames:
     """Every spelling a name list reaches the operator in."""
@@ -242,6 +251,31 @@ class TestParseNames:
         # brackets, so a name opens and closes on one as a matter of course —
         # and the comma-separated line is the form a run form is typed in.
         assert CampaignSelection.parse(names=given).names == frozenset(expected)
+
+    @pytest.mark.parametrize("given", ["[]", "()", "[ ]", "(  )"])
+    def test_a_container_written_out_empty_names_nothing(self, given):
+        # An array parameter left empty renders this way.  An empty container
+        # names no campaign, so the scope stays in charge; read as free text it
+        # would be the campaign named ``[]``, an explicit selection overriding
+        # the scope and matching nothing.
+        selection = CampaignSelection.parse(names=given)
+        assert selection.names == frozenset()
+        assert selection.is_explicit is False
+
+    def test_an_empty_container_reads_alike_written_out_and_handed_over(self):
+        assert CampaignSelection.parse(names="[]") == CampaignSelection.parse(names=[])
+
+    @pytest.mark.parametrize("given", ["[] Осень", "[]Осень", "[ ] Зима"])
+    def test_a_name_carrying_an_empty_bracket_is_still_a_name(self, given):
+        # Space is all that may stand between the two brackets, so a line that
+        # carries a character of its own is the name it spells out.
+        assert CampaignSelection.parse(names=given).names == frozenset({given})
+
+    def test_a_mapping_written_out_empty_is_refused(self):
+        # ``{}`` reads as a mapping, which names no campaign in a parameter
+        # asking for a list of them.
+        with pytest.raises(ValueError, match="campaign_names"):
+            CampaignSelection.parse(names="{}")
 
     def test_a_name_holding_a_comma_is_written_as_a_list(self):
         assert CampaignSelection.parse(names="['Лето, осень']").names == frozenset(

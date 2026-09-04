@@ -13,6 +13,7 @@ from typing import TYPE_CHECKING, TypedDict
 
 from airflow.models import BaseOperator
 from airflow.utils.helpers import render_template_to_string
+from jinja2.nativetypes import NativeEnvironment
 
 from airflow_provider_yandex_admetrica.campaign_selection import (
     ACTIVE_STATUS,
@@ -343,9 +344,10 @@ class YandexAdmetricaStatsOperator(BaseOperator):
         expression evaluated to rather than the characters they are written as:
         a list parameter yields the list itself.  Asking the DAG for a sandboxed
         environment gives back templates that yield characters, whatever the DAG
-        says, which is what :meth:`_render` joins into the rendered value.  The
-        two together are one decision — the fields of this operator render as
-        text — and the environment is the half that makes the text exist.
+        says, which is what :meth:`_render` joins into the rendered value.  This
+        method, :meth:`render_template` and :meth:`_render` are one decision —
+        the fields of this operator render as text — and the environment built
+        here is what makes the text exist.
 
         With no DAG around the base class already builds a sandboxed
         environment, so an operator rendered on its own is answered by
@@ -356,6 +358,28 @@ class YandexAdmetricaStatsOperator(BaseOperator):
         if dag is not None:
             return dag.get_template_env(force_sandboxed=True)
         return super().get_template_env(dag=dag)
+
+    def render_template(self, content, context, jinja_env=None, seen_oids=None):
+        """Render *content* of this operator in a sandboxed environment.
+
+        The environment a field renders in is settled here rather than taken
+        from the caller.  A task written as ``partial(...).expand(...)`` is
+        rendered by :class:`~airflow.models.mappedoperator.MappedOperator`,
+        which builds the environment itself and hands it down: in a DAG
+        declared with ``render_template_as_native_obj=True`` that is a native
+        one, and a native template yields the Python object an expression
+        evaluated to rather than the characters it is written as.  A native
+        environment is answered with the one :meth:`get_template_env` builds,
+        so the fields of this operator render as text however the task is
+        written, and :meth:`_render` is handed the text it joins.
+
+        A sandboxed environment already renders text and is passed along as it
+        came, which is also what keeps the recursion through a collection on
+        the environment it started with.
+        """
+        if jinja_env is None or isinstance(jinja_env, NativeEnvironment):
+            jinja_env = self.get_template_env()
+        return super().render_template(content, context, jinja_env, seen_oids)
 
     def _render(self, template, context, dag=None):
         """Render one of this operator's templates as text, never as an object.

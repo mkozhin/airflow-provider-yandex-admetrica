@@ -72,6 +72,11 @@ _ID_TEXT_RE = re.compile(r"0|[1-9][0-9]*")
 #: container here.
 _CONTAINER_OPENERS = ("[", "{", "(")
 
+#: A container written out holding nothing, once the space inside it is dropped.
+#: An array parameter left empty renders as one, and it is the one bracketed
+#: text that carries no character of its own for a campaign to be named by.
+_EMPTY_CONTAINERS = ("[]", "{}", "()")
+
 #: What to write instead, told in the vocabulary of ``campaign_ids``.  An id is
 #: digits, and the two spellings that reach this module are the container and
 #: the comma-separated line; the leading zero is named because Python reads no
@@ -221,10 +226,22 @@ def _meant_as_a_container(text: str) -> bool:
     ``"[Промо] Осень]"`` — and a comma-separated line of such names, the line an
     operator types into a run form, is read as the names it spells out.
 
+    A container is also a bracket closing on nothing but space — ``"[]"``,
+    ``"()"``, ``"[ ]"``.  An array parameter left empty renders that way, and
+    an empty container names no campaign, which leaves the scope in charge:
+    the same selection an empty list handed straight to the parameter makes.
+    Read as free text it would be the campaign named ``[]``, an explicit
+    selection overriding the scope and matching nothing — under
+    ``on_missing_campaign="warn"`` a green task and an empty day.  Space is all
+    that may stand between the two brackets: ``"[] Осень"`` carries a character
+    of its own and is the name it spells.
+
     A campaign id is digits and has no bracketed spelling of its own, so
     ``campaign_ids`` never asks this: a bracket there opens a container however
     it is written, and text that does not parse as one is refused by name.
     """
+    if "".join(text.split()) in _EMPTY_CONTAINERS:
+        return True
     return text[1:].lstrip().startswith(("'", '"'))
 
 
