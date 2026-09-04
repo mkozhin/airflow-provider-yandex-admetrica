@@ -844,3 +844,28 @@ class TestCleanup:
         monkeypatch.setattr(dag_module, "BASE_DIR", str(tmp_path))
         cleanup = dag_obj.get_task("cleanup").python_callable
         cleanup(run_id="manual__2026-08-21T00:00:00+00:00")
+
+
+class TestTheCampaignsOfARun:
+    """The selection is a run parameter, and both halves of it reach the operator."""
+
+    def test_the_scope_is_offered_as_a_choice_of_two(self, dag_obj):
+        """A run form picks the scope from a list, so a typo never reaches the operator."""
+        assert dag_obj.params.get_param("campaign_scope").schema["enum"] == ["active", "all"]
+
+    def test_the_example_walks_the_whole_cabinet_by_default(self, dag_obj):
+        """A run of this example is a backfill of a month, and a campaign archived
+        inside that month has real rows for its days."""
+        assert dag_obj.params["campaign_scope"] == "all"
+
+    def test_naming_no_campaign_leaves_the_scope_deciding(self, dag_obj):
+        assert dag_obj.params["campaign_ids"] == ""
+
+    def test_both_reach_the_operator_as_templates(self, dag_obj):
+        collect = dag_obj.get_task("day.collect")
+        assert collect.campaign_scope == "{{ params.campaign_scope }}"
+        assert collect.campaign_ids == "{{ params.campaign_ids }}"
+
+    def test_the_templates_are_fields_the_operator_renders(self, dag_obj):
+        collect = dag_obj.get_task("day.collect")
+        assert {"campaign_scope", "campaign_ids"} <= set(collect.template_fields)
