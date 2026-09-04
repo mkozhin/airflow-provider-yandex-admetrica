@@ -106,9 +106,13 @@ The operator writes JSONL files and returns a `list[dict]`, one entry per file w
 | `extra_params` | `None` | Extra query parameters, and the place a parameterised name's value goes: `{"goal_id": 12345}`, `{"currency": "RUB"}`. Adds names the request does not already carry and overrides none — see [Reserved parameters](#reserved-parameters) |
 | `base_dir` | `"/tmp/yandex_admetrica"` | Root of the local layout |
 | `collect_dictionaries` | `True` | Also export the campaign dictionary |
+| `campaign_scope` | `"active"` | Which campaigns the day is walked over: `"active"` keeps the ones the cabinet calls active, `"all"` walks the whole list and does not read the status at all. A string rather than a flag, because a rendered `{{ params.x }}` is the string `"False"` and every non-empty string is true |
+| `campaign_ids` | `None` | Campaigns asked for by id, as a list or as one string: `[123, 534]`, `"123, 534"`. Empty means none were named. Overrides `campaign_scope` outright, so an archived campaign is re-collected by naming it |
+| `campaign_names` | `None` | Campaigns asked for by name, as a list or as one comma-separated string. Joined with `campaign_ids` by OR, and overriding `campaign_scope` the same way. Names are compared whole, case included, surrounding space dropped |
+| `on_missing_campaign` | `"warn"` | What a named campaign the cabinet does not list is answered with: `"warn"` names it in the log and collects the rest, `"fail"` refuses the task with `ValueError` |
 | `loki_conn_id` | `None` | Connection for [request diagnostics](#request-diagnostics-in-loki-loki_conn_id). Without it nothing is constructed and nothing is sent |
 
-`date`, `admetrica_conn_id`, `loki_conn_id` and `base_dir` are template fields.
+`date`, `admetrica_conn_id`, `loki_conn_id`, `base_dir`, `campaign_scope`, `campaign_ids`, `campaign_names` and `on_missing_campaign` are template fields. They render as text, including in a DAG declared with `render_template_as_native_obj=True`: that setting finishes a render by reading the rendered characters as a Python literal, which turns `1_2` typed into `campaign_ids` into the number twelve and `None` typed into `campaign_names` into no name at all, and the operator renders its own fields as the characters that were typed instead.
 
 The request is checked before it goes out, so a report configured wrongly costs nothing. `ValueError` answers an empty `metrics`, more than 20 metrics, more than 10 dimensions and a `limit` outside 1…100 000, naming what is wrong. `date` is held to `YYYY-MM-DD` by the hook itself, so a DAG calling `get_stats` directly is answered the same way: it is the day the API is asked for, the day stamped onto every record and the day that names the directory the files land in, and it arrives rendered from a template.
 

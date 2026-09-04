@@ -12,6 +12,10 @@ import pytest
 from airflow.exceptions import AirflowException
 from airflow.models import DAG, Connection
 
+from airflow_provider_yandex_admetrica.campaign_selection import (
+    SCOPE_ACTIVE,
+    CampaignSelection,
+)
 from airflow_provider_yandex_admetrica.hooks.yandex_admetrica import (
     _CAMPAIGN_FIELDS,
     DEFAULT_LIMIT,
@@ -21,6 +25,7 @@ from airflow_provider_yandex_admetrica.hooks.yandex_admetrica import (
 )
 from airflow_provider_yandex_admetrica.operators.stats import (
     DICT_CAMPAIGNS_PARTS,
+    MISSING_WARN,
     YandexAdmetricaStatsOperator,
 )
 
@@ -83,11 +88,13 @@ def _context(
     return context
 
 
-def _connection(advertiser_id: object = ADVERTISER_ID) -> Connection:
+def _connection(
+    advertiser_id: object = ADVERTISER_ID, token: str = TOKEN
+) -> Connection:
     return Connection(
         conn_id="admetrica",
         conn_type="http",
-        password=TOKEN,
+        password=token,
         extra=json.dumps({"advertiser_id": advertiser_id}),
     )
 
@@ -127,9 +134,10 @@ class _Run:
         rows: list[dict],
         advertiser_id: object = ADVERTISER_ID,
         campaigns: list[dict] | None = None,
+        token: str = TOKEN,
     ) -> None:
         self.rows = rows
-        self.connection = _connection(advertiser_id)
+        self.connection = _connection(advertiser_id, token)
         self.get_stats = MagicMock(return_value=rows)
         self.get_campaigns = MagicMock(
             return_value=[_campaign()] if campaigns is None else campaigns
@@ -142,6 +150,12 @@ class _Run:
         def record(hook, **kwargs):
             original(hook, **kwargs)
             hook.get_connection = MagicMock(return_value=self.connection)
+            # A live run reads the token on its first request, and the first
+            # request of an export is the campaign list. That request is stood in
+            # for here, so the read it performs is stood in for as well: the
+            # masking gate the operator sends foreign text through searches for
+            # the token this hook has read.
+            hook._get_token()
             self.hooks.append(hook)
 
         self._patches = [
@@ -523,6 +537,7 @@ class TestParametersReachTheHook:
             "timezone": "+03:00",
             "lang": "ru",
             "extra_params": {"goal_id": 12345},
+            "selection": CampaignSelection(),
         }
 
     def test_defaults_keep_the_numbers_steady_and_the_rows_whole(self, tmp_path):
@@ -618,6 +633,24 @@ class TestDeclaration:
         )
         assert op.admetrica_conn_id == AdmetricaHook.default_conn_name
 
+    def test_templated_fields_cover_the_selection(self):
+        for field in (
+            "campaign_scope",
+            "campaign_ids",
+            "campaign_names",
+            "on_missing_campaign",
+        ):
+            assert field in YandexAdmetricaStatsOperator.template_fields
+
+    def test_the_operator_walks_the_running_campaigns_unless_told_otherwise(self):
+        op = YandexAdmetricaStatsOperator(
+            task_id="collect", date=DATE, dimensions=DIMENSIONS, metrics=METRICS
+        )
+        assert op.campaign_scope == SCOPE_ACTIVE
+        assert op.campaign_ids is None
+        assert op.campaign_names is None
+        assert op.on_missing_campaign == MISSING_WARN
+
 
 class TestCampaignDictionary:
     def test_writes_the_snapshot_under_the_day_it_ran(self, tmp_path):
@@ -701,7 +734,9 @@ class TestCampaignDictionary:
         assert [r["kind"] for r in result] == ["stats"]
         advertiser_dir = tmp_path / DAG_SEGMENT / RUN_SEGMENT / str(ADVERTISER_ID)
         assert not list(advertiser_dir.glob("dict/**/*"))
-        run.get_campaigns.assert_not_called()
+        # The list is read all the same: it is what the selection is applied to
+        # and what the policy answers for, and both hold with the dictionary off.
+        assert run.get_campaigns.call_count == 1
 
     def test_an_advertiser_without_campaigns_writes_nothing(self, tmp_path):
         op = _operator(base_dir=str(tmp_path))
@@ -792,3 +827,593 @@ class TestTheWriteIsAtomic:
 
         assert _read(path) == [json.dumps(_row(55), ensure_ascii=False)]
         assert list(os.listdir(os.path.dirname(path))) == [os.path.basename(path)]
+
+
+def _selection(run: _Run) -> CampaignSelection:
+    """The selection the operator handed the hook on that run."""
+    return run.get_stats.call_args.kwargs["selection"]
+
+
+def _record(caplog, phrase: str):
+    """The one record of the run whose message holds *phrase*."""
+    (record,) = [r for r in caplog.records if phrase in r.getMessage()]
+    return record
+
+
+class TestTheSelectionReachesTheHook:
+    """The operator reads its campaign parameters into one finished selection.
+
+    What the selection then walks is the selection's own rule; here the subject
+    is that the operator builds it out of what the task run carries and hands it
+    to the hook whole.
+    """
+
+    def test_by_default_only_active_campaigns_are_asked_for(self, tmp_path):
+        op = _operator(base_dir=str(tmp_path))
+        with _Run([_row()]) as run:
+            op.execute(_context())
+        assert _selection(run) == CampaignSelection()
+        assert _selection(run).scope == "active"
+
+    def test_the_whole_list_is_walked_when_asked_for(self, tmp_path):
+        op = _operator(base_dir=str(tmp_path), campaign_scope="all")
+        with _Run([_row()]) as run:
+            op.execute(_context())
+        assert _selection(run) == CampaignSelection(scope="all")
+
+    def test_campaigns_are_named_by_id(self, tmp_path):
+        op = _operator(base_dir=str(tmp_path), campaign_ids=[CAMPAIGN_ID])
+        with _Run([_row()]) as run:
+            op.execute(_context())
+        assert _selection(run).ids == frozenset({CAMPAIGN_ID})
+
+    def test_campaigns_are_named_by_name(self, tmp_path):
+        op = _operator(base_dir=str(tmp_path), campaign_names="Летняя кампания")
+        with _Run([_row()]) as run:
+            op.execute(_context())
+        assert _selection(run).names == frozenset({"Летняя кампания"})
+
+    def test_a_named_campaign_outranks_the_scope(self, tmp_path):
+        listed = [{**_campaign(), "status": "archived"}]
+        op = _operator(
+            base_dir=str(tmp_path), campaign_scope="active", campaign_ids=[CAMPAIGN_ID]
+        )
+        with _Run([_row()], campaigns=listed) as run:
+            op.execute(_context())
+        assert _selection(run).matching(listed) == listed
+
+    def test_the_dictionary_stays_the_whole_cabinet_under_a_narrow_selection(
+        self, tmp_path
+    ):
+        listed = [_campaign(1, "Одна"), _campaign(2, "Две"), _campaign(3, "Три")]
+        op = _operator(base_dir=str(tmp_path), campaign_ids="1")
+        with _Run([_row()], campaigns=listed):
+            result = op.execute(_context())
+        (record,) = [r for r in result if r["kind"] == "dict"]
+        written = [json.loads(line) for line in _read(record["path"])]
+        assert [row["campaign_id"] for row in written] == [1, 2, 3]
+
+
+class TestTheSelectionIsReported:
+    def test_the_line_names_how_many_were_skipped(self, tmp_path, caplog):
+        listed = [_campaign(1), {**_campaign(2), "status": "archived"}]
+        op = _operator(base_dir=str(tmp_path))
+        with caplog.at_level("INFO"), _Run([_row()], campaigns=listed):
+            op.execute(_context())
+        assert "Collecting statistics for 1 of 2 campaigns" in caplog.text
+        assert "1 skipped" in caplog.text
+
+    def test_an_explicit_selection_says_the_scope_was_not_applied(
+        self, tmp_path, caplog
+    ):
+        listed = [_campaign(1), _campaign(2)]
+        op = _operator(base_dir=str(tmp_path), campaign_ids="1")
+        with caplog.at_level("INFO"), _Run([_row()], campaigns=listed):
+            op.execute(_context())
+        assert "Collecting statistics for 1 of 2 campaigns" in caplog.text
+        assert "named explicitly, 1 skipped" in caplog.text
+        assert "campaign_scope=active not applied" in caplog.text
+
+    def test_an_empty_scope_warns_and_names_the_statuses_seen(self, tmp_path, caplog):
+        listed = [
+            {**_campaign(1), "status": "archived"},
+            {**_campaign(2), "status": "paused"},
+        ]
+        op = _operator(base_dir=str(tmp_path))
+        with caplog.at_level("INFO"), _Run([], campaigns=listed):
+            op.execute(_context())
+        record = _record(caplog, "No campaign of the")
+        line = record.getMessage()
+        assert record.levelname == "WARNING"
+        assert "No campaign of the 2 listed" in line
+        assert '"archived"' in line
+        assert '"paused"' in line
+
+    def test_an_empty_scope_names_the_vocabulary_as_the_likelier_reading(
+        self, tmp_path, caplog
+    ):
+        # The whole default rests on one undocumented word, and a cabinet
+        # wording a running campaign otherwise reads exactly like a cabinet
+        # whose campaigns are all over — so the line says which is likelier and
+        # what collects the day meanwhile.
+        listed = [{**_campaign(1), "status": "запущена"}]
+        op = _operator(base_dir=str(tmp_path))
+        with caplog.at_level("INFO"), _Run([], campaigns=listed):
+            op.execute(_context())
+        line = _record(caplog, "No campaign of the").getMessage()
+        assert 'something other than "active"' in line
+        assert "campaign_scope=all" in line
+        assert "campaign_ids" in line
+
+    def test_the_line_names_the_statuses_of_what_it_skipped(self, tmp_path, caplog):
+        # An unfamiliar spelling of "running" is what the default silently
+        # collects short, and this line is where it shows on an ordinary run.
+        listed = [
+            _campaign(1),
+            {**_campaign(2), "status": "archived"},
+            {**_campaign(3), "status": "модерация"},
+        ]
+        op = _operator(base_dir=str(tmp_path))
+        with caplog.at_level("INFO"), _Run([_row()], campaigns=listed):
+            op.execute(_context())
+        record = _record(caplog, "Collecting statistics")
+        line = record.getMessage()
+        assert "Collecting statistics for 1 of 3 campaigns" in line
+        assert "scope=active, 2 skipped" in line
+        assert 'statuses skipped: "archived", "модерация"' in line
+
+    def test_a_walk_that_skips_nothing_names_no_status(self, tmp_path, caplog):
+        op = _operator(base_dir=str(tmp_path), campaign_scope="all")
+        with caplog.at_level("INFO"), _Run([_row()], campaigns=[_campaign(1)]):
+            op.execute(_context())
+        record = _record(caplog, "Collecting statistics")
+        assert record.getMessage().endswith("(scope=all, 0 skipped).")
+
+    def test_an_advertiser_with_no_campaigns_is_a_case_of_its_own(
+        self, tmp_path, caplog
+    ):
+        op = _operator(base_dir=str(tmp_path))
+        with caplog.at_level("INFO"), _Run([], campaigns=[]):
+            op.execute(_context())
+        record = _record(caplog, "no statistics requested")
+        assert record.levelname == "WARNING"
+        assert "lists no campaign at all" in record.getMessage()
+        assert "statuses seen" not in caplog.text
+
+
+class TestTheMissingCampaignPolicy:
+    def test_warning_leaves_the_task_running(self, tmp_path, caplog):
+        op = _operator(base_dir=str(tmp_path), campaign_ids="999")
+        with caplog.at_level("INFO"), _Run([_row()]) as run:
+            op.execute(_context())
+        assert 'lists no campaign for 1 id(s): "999"' in caplog.text
+        run.get_stats.assert_called_once()
+
+    def test_failing_stops_before_any_statistics_are_asked_for(self, tmp_path):
+        op = _operator(
+            base_dir=str(tmp_path), campaign_ids="999", on_missing_campaign="fail"
+        )
+        with _Run([_row()]) as run:
+            with pytest.raises(ValueError, match=r"lists no campaign for 1 id\(s\)"):
+                op.execute(_context())
+        run.get_stats.assert_not_called()
+
+    def test_ids_and_names_are_reported_apart(self, tmp_path, caplog):
+        op = _operator(
+            base_dir=str(tmp_path), campaign_ids="999, 111", campaign_names="Нет"
+        )
+        with caplog.at_level("INFO"), _Run([_row()]):
+            op.execute(_context())
+        # The ids are sorted, so one selection reads the same on every run of it.
+        assert '2 id(s): "111", "999"' in caplog.text
+        assert '1 name(s): "Нет"' in caplog.text
+
+    def test_an_unknown_policy_is_refused_before_anything_is_asked_for(self, tmp_path):
+        op = _operator(base_dir=str(tmp_path), on_missing_campaign="explode")
+        with _Run([_row()]) as run:
+            with pytest.raises(ValueError, match="on_missing_campaign must be"):
+                op.execute(_context())
+        run.get_campaigns.assert_not_called()
+        run.get_stats.assert_not_called()
+
+    def test_the_policy_is_read_the_way_a_run_form_writes_it(self, tmp_path):
+        op = _operator(
+            base_dir=str(tmp_path), campaign_ids="999", on_missing_campaign=" FAIL "
+        )
+        with _Run([_row()]) as run:
+            with pytest.raises(ValueError, match=r"lists no campaign for 1 id\(s\)"):
+                op.execute(_context())
+        run.get_stats.assert_not_called()
+
+    def test_an_unreadable_scope_is_refused_before_anything_is_asked_for(self, tmp_path):
+        op = _operator(base_dir=str(tmp_path), campaign_scope="activ")
+        with _Run([_row()]) as run:
+            with pytest.raises(ValueError, match="campaign_scope must be"):
+                op.execute(_context())
+        run.get_campaigns.assert_not_called()
+
+    def test_an_unreadable_id_is_refused_before_anything_is_asked_for(self, tmp_path):
+        op = _operator(base_dir=str(tmp_path), campaign_ids="12a")
+        with _Run([_row()]) as run:
+            with pytest.raises(ValueError, match="not a campaign id"):
+                op.execute(_context())
+        run.get_campaigns.assert_not_called()
+        run.get_stats.assert_not_called()
+
+    def test_a_long_value_is_refused_without_being_quoted(self, tmp_path):
+        op = _operator(base_dir=str(tmp_path), campaign_ids=TOKEN)
+        with _Run([_row()]) as run:
+            with pytest.raises(ValueError) as raised:
+                op.execute(_context())
+        assert TOKEN not in str(raised.value)
+        assert f"a str of {len(TOKEN)} character(s)" in str(raised.value)
+        run.get_campaigns.assert_not_called()
+
+    def test_the_policy_holds_with_the_dictionary_switched_off(self, tmp_path, caplog):
+        op = _operator(
+            base_dir=str(tmp_path),
+            collect_dictionaries=False,
+            campaign_ids="999",
+            campaign_scope="all",
+        )
+        with caplog.at_level("INFO"), _Run([_row()]) as run:
+            op.execute(_context())
+        assert 'lists no campaign for 1 id(s): "999"' in caplog.text
+        assert "Collecting statistics for 0 of 1 campaigns" in caplog.text
+        run.get_campaigns.assert_called_once()
+
+    def test_the_policy_fails_with_the_dictionary_switched_off(self, tmp_path):
+        op = _operator(
+            base_dir=str(tmp_path),
+            collect_dictionaries=False,
+            campaign_ids="999",
+            on_missing_campaign="fail",
+        )
+        with _Run([_row()]) as run:
+            with pytest.raises(ValueError, match="lists no campaign"):
+                op.execute(_context())
+        run.get_stats.assert_not_called()
+
+
+class TestForeignTextPassesTheGate:
+    """A campaign name is typed into a run form; a status is written by the API."""
+
+    @pytest.mark.parametrize("policy", ["warn", "fail"])
+    def test_a_name_holding_the_token_never_reaches_the_message(
+        self, tmp_path, caplog, policy
+    ):
+        op = _operator(
+            base_dir=str(tmp_path),
+            campaign_names=[TOKEN],
+            on_missing_campaign=policy,
+        )
+        with caplog.at_level("INFO"), _Run([_row()]):
+            if policy == "fail":
+                with pytest.raises(ValueError) as excinfo:
+                    op.execute(_context())
+                assert TOKEN not in str(excinfo.value)
+                assert "<token>" in str(excinfo.value)
+            else:
+                op.execute(_context())
+                assert "<token>" in caplog.text
+        assert TOKEN not in caplog.text
+
+    def test_a_name_with_line_breaks_stays_one_line(self, tmp_path, caplog):
+        op = _operator(base_dir=str(tmp_path), campaign_names=["Летняя\nкампания"])
+        with caplog.at_level("INFO"), _Run([_row()]):
+            op.execute(_context())
+        (message,) = [
+            record.getMessage()
+            for record in caplog.records
+            if "lists no campaign" in record.getMessage()
+        ]
+        assert "\n" not in message
+        assert "Летняя кампания" in message
+
+    def test_a_name_cannot_reorder_the_message_that_quotes_it(self, tmp_path, caplog):
+        """A bidirectional override in a name would forge the counts around it."""
+        op = _operator(
+            base_dir=str(tmp_path),
+            campaign_names=["Summer\u202e; 9 id(s): 1"],
+        )
+        with caplog.at_level("INFO"), _Run([_row()]):
+            op.execute(_context())
+        (message,) = [
+            record.getMessage()
+            for record in caplog.records
+            if "lists no campaign" in record.getMessage()
+        ]
+        assert "\u202e" not in message
+        assert "1 name(s)" in message
+
+    def test_a_status_cannot_reorder_the_line_that_lists_it(self, tmp_path, caplog):
+        listed = [{**_campaign(), "status": "arch\u2066ived"}]
+        op = _operator(base_dir=str(tmp_path))
+        with caplog.at_level("INFO"), _Run([], campaigns=listed):
+            op.execute(_context())
+        assert "\u2066" not in caplog.text
+        assert "arch ived" in caplog.text
+
+    def test_a_status_holding_the_token_never_reaches_the_warning(
+        self, tmp_path, caplog
+    ):
+        listed = [{**_campaign(), "status": TOKEN}]
+        op = _operator(base_dir=str(tmp_path))
+        with caplog.at_level("INFO"), _Run([], campaigns=listed):
+            op.execute(_context())
+        assert TOKEN not in caplog.text
+        assert "statuses seen: <token>" in caplog.text.replace('"', "")
+
+    def test_a_status_the_gate_refuses_travels_as_its_length(self, tmp_path, caplog):
+        # A status that says nothing once flattened is refused by the gate, and
+        # what is left to say about it is how long it was.
+        listed = [{**_campaign(), "status": "   "}]
+        op = _operator(base_dir=str(tmp_path))
+        with caplog.at_level("INFO"), _Run([], campaigns=listed):
+            op.execute(_context())
+        assert "<3 character(s)>" in caplog.text
+
+    def test_a_status_that_is_not_text_is_named_by_its_type(self, tmp_path, caplog):
+        listed = [{**_campaign(), "status": None}]
+        op = _operator(base_dir=str(tmp_path))
+        with caplog.at_level("INFO"), _Run([], campaigns=listed):
+            op.execute(_context())
+        assert "<a NoneType>" in caplog.text
+
+    @pytest.mark.parametrize("policy", ["warn", "fail"])
+    def test_an_id_holding_the_token_never_reaches_the_message(
+        self, tmp_path, caplog, policy
+    ):
+        # A token made of digits alone is the shape a campaign id has, so the
+        # id of a missing campaign leaves by the same gate a name does.
+        numeric = "9" * 24
+        op = _operator(
+            base_dir=str(tmp_path),
+            campaign_ids=numeric,
+            on_missing_campaign=policy,
+        )
+        with caplog.at_level("INFO"), _Run([_row()], token=numeric):
+            if policy == "fail":
+                with pytest.raises(ValueError) as excinfo:
+                    op.execute(_context())
+                assert numeric not in str(excinfo.value)
+                assert "<token>" in str(excinfo.value)
+            else:
+                op.execute(_context())
+                assert "<token>" in caplog.text
+        assert numeric not in caplog.text
+
+    @pytest.mark.parametrize(
+        "numeric", ["+" + "9" * 23, "0" + "9" * 23], ids=["signed", "padded"]
+    )
+    def test_a_numeric_token_spelled_another_way_reaches_no_message(
+        self, tmp_path, caplog, numeric
+    ):
+        # A token that says a number some other way is refused where it is
+        # written: read as that number, it would be repeated further on as
+        # digits the gate was never given and could not recognise.
+        op = _operator(base_dir=str(tmp_path), campaign_ids=numeric)
+        with caplog.at_level("INFO"), _Run([_row()], token=numeric) as run:
+            with pytest.raises(ValueError) as raised:
+                op.execute(_context())
+        message = str(raised.value)
+        assert numeric not in message
+        assert "9" * 23 not in message
+        assert f"a str of {len(numeric)} character(s)" in message
+        assert numeric not in caplog.text
+        assert "9" * 23 not in caplog.text
+        run.get_campaigns.assert_not_called()
+
+    def test_a_name_cannot_forge_the_structure_of_the_line(self, tmp_path, caplog):
+        # The quotation marks and the counts are the message's own words: a
+        # name that spells them out is one value all the same, and reads as one.
+        forged = 'x"; 9 id(s): "123'
+        op = _operator(base_dir=str(tmp_path), campaign_names=[forged])
+        with caplog.at_level("INFO"), _Run([_row()]):
+            op.execute(_context())
+        assert r'1 name(s): "x\"; 9 id(s): \"123"' in caplog.text
+        assert '"; 9 id(s): "' not in caplog.text
+
+    def test_a_backslash_in_a_name_is_marked_as_one(self, tmp_path, caplog):
+        # The mark that escapes a quotation mark is escaped itself, so a name
+        # ending in one cannot swallow the quotation mark that closes it.
+        op = _operator(base_dir=str(tmp_path), campaign_names=["Лето\\"])
+        with caplog.at_level("INFO"), _Run([_row()]):
+            op.execute(_context())
+        assert r'1 name(s): "Лето\\"' in caplog.text
+
+    def test_the_count_of_missing_ids_survives_the_masking(self, tmp_path, caplog):
+        # What the gate hides is the value; how much of a selection the cabinet
+        # does not know is what an operator acts on, so it is named apart.
+        numeric = "9" * 24
+        op = _operator(base_dir=str(tmp_path), campaign_ids=f"{numeric}, 111")
+        with caplog.at_level("INFO"), _Run([_row()], token=numeric):
+            op.execute(_context())
+        assert "2 id(s):" in caplog.text
+        assert numeric not in caplog.text
+
+    def test_an_id_too_long_to_write_out_is_named_by_that(self, tmp_path, caplog):
+        # A selection built in a DAG rather than parsed from a run form may hold
+        # a number CPython renders no digits of; the line says so in its own
+        # words instead of raising the interpreter's.
+        op = _operator(base_dir=str(tmp_path))
+        selection = CampaignSelection(ids=frozenset({10**5000}))
+        with caplog.at_level("INFO"), _Run([_row()]) as run:
+            op.execute(_context())
+            (hook,) = run.hooks
+            op._answer_for_missing(hook, selection, [], MISSING_WARN)
+        assert "more digits than can be written" in caplog.text
+
+
+class TestTheReportIsCheckedBeforeTheCampaignList:
+    """A report configured wrongly costs no request, campaign list included."""
+
+    @pytest.mark.parametrize("limit", [0, 100001, "10000"], ids=["zero", "over", "text"])
+    def test_a_limit_outside_the_range_stops_the_task_first(self, tmp_path, limit):
+        op = _operator(base_dir=str(tmp_path), limit=limit)
+        with _Run([_row()]) as run:
+            with pytest.raises(ValueError, match="limit must be a whole number"):
+                op.execute(_context())
+        run.get_campaigns.assert_not_called()
+        run.get_stats.assert_not_called()
+
+    def test_a_limit_too_long_to_write_out_is_named_by_that(self, tmp_path):
+        # CPython renders no digits of such a number, and the refusal is the
+        # provider's own sentence rather than the interpreter's about a limit
+        # nobody set.
+        op = _operator(base_dir=str(tmp_path), limit=10**5000)
+        with _Run([_row()]) as run:
+            with pytest.raises(ValueError) as raised:
+                op.execute(_context())
+        message = str(raised.value)
+        assert "limit must be a whole number" in message
+        assert "more digits than can be written" in message
+        assert "int_max_str_digits" not in message
+        run.get_campaigns.assert_not_called()
+        run.get_stats.assert_not_called()
+
+    def test_a_report_without_metrics_stops_the_task_first(self, tmp_path):
+        op = _operator(base_dir=str(tmp_path), metrics=[])
+        with _Run([_row()]) as run:
+            with pytest.raises(ValueError, match="at least one metric"):
+                op.execute(_context())
+        run.get_campaigns.assert_not_called()
+
+    def test_a_reserved_extra_parameter_stops_the_task_first(self, tmp_path):
+        op = _operator(base_dir=str(tmp_path), extra_params={"ids": "1"})
+        with _Run([_row()]) as run:
+            with pytest.raises(ValueError, match="extra_params may not carry"):
+                op.execute(_context())
+        run.get_campaigns.assert_not_called()
+
+
+class TestTheSelectionArrivesFromParams:
+    """The four fields are templated, so a run form decides what a day walks."""
+
+    @pytest.mark.parametrize(
+        ("ids", "expected"),
+        [("123, 534", frozenset({123, 534})), ("[1, 2]", frozenset({1, 2}))],
+        ids=["commas", "brackets"],
+    )
+    def test_a_rendered_list_of_ids_becomes_the_selection(self, tmp_path, ids, expected):
+        with DAG("selection", schedule=None, start_date=RUN_START):
+            op = _operator(base_dir=str(tmp_path), campaign_ids="{{ params.ids }}")
+        op.render_template_fields({"params": {"ids": ids}})
+        assert op.campaign_ids == ids
+        with _Run([_row()]) as run:
+            op.execute(_context())
+        assert _selection(run).ids == expected
+
+    def test_a_rendered_scope_becomes_the_selection(self, tmp_path):
+        with DAG("selection", schedule=None, start_date=RUN_START):
+            op = _operator(base_dir=str(tmp_path), campaign_scope="{{ params.scope }}")
+        op.render_template_fields({"params": {"scope": "all"}})
+        assert op.campaign_scope == "all"
+        with _Run([_row()]) as run:
+            op.execute(_context())
+        assert _selection(run) == CampaignSelection(scope="all")
+
+    def test_an_empty_rendered_value_names_no_campaign(self, tmp_path):
+        with DAG("selection", schedule=None, start_date=RUN_START):
+            op = _operator(base_dir=str(tmp_path), campaign_ids="{{ params.ids }}")
+        op.render_template_fields({"params": {"ids": ""}})
+        with _Run([_row()]) as run:
+            op.execute(_context())
+        assert _selection(run) == CampaignSelection()
+
+
+class TestANativeDagRendersTheSelectionAsText:
+    """``render_template_as_native_obj`` reads a rendered value as a literal.
+
+    A DAG declared that way finishes every render through ``ast.literal_eval``,
+    so a value typed into a run form stops being the text that was typed.  The
+    operator renders its own fields as text, and these say what that keeps.
+    """
+
+    @staticmethod
+    def _rendered(tmp_path, params, **fields):
+        with DAG(
+            "native",
+            schedule=None,
+            start_date=RUN_START,
+            render_template_as_native_obj=True,
+        ):
+            op = _operator(base_dir=str(tmp_path), **fields)
+        op.render_template_fields({"params": params})
+        return op
+
+    @pytest.mark.parametrize("typed", ["1_2", "+999", "0x0c"])
+    def test_an_id_that_reads_as_a_literal_is_still_refused(self, tmp_path, typed):
+        op = self._rendered(tmp_path, {"ids": typed}, campaign_ids="{{ params.ids }}")
+
+        assert op.campaign_ids == typed
+        with _Run([_row()]) as run:
+            with pytest.raises(ValueError, match="campaign_ids"):
+                op.execute(_context())
+        run.get_campaigns.assert_not_called()
+
+    def test_an_id_is_not_quietly_swapped_for_another_campaign(self, tmp_path):
+        """``1_2`` is twelve to ``int`` and no campaign to a caller who typed it."""
+        op = self._rendered(tmp_path, {"ids": "1_2"}, campaign_ids="{{ params.ids }}")
+
+        with _Run([_row()]) as run:
+            with pytest.raises(ValueError):
+                op.execute(_context())
+        run.get_stats.assert_not_called()
+
+    @pytest.mark.parametrize("typed", ["None", "123", "False"])
+    def test_a_name_that_reads_as_a_literal_stays_a_name(self, tmp_path, typed):
+        op = self._rendered(
+            tmp_path, {"names": typed}, campaign_names="{{ params.names }}"
+        )
+
+        assert op.campaign_names == typed
+        with _Run([_row()]) as run:
+            op.execute(_context())
+        selection = _selection(run)
+        assert selection.names == frozenset({typed})
+        assert selection.is_explicit is True
+
+    def test_a_list_param_renders_as_the_characters_it_is_written_in(self, tmp_path):
+        # A native DAG renders in an environment whose templates yield the
+        # Python object the expression evaluated to; the operator renders in a
+        # sandboxed one, so a list arrives as the text a list is written as.
+        op = self._rendered(
+            tmp_path, {"ids": [123, 534]}, campaign_ids="{{ params.ids }}"
+        )
+
+        assert op.campaign_ids == "[123, 534]"
+        with _Run([_row()]) as run:
+            op.execute(_context())
+        assert _selection(run).ids == frozenset({123, 534})
+
+    def test_a_tuple_param_of_names_renders_as_the_names_it_holds(self, tmp_path):
+        op = self._rendered(
+            tmp_path, {"names": ("Лето", "Зима")}, campaign_names="{{ params.names }}"
+        )
+
+        assert op.campaign_names == "('Лето', 'Зима')"
+        with _Run([_row()]) as run:
+            op.execute(_context())
+        assert _selection(run).names == frozenset({"Лето", "Зима"})
+
+    def test_a_written_out_list_is_read_as_the_list_it_names(self, tmp_path):
+        op = self._rendered(
+            tmp_path, {"ids": "[123, 534]"}, campaign_ids="{{ params.ids }}"
+        )
+
+        with _Run([_row()]) as run:
+            op.execute(_context())
+        assert _selection(run).ids == frozenset({123, 534})
+
+    def test_the_day_is_rendered_as_the_day_it_names(self, tmp_path):
+        with DAG(
+            "native",
+            schedule=None,
+            start_date=RUN_START,
+            render_template_as_native_obj=True,
+        ):
+            op = _operator(base_dir=str(tmp_path), date="{{ ds }}")
+        op.render_template_fields({"params": {}, "ds": DATE})
+
+        assert op.date == DATE
