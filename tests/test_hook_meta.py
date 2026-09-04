@@ -1,4 +1,6 @@
-"""Tests for the connection check and for how often the connection is read."""
+"""Tests for the connection check, for how often the connection is read and for
+the masking gate the hook offers a caller above it.
+"""
 
 from __future__ import annotations
 
@@ -223,3 +225,45 @@ class TestConnectionIsReadOnce:
         hook.get_connection = MagicMock(side_effect=AirflowException("The conn_id is not defined"))
         hook.test_connection()
         assert hook.get_connection.call_count == 1
+
+
+# ---------------------------------------------------------------------------
+# The gate the operator writes somebody else's words through
+# ---------------------------------------------------------------------------
+
+
+class TestSafeText:
+    """``safe_text`` is the masking gate, offered to a caller above the hook."""
+
+    def _read_hook(self) -> AdmetricaHook:
+        """A hook that has read its connection, and therefore its token."""
+        hook = _hook()
+        with patch("requests.get", return_value=_campaign_page([_campaign(1)])):
+            hook.get_campaigns()
+        return hook
+
+    def test_a_value_carrying_the_token_comes_back_masked(self):
+        text = self._read_hook().safe_text(f"campaign {TOKEN} missing")
+        assert TOKEN not in text
+        assert _TOKEN_REDACTED in text
+
+    def test_ordinary_text_comes_back_flattened(self):
+        assert self._read_hook().safe_text("first\nsecond") == "first second"
+
+    def test_long_text_comes_back_bounded(self):
+        text = self._read_hook().safe_text("m" * 500)
+        assert len(text) < 500
+
+    def test_a_value_that_is_not_text_comes_back_as_nothing(self):
+        assert self._read_hook().safe_text(["Campaign"]) is None
+
+    def test_text_the_token_survived_comes_back_as_nothing(self):
+        assert self._read_hook().safe_text("\x00".join(TOKEN)) is None
+
+    def test_text_that_says_nothing_comes_back_as_nothing(self):
+        assert self._read_hook().safe_text("   \n  ") is None
+
+    def test_it_answers_before_the_connection_has_been_read(self):
+        hook = _hook()
+        assert hook.safe_text("Campaign") == "Campaign"
+        assert hook.get_connection.call_count == 0

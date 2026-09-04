@@ -10,6 +10,7 @@ import pytest
 from airflow.exceptions import AirflowException
 from airflow.models import Connection
 
+from airflow_provider_yandex_admetrica.campaign_selection import CampaignSelection
 from airflow_provider_yandex_admetrica.hooks.yandex_admetrica import (
     _CAMPAIGNS_LIMIT,
     _ENDPOINT_URLS,
@@ -104,6 +105,11 @@ def _campaign(campaign_id: int) -> dict:
         "advertiser_id": ADVERTISER_ID,
         "advertiser_name": "Advertiser",
     }
+
+
+def _campaign_named(campaign_id: int, name: str, status: str) -> dict:
+    """A campaign of the list worded as the cabinet words it."""
+    return {**_campaign(campaign_id), "name": name, "status": status}
 
 
 def _refused() -> MagicMock:
@@ -897,6 +903,68 @@ class TestCampaignList:
         list_calls = [c for c in mock_get.call_args_list if c.args[0] == _ENDPOINT_URLS["campaigns"]]
         assert len(list_calls) == 1
         assert len(_stat_params(mock_get)) == 2
+
+
+# ---------------------------------------------------------------------------
+# Which campaigns a day is walked over
+# ---------------------------------------------------------------------------
+
+
+class TestSelection:
+    """Only the campaigns the selection names are asked for statistics."""
+
+    def _walked(self, selection=None) -> list[int]:
+        """Return the campaign ids a day spent a request on, in order."""
+        campaigns = [
+            _campaign_named(1, "Running", "active"),
+            _campaign_named(2, "Retired", "archived"),
+            _campaign_named(3, "Also running", "active"),
+        ]
+        pages = [_page([], total=0) for _ in campaigns]
+        kwargs = {} if selection is None else {"selection": selection}
+        with patch("requests.get", side_effect=_api(campaigns, pages)) as mock_get:
+            _hook().get_stats(DATE, DIMENSIONS, METRICS, **kwargs)
+        return [params["ids"] for params in _stat_params(mock_get)]
+
+    def test_by_default_only_the_active_campaigns_are_asked_for(self):
+        assert self._walked() == [1, 3]
+
+    def test_an_explicit_default_selection_says_the_same_thing(self):
+        assert self._walked(CampaignSelection()) == [1, 3]
+
+    def test_the_whole_list_is_walked_under_the_all_scope(self):
+        assert self._walked(CampaignSelection.parse(scope="all")) == [1, 2, 3]
+
+    def test_an_archived_campaign_named_by_id_is_walked(self):
+        selection = CampaignSelection.parse(ids="2")
+        assert self._walked(selection) == [2]
+
+    def test_an_archived_campaign_named_by_name_is_walked(self):
+        selection = CampaignSelection.parse(names="Retired")
+        assert self._walked(selection) == [2]
+
+    def test_ids_and_names_are_one_selection(self):
+        selection = CampaignSelection.parse(ids="3", names="Retired")
+        assert self._walked(selection) == [2, 3]
+
+    def test_a_selection_matching_nothing_costs_no_statistics_request(self):
+        campaigns = [_campaign_named(1, "Retired", "archived")]
+        with patch("requests.get", side_effect=_api(campaigns, [])) as mock_get:
+            records = _hook().get_stats(DATE, DIMENSIONS, METRICS)
+        assert records == []
+        assert _stat_params(mock_get) == []
+
+    def test_the_list_is_still_asked_for_in_full(self):
+        """A narrowed walk does not narrow the answer the dictionary is written from."""
+        campaigns = [
+            _campaign_named(1, "Running", "active"),
+            _campaign_named(2, "Retired", "archived"),
+        ]
+        hook = _hook()
+        with patch("requests.get", side_effect=_api(campaigns, [_page([], total=0)])):
+            hook.get_stats(DATE, DIMENSIONS, METRICS)
+            listed = hook.get_campaigns()
+        assert [campaign["campaign_id"] for campaign in listed] == [1, 2]
 
 
 # ---------------------------------------------------------------------------

@@ -151,6 +151,39 @@ class TestOneLine:
     def test_text_that_says_nothing_else_comes_back_empty(self):
         assert _one_line(" \n\t\x07 ") == ""
 
+    def test_a_bidirectional_override_takes_a_space_of_its_own(self):
+        """A campaign name cannot reorder the message that quotes it."""
+        assert _one_line("total\u202e321 dlrow") == "total 321 dlrow"
+
+    def test_a_bidirectional_isolate_goes_the_same_way(self):
+        """Both ends of an isolate are formatting, and neither survives."""
+        assert _one_line("a\u2066b\u2069c") == "a b c"
+
+    def test_a_zero_width_character_takes_a_space_of_its_own(self):
+        """What is invisible to a reader is not left invisible in the text."""
+        assert _one_line("se\u200bcret") == "se cret"
+
+    def test_a_byte_order_mark_and_a_tag_character_go_too(self):
+        """The invisible formatting of a name is not part of what it says."""
+        assert _one_line("\ufeffname\U000e0041") == "name"
+
+    @pytest.mark.parametrize(
+        ("given", "expected"),
+        [
+            ("a\u034fb", "a b"),
+            ("\u115fname\u3164", "name"),
+            ("x\ufe0fy", "x y"),
+            ("x\U000e0100y", "x y"),
+            ("a\u180fb", "a b"),
+        ],
+        ids=["joiner", "hangul-fillers", "variation-selector", "supplement", "mongolian"],
+    )
+    def test_a_default_ignorable_character_takes_a_space_of_its_own(
+        self, given, expected
+    ):
+        """A character Unicode marks as taking no place of its own takes none here."""
+        assert _one_line(given) == expected
+
 
 # ---------------------------------------------------------------------------
 # _mask_token
@@ -236,6 +269,12 @@ class TestStripToken:
 
         assert _strip_token(text, TOKEN, cut=False) is None
 
+    def test_a_token_spelled_out_between_zero_width_spaces_drops_the_text_whole(self):
+        """A character nobody sees hides the value from the search, not from a reader."""
+        text = "\u200b".join(TOKEN)
+
+        assert _strip_token(text, TOKEN, cut=False) is None
+
 
 class TestDropCutToken:
     def test_the_longest_matching_beginning_is_taken(self):
@@ -262,6 +301,16 @@ class TestScrub:
 
     def test_a_token_that_answers_with_code_of_its_own_drops_the_text(self):
         assert _scrub("plain text", _HostileStr(TOKEN)) is None
+
+    def test_the_text_is_flattened_by_the_gate_itself(self):
+        """Every channel calling the gate gets the flattening with it."""
+        assert _scrub("first\nsecond", TOKEN) == "first second"
+
+    def test_a_bidirectional_override_does_not_survive_the_gate(self):
+        assert _scrub("total\u202e321 dlrow", TOKEN) == "total 321 dlrow"
+
+    def test_a_zero_width_character_inside_the_token_still_drops_the_text(self):
+        assert _scrub("\u200b".join(TOKEN), TOKEN) is None
 
 
 # ---------------------------------------------------------------------------
@@ -408,6 +457,12 @@ class TestRedact:
 
         assert result["X-Echo"] is None
 
+    def test_a_header_carrying_a_bidirectional_override_is_flattened(self):
+        """A header is text a server wrote, and the event quoting it is read."""
+        result = _redact({"X-Echo": "total\u202e321 dlrow"}, TOKEN)
+
+        assert result["X-Echo"] == "total 321 dlrow"
+
 
 # ---------------------------------------------------------------------------
 # _declared_charset
@@ -520,6 +575,17 @@ class TestBoundedBody:
         body = "\x00".join(TOKEN).encode("utf-8")
 
         assert _bounded_body(_Body(body), TOKEN) is None
+
+    def test_a_body_carrying_a_bidirectional_override_is_flattened(self):
+        """An error page reorders nothing in the event that carries it."""
+        result = _bounded_body(_Body("total\u202e321 dlrow".encode()), TOKEN)
+
+        assert result == "total 321 dlrow"
+
+    def test_a_body_written_over_several_lines_travels_as_one(self):
+        result = _bounded_body(_Body(b'{\n  "error": "nope"\n}'), TOKEN)
+
+        assert result == '{ "error": "nope" }'
 
     def test_a_response_whose_bytes_raise_has_no_body(self):
         class Hostile:
@@ -1249,6 +1315,15 @@ class TestRecordRateLimit:
 
         assert TOKEN not in str(event["rate_limit_limit"])
         assert event["rate_limit_limit"] == _TOKEN_REDACTED
+
+    def test_a_header_carrying_invisible_formatting_is_flattened(self):
+        event = _event()
+        headers = {"X-RateLimit-Limit": "9\u202e9", "X-RateLimit-Remaining": "0"}
+        resp = _Answer(headers=headers)
+
+        _record_rate_limit(event, resp, TOKEN)
+
+        assert event["rate_limit_limit"] == "9 9"
 
     def test_an_answer_naming_neither_leaves_both_empty(self):
         event = _event()

@@ -111,6 +111,28 @@ class TestNormalizeName:
     def test_a_name_that_is_all_separators_leaves_no_edges_behind(self):
         assert _normalize_name("am:e:$$$") == ""
 
+    def test_a_value_of_more_digits_than_can_be_written_is_refused_by_name(self):
+        """An unwritable answer to a placeholder stops the export in our words."""
+        with pytest.raises(ValueError) as refusal:
+            _normalize_name("am:e:goal<goal_id>Reaches", {"goal_id": 10**5000})
+
+        message = str(refusal.value)
+        assert "more digits than can be written" in message
+        assert "goal_id" in message
+        assert "int_max_str_digits" not in message
+
+    def test_the_refusal_names_the_parameter_through_the_gate(self):
+        """The parameter is the caller's text, so the token in it is masked."""
+        with pytest.raises(ValueError) as refusal:
+            _normalize_name(
+                "am:e:goal<secret-token>Reaches",
+                {"secret-token": 10**5000},
+                "secret-token",
+            )
+
+        assert "secret-token" not in str(refusal.value)
+        assert "<token>" in str(refusal.value)
+
 
 class TestServiceFields:
     """The flat half of the record: the day, the advertiser and the campaign."""

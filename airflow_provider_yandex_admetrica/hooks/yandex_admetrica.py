@@ -6,6 +6,7 @@ import json
 import logging
 import re
 import time
+import unicodedata
 from datetime import datetime
 from datetime import timezone as _timezone
 from email.utils import parsedate_to_datetime
@@ -14,6 +15,8 @@ from typing import TYPE_CHECKING
 import requests
 from airflow.exceptions import AirflowException
 from airflow.hooks.base import BaseHook
+
+from airflow_provider_yandex_admetrica.campaign_selection import CampaignSelection
 
 if TYPE_CHECKING:
     from collections.abc import Sequence
@@ -313,12 +316,40 @@ _RATE_LIMIT_REMAINING_HEADER = "X-RateLimit-Remaining"
 #: exception texts).
 _TEXT_LIMIT = 300
 
-#: A run of whitespace or control characters in text the server wrote, replaced
-#: by a single space before that text travels.  The task log gives one
-#: unsuccessful attempt exactly one line, and a ``message`` holding a line break
-#: would write several — a reader, or an alert counting lines, would see
-#: attempts that never happened.
-_WHITESPACE_RUN_RE = re.compile(r"[\s\x00-\x1f\x7f-\x9f]+")
+#: The Unicode general categories whose characters take no visible place of
+#: their own: control, format, surrogate and private-use.  The rule is asked of
+#: the category rather than of a list of characters, so a character a later
+#: Unicode version adds to one of them is covered by the same sentence that
+#: covers the ones written down today.
+_INVISIBLE_CATEGORIES = frozenset({"Cc", "Cf", "Cs", "Co"})
+
+#: The default-ignorable characters that none of :data:`_INVISIBLE_CATEGORIES`
+#: holds: the combining grapheme joiner, the Hangul fillers, the Khmer inherent
+#: vowels, the Mongolian free variation selectors, the variation selectors and
+#: their supplement, the reserved points set aside for this class, and the tag
+#: block.  Unicode marks each of them as taking no place of its own, and the
+#: categories they carry — a mark, a letter, an unassigned point — say nothing
+#: about that, so this class is named by its own ranges.
+_IGNORABLE_RANGES = (
+    (0x034F, 0x034F),
+    (0x115F, 0x1160),
+    (0x17B4, 0x17B5),
+    (0x180B, 0x180F),
+    (0x2065, 0x2065),
+    (0x3164, 0x3164),
+    (0xFE00, 0xFE0F),
+    (0xFFA0, 0xFFA0),
+    (0xFFF0, 0xFFF8),
+    (0xE0000, 0xE0FFF),
+)
+
+#: :data:`_IGNORABLE_RANGES` written out, so that asking about one character
+#: costs a single lookup: the question is put to every character of a response
+#: body, and a body is bounded by :data:`_BODY_LIMIT` rather than by a line.
+_IGNORABLE_POINTS = frozenset(
+    point for first, last in _IGNORABLE_RANGES for point in range(first, last + 1)
+)
+
 
 #: Character budget for a response header value copied into an event.
 _HEADER_LIMIT = 32
@@ -404,19 +435,75 @@ def _truncate(value: str, limit: int = _TEXT_LIMIT, *, suffix: str = "…") -> s
     return value[: limit - len(suffix)] + suffix
 
 
-def _one_line(value: str) -> str:
-    """Flatten text the server wrote onto a single line of single spaces.
+def _is_invisible(char: str) -> bool:
+    """Whether *char* takes no visible place of its own.
 
-    Every run of whitespace or control characters becomes one space and the ends
-    are trimmed, so the result holds no line break, no carriage return and no
-    escape sequence a terminal would act on.  Text that says nothing else comes
-    back empty, and the caller reads that as no text at all.
+    Whitespace, the four categories of :data:`_INVISIBLE_CATEGORIES` and the
+    default-ignorable characters of :data:`_IGNORABLE_RANGES`.  Every such
+    character is taken out of somebody else's text before it travels, so that
+    what a person reads in a task log is what the text holds.
 
-    Runs before the token is cut out: a value split across a line break is one
-    value again once the break becomes a space, and the search that removes it
-    works on text already in its final shape.
+    A line break is the plain case: the log gives one unsuccessful attempt
+    exactly one line, and a ``message`` holding a break would write several, so
+    that a reader, or an alert counting lines, would see attempts that never
+    happened.  A bidirectional override is the same thing said about one line: a
+    campaign name carrying U+202E reorders every character after it, and the
+    counts and quotation marks a message is built from can be made to read as
+    something else entirely.  A zero-width character says it a third way: put
+    between two characters of the credential, it leaves the value legible to a
+    person while hiding it from the search that removes it, and taking such
+    characters out is what keeps that search looking at what is really written.
     """
-    return _WHITESPACE_RUN_RE.sub(" ", value).strip()
+    return (
+        char.isspace()
+        or unicodedata.category(char) in _INVISIBLE_CATEGORIES
+        or ord(char) in _IGNORABLE_POINTS
+    )
+
+
+def _without_invisible(text: str, filler: str) -> str:
+    """Return *text* with every run of invisible characters replaced by *filler*.
+
+    A run at either end is dropped rather than filled, so text that says nothing
+    else comes back empty.  *filler* is a space where the result is read by a
+    person and empty where it is compared against a credential: a value split
+    across a zero-width space is one value again once nothing stands between its
+    characters.
+    """
+    out: list[str] = []
+    run = False
+    for char in text:
+        if _is_invisible(char):
+            run = True
+            continue
+        if run and out:
+            out.append(filler)
+        run = False
+        out.append(char)
+    return "".join(out)
+
+
+def _one_line(value: str) -> str:
+    """Flatten somebody else's text onto a single line of visible characters.
+
+    Every run of characters :func:`_is_invisible` recognises becomes one space
+    and the ends are trimmed, so the result holds no line break, no carriage
+    return, no escape sequence a terminal would act on and no formatting
+    character that moves what is drawn around it.  Text that says nothing else
+    comes back empty, and the caller reads that as no text at all.
+
+    This is what makes the rest of a message trustworthy.  A message here counts
+    what it names and quotes each value, and the counts and the quotation marks
+    are its structure; a value free to carry a bidirectional override could
+    reorder that structure on the screen and show a reader a different sentence
+    from the one that was written.  What comes back cannot: every character left
+    in it takes a place of its own.
+
+    Runs before the token is cut out: a value split across a line break, or
+    across a zero-width space, is one value again once the run becomes a space,
+    and the search that removes it works on text already in its final shape.
+    """
+    return _without_invisible(value, " ")
 
 
 def _mask_token(token: object) -> str:
@@ -457,10 +544,10 @@ def _strip_token(text: str, token: object, *, cut: bool) -> str | None:
     rather than all of it.  ``None`` means the text must not travel at all: an
     answer that spells the token out with something standing between its
     characters — UTF-16 read as UTF-8 leaves every one of them between NULs, and
-    a line break inside the value does the same once flattening turns it into a
-    space — puts the value out of reach of a search for it, and the value
-    outranks the diagnostic.  That last check reads both the text and the token
-    with every run of whitespace and control characters taken out, so what it
+    a line break or a zero-width space inside the value does the same once
+    flattening turns it into a space — puts the value out of reach of a search
+    for it, and the value outranks the diagnostic.  That last check reads both
+    the text and the token with every invisible character taken out, so what it
     compares is what a person reading the line would see.
 
     A token that is not a non-empty ``str`` names no value to look for, so the
@@ -471,8 +558,8 @@ def _strip_token(text: str, token: object, *, cut: bool) -> str | None:
     text = text.replace(token, _TOKEN_REDACTED)
     if cut:
         text = _drop_cut_token(text, token)
-    needle = _WHITESPACE_RUN_RE.sub("", token)
-    if needle and needle in _WHITESPACE_RUN_RE.sub("", text):
+    needle = _without_invisible(token, "")
+    if needle and needle in _without_invisible(text, ""):
         return None
     return text
 
@@ -488,6 +575,15 @@ def _scrub(text: object, token: object, *, cut: bool = False) -> str | None:
     door means one place to read to know what a channel may carry, and a channel
     added later inherits the guarantee by calling it.
 
+    Two things happen here, in this order.  The text is flattened by
+    :func:`_one_line`, so that whatever a server, a proxy or a caller wrote
+    reaches a task log and an event as visible characters on a single line: a
+    header value and a response body are as free to carry a bidirectional
+    override or a zero-width space as any other foreign text, and a channel that
+    flattened its own text would leave the next one to remember to.  Then the
+    live token is cut out of the flattened text, which is the shape it will
+    travel in.
+
     ``None`` means the text must not travel: either it is not a ``str`` this
     module will operate on, or the token survived the search and the value
     outranks the diagnostic.  *cut* is for text taken from a slice at a byte
@@ -499,7 +595,7 @@ def _scrub(text: object, token: object, *, cut: bool = False) -> str | None:
     if type(text) is not str:
         return None
     try:
-        return _strip_token(text, token, cut=cut)
+        return _strip_token(_one_line(text), token, cut=cut)
     except Exception:
         return None
 
@@ -507,18 +603,14 @@ def _scrub(text: object, token: object, *, cut: bool = False) -> str | None:
 def _safe_text(value: object, token: object, *, limit: int = _TEXT_LIMIT) -> str | None:
     """Return free text the server wrote, fit to travel, or ``None``.
 
-    Flattens onto one line, cuts the token out and bounds the result, in that
-    order: the flattening joins a value a line break had split, so the search
-    sees the text in the shape it will travel in, and the budget counts that
-    same shape.  Text that says nothing, and text the token survived, both come
-    back as ``None``, which every caller reads as no text at all.
+    The gate flattens the text and cuts the token out; what this adds is the
+    budget, counted on the shape the text travels in.  Text that says nothing,
+    and text the token survived, both come back as ``None``, which every caller
+    reads as no text at all.
     """
     if type(value) is not str:
         return None
-    flat = _one_line(value)
-    if not flat:
-        return None
-    clean = _scrub(flat, token)
+    clean = _scrub(value, token)
     if not clean:
         return None
     return _truncate(clean, limit)
@@ -641,10 +733,13 @@ def _bounded_body(resp: object, token: object) -> str | None:
     token that answers with code of its own are reported as the absence of a
     value, never as an exception that would change what the caller sees.
 
-    The live token is cut out by :func:`_scrub`: a server or a proxy can echo the
-    ``Authorization`` header back in an error body, and the token is the one
-    secret this event never carries.  An answer that keeps the token out of that
-    gate's reach is dropped whole.
+    The body leaves through :func:`_scrub`, the gate every foreign text leaves
+    by: it comes out as visible characters of a single line, and the live token
+    comes out of it.  Both halves matter for a body — a proxy can echo the
+    ``Authorization`` header back in an error page, and an error page is as free
+    as any other text to carry a bidirectional override into the event that
+    quotes it.  An answer that keeps the token out of that gate's reach is
+    dropped whole.
     """
     if resp is None:
         return None
@@ -1618,6 +1713,45 @@ def _campaign_record(row: dict) -> dict:
     return record
 
 
+def _written_number(value: object) -> str | None:
+    """Return a number written out, or ``None`` where it cannot be written.
+
+    CPython renders an integer only up to ``sys.get_int_max_str_digits`` digits
+    and refuses a longer one with a ``ValueError`` worded in terms of that
+    setting.  Every sentence this module lets out is its own, so a number of that
+    size is answered here as an absence, and each caller says in its own words
+    what a value it cannot write is — rather than letting the interpreter's
+    sentence about a limit nobody set escape as the diagnostic.
+
+    The one door a number of unknown size goes through on its way into text,
+    because a number reaches this module from a caller and from an answer alike,
+    and either can hold one longer than a message can name.
+    """
+    try:
+        return repr(value)
+    except ValueError:
+        return None
+
+
+def _written_value(value: object) -> str | None:
+    """Return *value* as the text it is spelled into a name as, or ``None``.
+
+    ``str`` rather than ``repr``, because what comes back becomes part of a
+    record key: a currency is written as ``RUB`` and a goal as its digits, the
+    way each of them is written in the name that carries the value.
+    :func:`_written_number` is the other spelling of the same care, the one a
+    diagnostic uses to name a value rather than to build a key from it.
+
+    ``None`` where the value cannot be written at all: CPython renders an
+    integer only up to ``sys.get_int_max_str_digits`` digits, and the caller
+    says in its own words what such a value means for what it was building.
+    """
+    try:
+        return str(value)
+    except ValueError:
+        return None
+
+
 def _describe_campaign(row: dict, token: object) -> str:
     """Return the words that name a campaign whose id could not be read.
 
@@ -1625,11 +1759,17 @@ def _describe_campaign(row: dict, token: object) -> str:
     is one a diagnostic may carry, and the campaign's name when the answer gave
     one.  The name and a textual id are the server's own words, so they leave
     through the gate every text leaves by; a number, which is short and holds no
-    text, is spelled out as it arrived.
+    text, is spelled out as it arrived, unless it is a number of more digits than
+    :func:`_written_number` will write.
     """
     raw = row.get("campaign_id")
     if type(raw) in (int, float, bool):
-        described = f"a {type(raw).__name__} of {raw}"
+        written = _written_number(raw)
+        described = (
+            f"a {type(raw).__name__} of {written}"
+            if written is not None
+            else f"a {type(raw).__name__} of more digits than can be written"
+        )
     elif type(raw) is str:
         text = _safe_text(raw, token, limit=_PARAM_VALUE_LIMIT)
         described = f"a str of {text!r}" if text else "a str of unusable text"
@@ -1651,7 +1791,7 @@ def _quoted_parameter(parameter: str, token: object) -> str:
     Bounded like free text, because a name is as long as whoever wrote it made
     it and the line is read from a log.
     """
-    clean = _scrub(_one_line(parameter), token)
+    clean = _scrub(parameter, token)
     if clean is None:
         return f"of {len(parameter)} character(s), which cannot be quoted here"
     return repr(_truncate(clean))
@@ -1678,6 +1818,15 @@ def _resolve_placeholders(
     key to add to ``extra_params``.  *token* is what makes that safe: the name
     goes out through :func:`_quoted_parameter`, the same gate the caller's text
     passes through on every other channel.
+
+    A value that answers a placeholder is written into the record key, so it
+    goes through :func:`_written_value`, the one door a value of unknown size
+    takes into text here.  An integer past the digits CPython will render is
+    refused in this module's own words rather than the interpreter's: the key it
+    would name cannot be written at all, and a report whose columns cannot be
+    named is not a report that should run.  The refusal comes as the record keys
+    are built, which is before the first request for the day's numbers and after
+    the campaign list the walk needs.
     """
     if "<" not in text:
         return text
@@ -1686,7 +1835,18 @@ def _resolve_placeholders(
     def substitute(match: re.Match) -> str:
         parameter = match.group(1)
         if parameter in params:
-            return str(params[parameter])
+            written = _written_value(params[parameter])
+            if written is None:
+                raise ValueError(
+                    f"extra_params answers the parameter "
+                    f"{_quoted_parameter(parameter, token)} with a value of "
+                    f"more digits than can be written, and that value is "
+                    f"spelled into the name it answers. Give the parameter a "
+                    f"value a record key can be written from, so the export "
+                    f"stops here rather than on a key nothing can be read "
+                    f"under."
+                )
+            return written
         log.warning(
             "A name of %d character(s) in this request names the parameter %s, "
             "which the request does not carry; the record key keeps the "
@@ -1990,7 +2150,7 @@ def check_date(date: object) -> None:
         )
 
 
-def _check_report_limits(
+def check_report_limits(
     dimensions: Sequence[str], metrics: Sequence[str], limit: object
 ) -> None:
     """Fail on a request the API documents as out of bounds, before it is sent.
@@ -2014,7 +2174,13 @@ def _check_report_limits(
     credential among the possibilities, while this text is read from a task log
     and a traceback like every other text this module lets out.  A whole number
     is quoted as itself, since a number says nothing beyond the range it fell
-    outside of.
+    outside of — one of more digits than :func:`_written_number` will write is
+    named by that instead, so the refusal stays this module's own sentence.
+
+    The operator asks this before it builds a hook, which is what keeps the
+    promise that a report configured wrongly costs no request at all: the
+    campaign list is fetched before the day is collected, and a check reached
+    only inside :meth:`AdmetricaHook.get_stats` would come after it.
     """
     if not metrics:
         raise ValueError(
@@ -2031,20 +2197,26 @@ def _check_report_limits(
             f"{len(dimensions)} were given."
         )
     if type(limit) is not int or not 0 < limit <= _MAX_LIMIT:
-        given = repr(limit) if type(limit) is int else f"a {type(limit).__name__}"
+        if type(limit) is not int:
+            given = f"a {type(limit).__name__}"
+        else:
+            given = _written_number(limit) or "an int of more digits than can be written"
         raise ValueError(
             f"limit must be a whole number between 1 and {_MAX_LIMIT}; {given} "
             f"was given."
         )
 
 
-def _check_extra_params(extra_params: dict | None) -> None:
+def check_extra_params(extra_params: dict | None) -> None:
     """Fail on an ``extra_params`` key the hook itself owns.
 
     :data:`_RESERVED_PARAMS` says why each name is refused; the refusal is here,
     before the first request, so that a report configured this way never runs at
     all rather than running and writing plausible numbers about something other
     than what was asked for.
+
+    The operator asks this alongside :func:`check_report_limits`, before it
+    builds a hook, so the refusal comes before the campaign list is fetched.
     """
     if not extra_params:
         return
@@ -2553,10 +2725,17 @@ class AdmetricaHook(BaseHook):
     def get_campaigns(self) -> list[dict]:
         """Return the advertiser's campaigns, one record per campaign.
 
-        Every status is asked for: no ``status`` goes out with the request,
-        because an archived campaign ran in the past and its statistics are as
-        real as an active one's — a filter here would silently shorten every
-        re-export of an earlier period.
+        Every status is asked for: no ``status`` goes out with the request, so
+        what comes back is the whole cabinet, archived campaigns included.  That
+        is what the completeness check below is a check of, and what the
+        dictionary of campaigns is written from — the record of what the
+        advertiser holds, by which a campaign left out of a day can be told
+        apart from one that never existed.
+
+        Narrowing belongs to the day, not to the list:
+        :class:`~airflow_provider_yandex_admetrica.campaign_selection.CampaignSelection`
+        decides which of these campaigns :meth:`get_stats` spends a request on,
+        and it is handed the full list to choose from.
 
         A campaign whose ``campaign_id`` is not a positive whole number fails
         the export.  Statistics are asked for one campaign at a time and named
@@ -2694,6 +2873,24 @@ class AdmetricaHook(BaseHook):
         """
         return self._token
 
+    def safe_text(self, value: object) -> str | None:
+        """Return *value* fit to travel out of the process, or ``None``.
+
+        The gate itself is a module function, but the credential it searches for
+        is this hook's: the token is read out of one connection and kept here,
+        and nothing above the hook has it or should.  So a caller that wants to
+        put somebody else's words into a message — a campaign name typed into a
+        run form, a status the API wrote — asks the hook that read the token to
+        clean them, rather than carrying the token up to do it itself.
+
+        One line, the token replaced by :data:`_TOKEN_REDACTED` and the length
+        bounded.  ``None`` means the value must not travel at all: it is not
+        text, it says nothing once flattened, or the token survived the search
+        and outranks the diagnostic.  A caller reads ``None`` as "no text" and
+        describes the value some other way.
+        """
+        return _safe_text(value, self._maskable_token())
+
     def test_connection(self) -> tuple[bool, str]:
         """Answer whether this connection works, as a flag and a sentence.
 
@@ -2731,8 +2928,9 @@ class AdmetricaHook(BaseHook):
         timezone: str | None = None,
         lang: str | None = None,
         extra_params: dict | None = None,
+        selection: CampaignSelection = CampaignSelection(),
     ) -> list[dict]:
-        """Return one day of statistics for every campaign of the advertiser.
+        """Return one day of statistics for the campaigns *selection* names.
 
         A day is the unit because the report has no date in it: ``/v1/stat/data``
         is asked for ``date1=date2=<day>`` and the day is stamped onto every
@@ -2745,6 +2943,16 @@ class AdmetricaHook(BaseHook):
         campaign is the only way the split survives at all.  The list of
         campaigns comes from :meth:`get_campaigns`, so one task instance asks
         the management API once however many campaigns it walks.
+
+        Which of that list is walked is *selection*'s to say, and a day costs
+        one request per campaign it keeps: a cabinet is mostly history, and a
+        campaign archived a year ago answers every day with nothing at the price
+        of a request.  The default value of the parameter is the default of the
+        provider — active campaigns only — written down in one place rather than
+        spelled out again here.  The list itself stays whole: :meth:`get_campaigns`
+        asks for every status, checks the list against the declared total and
+        hands the same full answer to the dictionary the operator writes, so a
+        narrowed walk never narrows the record of what the cabinet holds.
 
         ``sort`` goes out naming every grouping that was asked for.  The API
         documents nothing about the order rows come back in, so a walk that
@@ -2772,15 +2980,16 @@ class AdmetricaHook(BaseHook):
         nothing and says what is wrong.
 
         Raises :class:`ValueError` on a day not written as :data:`DATE_FORMAT`,
-        on a request the API documents as too large or on an ``extra_params``
-        key the hook owns, and :class:`~airflow.exceptions.AirflowException` on
-        a day that came back incomplete.
+        on a request the API documents as too large, on an ``extra_params`` key
+        the hook owns or on an ``extra_params`` value a record key cannot be
+        written from, and :class:`~airflow.exceptions.AirflowException` on a day
+        that came back incomplete.
         """
         check_date(date)
         dimensions = list(dimensions)
         metrics = list(metrics)
-        _check_report_limits(dimensions, metrics, self.limit)
-        _check_extra_params(extra_params)
+        check_report_limits(dimensions, metrics, self.limit)
+        check_extra_params(extra_params)
 
         advertiser_id = self.advertiser_id
         base_params = self._report_params(
@@ -2808,7 +3017,7 @@ class AdmetricaHook(BaseHook):
         metric_keys = _record_keys(metrics, extra_params, "metric", token)
 
         records: list[dict] = []
-        for campaign in self.get_campaigns():
+        for campaign in selection.matching(self.get_campaigns()):
             # A positive whole number for every campaign of the list, because
             # `get_campaigns` fails the export over one it could not read: `ids`
             # is required, and `requests` drops a parameter of `None`, so the

@@ -96,7 +96,9 @@ def _run(answer, caplog, *, campaigns_first: bool = False) -> tuple[_Sink, str]:
     sink = _Sink()
     hook = _hook(sink)
     if not campaigns_first:
-        hook._campaigns = [{"campaign_id": 123456, "name": "Campaign"}]
+        hook._campaigns = [
+            {"campaign_id": 123456, "name": "Campaign", "status": "active"}
+        ]
     failure: BaseException | None = None
     with caplog.at_level(logging.DEBUG, logger=_HOOK_LOGGER):
         with patch("requests.get", **answer):
@@ -303,7 +305,7 @@ class TestTheRowsThemselves:
     def test_a_repeated_row_is_reported_without_the_token(self, caplog):
         sink = _Sink()
         hook = _hook(sink)
-        hook._campaigns = [{"campaign_id": 123456}]
+        hook._campaigns = [{"campaign_id": 123456, "status": "active"}]
         hook.limit = 1
         row = {"dimensions": [{"name": f"{_TOKEN_SCHEME} {TOKEN}"}], "metrics": [1]}
         page = _response(200, {"data": [row], "total_rows": 9, "total_rows_rounded": False})
@@ -321,7 +323,7 @@ class TestExtraParams:
     def test_a_parameter_carrying_the_token_travels_masked(self, caplog):
         sink = _Sink()
         hook = _hook(sink)
-        hook._campaigns = [{"campaign_id": 123456}]
+        hook._campaigns = [{"campaign_id": 123456, "status": "active"}]
         with caplog.at_level(logging.DEBUG, logger=_HOOK_LOGGER):
             with patch("requests.get", return_value=_response(500, {})):
                 with pytest.raises(AirflowException):
@@ -337,7 +339,7 @@ class TestExtraParams:
         """A credential lands as readily in the name of a parameter as in its value."""
         sink = _Sink()
         hook = _hook(sink)
-        hook._campaigns = [{"campaign_id": 123456}]
+        hook._campaigns = [{"campaign_id": 123456, "status": "active"}]
         with caplog.at_level(logging.DEBUG, logger=_HOOK_LOGGER):
             with patch("requests.get", return_value=_response(500, {})):
                 with pytest.raises(AirflowException):
@@ -368,7 +370,7 @@ class TestTheNamesTheCallerAsksBy:
         """The collision is a WARNING, and the names behind it stay in the request."""
         sink = _Sink()
         hook = _hook(sink)
-        hook._campaigns = [{"campaign_id": 123456}]
+        hook._campaigns = [{"campaign_id": 123456, "status": "active"}]
         records = self._day(hook, DIMENSIONS, [f"am:e:{TOKEN}"] * 2, [1, 2], caplog)
 
         assert len(records) == 1
@@ -379,7 +381,7 @@ class TestTheNamesTheCallerAsksBy:
         """The name is given by its length: the request carries no value for it."""
         sink = _Sink()
         hook = _hook(sink)
-        hook._campaigns = [{"campaign_id": 123456}]
+        hook._campaigns = [{"campaign_id": 123456, "status": "active"}]
         records = self._day(hook, DIMENSIONS, [f"am:e:{TOKEN}<goal_id>Reaches"], [1], caplog)
 
         assert len(records) == 1
@@ -390,7 +392,7 @@ class TestTheNamesTheCallerAsksBy:
         """The parameter's own name is written out, so it passes the gate too."""
         sink = _Sink()
         hook = _hook(sink)
-        hook._campaigns = [{"campaign_id": 123456}]
+        hook._campaigns = [{"campaign_id": 123456, "status": "active"}]
         records = self._day(hook, DIMENSIONS, [f"am:e:goal<{TOKEN}>Reaches"], [1], caplog)
 
         assert len(records) == 1
